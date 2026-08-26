@@ -79,6 +79,33 @@ python jarvis.py
 
 Allow the microphone if Windows prompts you. Stop with **Ctrl+C**.
 
+### Deterministic command mode
+
+Run one registered command through the same production command router intended
+for future voice input, bypassing microphone/clap waiting:
+
+```powershell
+python jarvis.py --command "open claude"
+python jarvis.py --command "open netflix"
+python jarvis.py --command "start my desk"
+```
+
+Supported commands are desk mode (`start my desk`, `desk mode`, `start desk
+mode`), opening Claude/Netflix/Spotify, closing Claude/Netflix, minimizing
+Spotify, and reporting the local time. Commands are normalized for case,
+whitespace, and simple punctuation, but are otherwise exact and deterministic.
+Unknown text never becomes a shell command or an application launch.
+
+Use `--dry-run` with `--command` to resolve a command without executing it:
+
+```powershell
+python jarvis.py --command "open netflix" --dry-run
+```
+
+`--command` and `--debug-audio` are mutually exclusive. Until the separately
+tested speech-recognition phase is implemented, the normal double clap continues
+to run the existing desk routine directly.
+
 ## Audio calibration
 
 Run the detector without launching Spotify, Chrome, Cursor, ElevenLabs, or any

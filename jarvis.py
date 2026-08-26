@@ -41,6 +41,7 @@ import wave
 import webbrowser
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime
 from enum import Enum
 from pathlib import Path
 
@@ -48,6 +49,7 @@ import numpy as np
 import sounddevice as sd
 
 from config import ConfigError, JarvisConfig, load_config
+from commands import CommandDefinition, CommandResult, CommandRouter
 
 # --- tuning knobs -----------------------------------------------------------
 SAMPLE_RATE = 44100
@@ -75,6 +77,8 @@ WINDOW_LIFECYCLE_DIAGNOSTIC_S = 3.0
 WINDOW_LIFECYCLE_POLL_S = 0.2
 SPOTIFY_FINAL_MINIMIZE_TIMEOUT_S = 2.0
 SPOTIFY_FINAL_STABLE_POLLS = 3
+WINDOW_CLOSE_TIMEOUT_S = 2.0
+CLAUDE_CLOSE_STABLE_POLLS = 3
 
 # Temporary Milestone diagnostic. main() enables this only in production mode;
 # direct unit-test calls and --debug-audio leave it disabled.
@@ -970,6 +974,42 @@ def _minimize_window_win32(hwnd: int, *, label: str) -> bool:
     return True
 
 
+def _window_exists_win32(hwnd: int) -> bool:
+    import ctypes
+
+    return bool(ctypes.windll.user32.IsWindow(hwnd))
+
+
+def _request_window_close_win32(
+    hwnd: int,
+    *,
+    label: str,
+    timeout: float = WINDOW_CLOSE_TIMEOUT_S,
+    poll_s: float = DESKTOP_WINDOW_POLL_S,
+) -> bool:
+    """Send WM_CLOSE to one HWND and boundedly verify that it closed."""
+    if sys.platform != "win32":
+        raise RuntimeError(f"{label} window closing is supported on Windows only")
+    import ctypes
+
+    WM_CLOSE = 0x0010
+    if not ctypes.windll.user32.PostMessageW(hwnd, WM_CLOSE, 0, 0):
+        if not _window_exists_win32(hwnd):
+            return True
+        log.warning("%s close request could not be sent.", label)
+        return False
+
+    max_polls = max(1, int(timeout / poll_s) + 1)
+    for poll_number in range(max_polls):
+        if not _window_exists_win32(hwnd):
+            log.info("%s closed.", label)
+            return True
+        if poll_number + 1 < max_polls:
+            time.sleep(poll_s)
+    log.warning("%s did not close after a normal window close request.", label)
+    return False
+
+
 def _move_window_to_monitor_win32(
     hwnd: int,
     monitor: int,
@@ -1753,6 +1793,82 @@ def open_netflix(config: JarvisConfig) -> None:
     )
 
 
+def close_netflix_window() -> None:
+    """Close only the strongly identified Netflix top-level window."""
+    if sys.platform != "win32":
+        raise RuntimeError("Netflix window closing is supported on Windows only")
+    window = _best_netflix_window_win32()
+    if window is None:
+        raise FileNotFoundError("Netflix window was not found")
+    if not _request_window_close_win32(window.hwnd, label="Netflix"):
+        raise RuntimeError("Netflix did not accept the normal window close request")
+
+
+def _claude_desktop_windows_win32() -> list[DesktopWindow]:
+    if sys.platform != "win32":
+        return []
+    return _matching_app_windows_win32(process_names=("claude.exe",))
+
+
+def _claude_desktop_window_win32() -> DesktopWindow | None:
+    return max(
+        _claude_desktop_windows_win32(),
+        key=lambda window: window.area,
+        default=None,
+    )
+
+
+def _request_claude_window_close_win32(
+    window: DesktopWindow,
+    *,
+    timeout: float = WINDOW_CLOSE_TIMEOUT_S,
+    poll_s: float = DESKTOP_WINDOW_POLL_S,
+    stable_polls: int = CLAUDE_CLOSE_STABLE_POLLS,
+) -> bool:
+    """Close Claude's UI and verify that no visible desktop frame remains."""
+    if sys.platform != "win32":
+        raise RuntimeError("Claude Desktop window closing is supported on Windows only")
+    import ctypes
+
+    WM_CLOSE = 0x0010
+    if not ctypes.windll.user32.PostMessageW(window.hwnd, WM_CLOSE, 0, 0):
+        log.warning("Claude Desktop close request could not be sent.")
+
+    max_polls = max(stable_polls, int(timeout / poll_s) + 1)
+    verified_polls = 0
+    for poll_number in range(max_polls):
+        visible_windows = [
+            candidate
+            for candidate in _claude_desktop_windows_win32()
+            if candidate.visible
+        ]
+        if visible_windows:
+            verified_polls = 0
+        else:
+            verified_polls += 1
+            if verified_polls >= stable_polls:
+                log.info(
+                    "Claude close verified: no visible Claude Desktop window."
+                )
+                return True
+        if poll_number + 1 < max_polls:
+            time.sleep(poll_s)
+
+    log.warning("Claude Desktop did not close.")
+    return False
+
+
+def close_claude_desktop_window() -> None:
+    """Close the visible Claude Desktop frame without targeting CLI processes."""
+    if sys.platform != "win32":
+        raise RuntimeError("Claude Desktop window closing is supported on Windows only")
+    window = _claude_desktop_window_win32()
+    if window is None:
+        raise FileNotFoundError("Claude Desktop window was not found")
+    if not _request_claude_window_close_win32(window):
+        raise RuntimeError("Claude Desktop did not close")
+
+
 def open_binance_btc_in_chrome(config: JarvisConfig) -> None:
     pos: tuple[int, int] | None = None
     size: tuple[int, int] | None = None
@@ -1932,8 +2048,8 @@ def _schedule_speech_action(config: JarvisConfig) -> None:
     ).start()
 
 
-def run_double_clap_actions(config: JarvisConfig) -> list[ActionResult]:
-    """Run outside the mic loop so sleeps and integrations do not stall capture."""
+def run_desk_mode(config: JarvisConfig) -> list[ActionResult]:
+    """Run the physically validated Spotify, Claude, and Netflix desk routine."""
     log.info("Running startup sequence.")
     results: list[ActionResult] = []
 
@@ -2010,6 +2126,11 @@ def run_double_clap_actions(config: JarvisConfig) -> list[ActionResult]:
     return results
 
 
+def run_double_clap_actions(config: JarvisConfig) -> list[ActionResult]:
+    """Backward-compatible entry point for the current clap-triggered routine."""
+    return run_desk_mode(config)
+
+
 def open_cursor_window(config: JarvisConfig) -> None:
     exe = _cursor_executable()
     if not exe:
@@ -2041,14 +2162,123 @@ def open_cursor_window(config: JarvisConfig) -> None:
             raise RuntimeError("Cursor fullscreen requested, but no window was found")
 
 
+def _desk_mode_command(config: JarvisConfig) -> str:
+    results = run_desk_mode(config)
+    failures = [result for result in results if not result.succeeded]
+    if failures:
+        details = "; ".join(
+            f"{result.name}: {result.error or 'failed'}" for result in failures
+        )
+        raise RuntimeError(f"desk mode completed with failures: {details}")
+    return "Desk mode completed."
+
+
+def _open_claude_command(config: JarvisConfig) -> str:
+    if not config.open_claude:
+        raise RuntimeError("Claude is disabled by OPEN_CLAUDE")
+    if config.claude_scheme != "claude":
+        raise RuntimeError("open Claude requires a configured claude:// desktop URI")
+    open_claude(config)
+    return "Claude Desktop opened."
+
+
+def _open_netflix_command(config: JarvisConfig) -> str:
+    if not config.open_netflix:
+        raise RuntimeError("Netflix is disabled by OPEN_NETFLIX")
+    open_netflix(config)
+    return "Netflix launch requested."
+
+
+def _open_spotify_command(config: JarvisConfig) -> str:
+    if not config.spotify_enabled:
+        raise RuntimeError("Spotify is disabled or SONG_URI is not configured")
+    open_spotify(config)
+    return "Spotify URI opened."
+
+
+def _minimize_spotify_command() -> str:
+    if not _enforce_spotify_minimized_final():
+        raise RuntimeError("Spotify could not be kept minimized")
+    return "Spotify minimized."
+
+
+def create_command_router(
+    config: JarvisConfig,
+    *,
+    now_provider: Callable[[], datetime] | None = None,
+) -> CommandRouter:
+    """Build the production deterministic router used by CLI and future voice input."""
+    clock = now_provider or datetime.now
+    return CommandRouter(
+        (
+            CommandDefinition(
+                name="desk_mode",
+                aliases=("start my desk", "desk mode", "start desk mode"),
+                handler=lambda: _desk_mode_command(config),
+            ),
+            CommandDefinition(
+                name="open_claude",
+                aliases=("open claude", "launch claude"),
+                handler=lambda: _open_claude_command(config),
+            ),
+            CommandDefinition(
+                name="open_netflix",
+                aliases=("open netflix", "launch netflix"),
+                handler=lambda: _open_netflix_command(config),
+            ),
+            CommandDefinition(
+                name="open_spotify",
+                aliases=("open spotify", "play spotify"),
+                handler=lambda: _open_spotify_command(config),
+            ),
+            CommandDefinition(
+                name="close_netflix",
+                aliases=("close netflix",),
+                handler=lambda: (close_netflix_window() or "Netflix closed."),
+            ),
+            CommandDefinition(
+                name="close_claude",
+                aliases=("close claude",),
+                handler=lambda: (
+                    close_claude_desktop_window() or "Claude Desktop closed."
+                ),
+            ),
+            CommandDefinition(
+                name="minimize_spotify",
+                aliases=("minimize spotify", "hide spotify"),
+                handler=_minimize_spotify_command,
+            ),
+            CommandDefinition(
+                name="local_time",
+                aliases=("what time is it", "tell me the time"),
+                handler=lambda: f"The local time is {clock():%H:%M}.",
+            ),
+        )
+    )
+
+
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Jarvis desktop clap listener")
-    parser.add_argument(
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument(
         "--debug-audio",
         action="store_true",
         help="log clap diagnostics without running desktop actions",
     )
-    return parser.parse_args(argv)
+    modes.add_argument(
+        "--command",
+        metavar="TEXT",
+        help="run one deterministic command through the production router and exit",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="resolve --command without executing its registered action",
+    )
+    args = parser.parse_args(argv)
+    if args.dry_run and args.command is None:
+        parser.error("--dry-run requires --command")
+    return args
 
 
 def _log_debug_events(events: list[ClapEvent]) -> None:
@@ -2199,6 +2429,19 @@ def main(
         except ConfigError as exc:
             log.error("Configuration error: %s", exc)
             return 2
+    if args.command is not None:
+        result: CommandResult = create_command_router(config).route(
+            args.command,
+            dry_run=args.dry_run,
+        )
+        if result.success:
+            log.info("Command %s: %s", result.command, result.message)
+        elif result.recognized:
+            log.warning("Command %s: %s", result.command, result.message)
+        else:
+            log.warning("%s", result.message)
+        print(result.message)
+        return 0 if result.success else 1
     blocksize = block_samples()
     detector = ClapDetector()
     welcome_sequence_done = False
