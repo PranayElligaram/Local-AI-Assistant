@@ -36,6 +36,7 @@ class CommandRouter:
 
     def __init__(self, definitions: Iterable[CommandDefinition]) -> None:
         self._commands: dict[str, CommandDefinition] = {}
+        accepted_phrases: list[str] = []
         for definition in definitions:
             aliases = (definition.name, *definition.aliases)
             for alias in aliases:
@@ -49,6 +50,16 @@ class CommandRouter:
                         f"{existing.name!r}"
                     )
                 self._commands[normalized] = definition
+            for alias in definition.aliases:
+                normalized = normalize_command(alias)
+                if normalized and normalized not in accepted_phrases:
+                    accepted_phrases.append(normalized)
+        self._accepted_phrases = tuple(accepted_phrases)
+
+    @property
+    def accepted_phrases(self) -> tuple[str, ...]:
+        """Spoken aliases accepted by this router, in registration order."""
+        return self._accepted_phrases
 
     def route(self, text: str, *, dry_run: bool = False) -> CommandResult:
         normalized = normalize_command(text)
@@ -80,4 +91,3 @@ class CommandRouter:
             command=definition.name,
             message=message or f"Command completed: {definition.name}",
         )
-

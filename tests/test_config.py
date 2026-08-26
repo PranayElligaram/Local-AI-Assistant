@@ -211,6 +211,81 @@ class ConfigurationTests(unittest.TestCase):
 
         self.assertEqual(config.input_device, "Microphone Array")
 
+    def test_voice_settings_have_bounded_defaults_and_allow_overrides(self) -> None:
+        defaults = load_config({})
+        configured = load_config(
+            {
+                "VOICE_COMMAND_TIMEOUT_S": "7.5",
+                "VOICE_MIN_CONFIDENCE": "0.82",
+            }
+        )
+
+        self.assertEqual(defaults.voice_command_timeout_s, 5.0)
+        self.assertEqual(defaults.voice_min_confidence, 0.75)
+        self.assertEqual(configured.voice_command_timeout_s, 7.5)
+        self.assertEqual(configured.voice_min_confidence, 0.82)
+
+    def test_double_clap_mode_accepts_voice_and_desk(self) -> None:
+        self.assertEqual(load_config({}).double_clap_mode, "voice")
+        self.assertEqual(load_config({}).session_mode, "clap_then_voice")
+        self.assertEqual(
+            load_config({"DOUBLE_CLAP_MODE": "VOICE"}).double_clap_mode,
+            "voice",
+        )
+        self.assertEqual(
+            load_config({"DOUBLE_CLAP_MODE": "desk"}).double_clap_mode,
+            "desk",
+        )
+
+    def test_double_clap_mode_rejects_unsupported_value(self) -> None:
+        with self.assertRaisesRegex(ConfigError, "DOUBLE_CLAP_MODE must be one of"):
+            load_config({"DOUBLE_CLAP_MODE": "both"})
+
+    def test_session_mode_accepts_clap_then_voice_and_desk(self) -> None:
+        self.assertEqual(
+            load_config({"JARVIS_SESSION_MODE": "CLAP_THEN_VOICE"}).session_mode,
+            "clap_then_voice",
+        )
+        self.assertEqual(
+            load_config({"JARVIS_SESSION_MODE": "desk"}).session_mode,
+            "desk",
+        )
+
+    def test_session_mode_rejects_unsupported_value(self) -> None:
+        with self.assertRaisesRegex(ConfigError, "JARVIS_SESSION_MODE must be one of"):
+            load_config({"JARVIS_SESSION_MODE": "always_listening"})
+
+    def test_wake_phrase_and_confidence_defaults_and_overrides(self) -> None:
+        defaults = load_config({})
+        configured = load_config(
+            {
+                "WAKE_PHRASE": "Computer",
+                "WAKE_WORD_MIN_CONFIDENCE": "0.88",
+            }
+        )
+
+        self.assertEqual(defaults.wake_phrase, "jarvis")
+        self.assertEqual(defaults.wake_word_min_confidence, 0.80)
+        self.assertEqual(configured.wake_phrase, "Computer")
+        self.assertEqual(configured.wake_word_min_confidence, 0.88)
+
+    def test_wake_configuration_rejects_empty_or_invalid_values(self) -> None:
+        with self.assertRaisesRegex(ConfigError, "WAKE_PHRASE"):
+            load_config({"WAKE_PHRASE": ""})
+        with self.assertRaisesRegex(ConfigError, "WAKE_WORD_MIN_CONFIDENCE"):
+            load_config({"WAKE_WORD_MIN_CONFIDENCE": "1.1"})
+
+    def test_voice_settings_reject_out_of_range_values(self) -> None:
+        for name, value in (
+            ("VOICE_COMMAND_TIMEOUT_S", "0.5"),
+            ("VOICE_COMMAND_TIMEOUT_S", "31"),
+            ("VOICE_MIN_CONFIDENCE", "-0.1"),
+            ("VOICE_MIN_CONFIDENCE", "1.1"),
+        ):
+            with self.subTest(name=name, value=value):
+                with self.assertRaisesRegex(ConfigError, name):
+                    load_config({name: value})
+
     def test_legacy_environment_names_remain_compatible(self) -> None:
         config = load_config(
             {

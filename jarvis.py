@@ -20,8 +20,9 @@ Detector constants below are physically calibrated; change only after measuremen
   MIN_RMS       — ignore spikes below this absolute level (float audio ~ [-1, 1]).
   User actions and credentials are configured in `.env`; see `.env.example`.
   With JARVIS_WELCOME_CACHE_ENABLED, audio is cached under `.cache/jarvis_welcome/`.
-  The welcome sequence runs only once per process. The assistant speaks in the background so Cursor
-    opens without waiting for playback to finish (restart the script to run again).
+  JARVIS_SESSION_MODE=clap_then_voice uses one activation clap, runs desk mode,
+    then waits persistently for the configured wake phrase. The legacy `desk`
+    mode preserves the original one-shot desk routine.
 """
 
 from __future__ import annotations
@@ -50,6 +51,12 @@ import sounddevice as sd
 
 from config import ConfigError, JarvisConfig, load_config
 from commands import CommandDefinition, CommandResult, CommandRouter
+from speech import (
+    SpeechRecognitionResult,
+    WakeWordResult,
+    WindowsSpeechRecognizer,
+    WindowsWakeWordRecognizer,
+)
 
 # --- tuning knobs -----------------------------------------------------------
 SAMPLE_RATE = 44100
@@ -79,9 +86,17 @@ SPOTIFY_FINAL_MINIMIZE_TIMEOUT_S = 2.0
 SPOTIFY_FINAL_STABLE_POLLS = 3
 WINDOW_CLOSE_TIMEOUT_S = 2.0
 CLAUDE_CLOSE_STABLE_POLLS = 3
+SPOTIFY_OPEN_VERIFY_TIMEOUT_S = 2.0
+SPOTIFY_OPEN_STABLE_POLLS = 3
+# Physical lifecycle evidence showed URI activation restoring the same frame at
+# approximately 3.1 seconds. Command-mode playback waits past that point before
+# applying the existing proven final-minimize verifier.
+SPOTIFY_PLAY_SETTLE_S = 3.25
+CLAUDE_OPEN_VERIFY_TIMEOUT_S = 2.0
+CLAUDE_OPEN_STABLE_POLLS = 3
+WAKE_RECOGNIZER_RESTART_DELAY_S = 0.5
 
-# Temporary Milestone diagnostic. main() enables this only in production mode;
-# direct unit-test calls and --debug-audio leave it disabled.
+# Historical lifecycle probe retained for targeted troubleshooting only.
 WINDOW_LIFECYCLE_DIAGNOSTICS_ENABLED = False
 
 # Cursor's optional new-window mode remains an internal, disabled upstream behavior.
@@ -632,8 +647,11 @@ def _win32_sorted_monitor_rects() -> list[tuple[int, int, int, int]]:
     return collected
 
 
-def _visible_top_level_windows_win32() -> list[DesktopWindow]:
-    """Visible application windows with their owning executable name."""
+def _visible_top_level_windows_win32(
+    *,
+    include_hidden: bool = False,
+) -> list[DesktopWindow]:
+    """Application windows with owner process; hidden frames are opt-in."""
     if sys.platform != "win32":
         return []
     import ctypes
@@ -656,7 +674,7 @@ def _visible_top_level_windows_win32() -> list[DesktopWindow]:
             return True
         is_visible = bool(user32.IsWindowVisible(hwnd))
         is_iconic = bool(user32.IsIconic(hwnd))
-        if not is_visible and not is_iconic:
+        if not include_hidden and not is_visible and not is_iconic:
             return True
 
         rect = wintypes.RECT()
@@ -664,7 +682,7 @@ def _visible_top_level_windows_win32() -> list[DesktopWindow]:
             return True
         width = max(0, rect.right - rect.left)
         height = max(0, rect.bottom - rect.top)
-        if (width < 120 or height < 80) and not is_iconic:
+        if (width < 120 or height < 80) and not is_iconic and not include_hidden:
             return True
 
         pid = wintypes.DWORD()
@@ -922,10 +940,76 @@ def _window_is_minimized_win32(hwnd: int) -> bool:
     return bool(ctypes.windll.user32.IsIconic(hwnd))
 
 
+def _claude_window_is_visible_win32(hwnd: int) -> bool:
+    """Read Claude's current Win32 visibility rather than trusting an old snapshot."""
+    import ctypes
+
+    return bool(ctypes.windll.user32.IsWindowVisible(hwnd))
+
+
+def _claude_window_is_cloaked_win32(hwnd: int) -> bool:
+    """Return whether DWM is withholding a Claude frame from physical presentation."""
+    import ctypes
+    from ctypes import wintypes
+
+    DWMWA_CLOAKED = 14
+    cloaked = wintypes.DWORD()
+    try:
+        result = ctypes.windll.dwmapi.DwmGetWindowAttribute(
+            hwnd,
+            DWMWA_CLOAKED,
+            ctypes.byref(cloaked),
+            ctypes.sizeof(cloaked),
+        )
+    except (AttributeError, OSError):
+        return False
+    return result == 0 and bool(cloaked.value)
+
+
+def _claude_window_rect_matches_monitor_win32(hwnd: int, monitor: int) -> bool:
+    """Require the physical window centre to lie on the configured monitor."""
+    rect = _window_rect_win32(hwnd)
+    monitors = _win32_sorted_monitor_rects()
+    if rect is None or monitor < 1 or monitor > len(monitors):
+        return False
+    left, top, right, bottom = rect
+    if right <= left or bottom <= top:
+        return False
+    centre_x = left + (right - left) // 2
+    centre_y = top + (bottom - top) // 2
+    target_left, target_top, target_right, target_bottom = monitors[monitor - 1]
+    return (
+        target_left <= centre_x < target_right
+        and target_top <= centre_y < target_bottom
+    )
+
+
 def _show_window_win32(hwnd: int, command: int) -> None:
     import ctypes
 
     ctypes.windll.user32.ShowWindow(hwnd, command)
+
+
+def _activate_window_win32(hwnd: int) -> bool:
+    """Request foreground activation without using process-wide termination."""
+    import ctypes
+
+    user32 = ctypes.windll.user32
+    foreground = user32.GetForegroundWindow()
+    target_thread = user32.GetWindowThreadProcessId(hwnd, None)
+    foreground_thread = (
+        user32.GetWindowThreadProcessId(foreground, None) if foreground else 0
+    )
+    attached = False
+    if foreground_thread and target_thread and foreground_thread != target_thread:
+        attached = bool(
+            user32.AttachThreadInput(foreground_thread, target_thread, True)
+        )
+    try:
+        return bool(user32.SetForegroundWindow(hwnd))
+    finally:
+        if attached:
+            user32.AttachThreadInput(foreground_thread, target_thread, False)
 
 
 def _set_window_position_win32(
@@ -1112,11 +1196,153 @@ def _minimize_desktop_window(
     return _minimize_window_win32(hwnd, label=label)
 
 
-def _spotify_main_windows_win32() -> list[DesktopWindow]:
-    return _matching_app_windows_win32(
-        process_names=("spotify.exe",),
-        class_names=("Chrome_WidgetWin_1",),
+def _spotify_main_windows_win32(
+    *,
+    include_hidden: bool = False,
+) -> list[DesktopWindow]:
+    return [
+        window
+        for window in _visible_top_level_windows_win32(
+            include_hidden=include_hidden
+        )
+        if window.process_name.casefold() == "spotify.exe"
+        and window.class_name.casefold() == "chrome_widgetwin_1"
+        and window.owner_hwnd == 0
+    ]
+
+
+def _best_spotify_main_window_win32() -> DesktopWindow | None:
+    return max(
+        _spotify_main_windows_win32(include_hidden=True),
+        key=lambda window: window.area,
+        default=None,
     )
+
+
+def _rect_intersects_available_monitor_win32(
+    rect: tuple[int, int, int, int],
+) -> bool:
+    monitors = _win32_sorted_monitor_rects()
+    if not monitors:
+        return True
+    left, top, right, bottom = rect
+    return any(
+        min(right, monitor_right) > max(left, monitor_left)
+        and min(bottom, monitor_bottom) > max(top, monitor_top)
+        for monitor_left, monitor_top, monitor_right, monitor_bottom in monitors
+    )
+
+
+def _primary_monitor_number_win32() -> int:
+    monitors = _win32_sorted_monitor_rects()
+    for index, (left, top, right, bottom) in enumerate(monitors, start=1):
+        if left <= 0 < right and top <= 0 < bottom:
+            return index
+    return 1
+
+
+def _wait_for_spotify_main_window_win32(
+    *,
+    timeout: float = DESKTOP_WINDOW_WAIT_S,
+) -> DesktopWindow | None:
+    deadline = time.monotonic() + timeout
+    while True:
+        window = _best_spotify_main_window_win32()
+        if window is not None:
+            return window
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(DESKTOP_WINDOW_POLL_S)
+
+
+def show_spotify_window(
+    config: JarvisConfig,
+    *,
+    timeout: float = SPOTIFY_OPEN_VERIFY_TIMEOUT_S,
+    poll_s: float = DESKTOP_WINDOW_POLL_S,
+    stable_polls: int = SPOTIFY_OPEN_STABLE_POLLS,
+) -> None:
+    """Restore and foreground Spotify without redispatching the configured song."""
+    if sys.platform != "win32":
+        raise RuntimeError("Spotify window restore is supported on Windows only")
+
+    window = _best_spotify_main_window_win32()
+    if window is None:
+        _open_registered_uri("spotify:", label="Spotify Desktop URI")
+        log.info("Spotify Desktop launch requested.")
+        window = _wait_for_spotify_main_window_win32()
+    if window is None:
+        raise FileNotFoundError("Spotify main window was not found")
+
+    log.info(
+        "Spotify restore candidate: hwnd=%d, process=%s, class=%s, "
+        "rect=%s, visible=%s, iconic=%s",
+        window.hwnd,
+        window.process_name or "unknown",
+        window.class_name or "unknown",
+        window.rect,
+        window.visible,
+        window.iconic,
+    )
+    log.info("Spotify restore requested: hwnd=%d", window.hwnd)
+    _show_window_win32(window.hwnd, 9)  # SW_RESTORE
+
+    rect = _window_rect_win32(window.hwnd) or window.rect
+    if not _rect_intersects_available_monitor_win32(rect):
+        target_monitor = config.spotify_monitor or _primary_monitor_number_win32()
+        _move_window_to_monitor_win32(
+            window.hwnd,
+            target_monitor,
+            label="Spotify",
+            maximize=False,
+        )
+    if not _activate_window_win32(window.hwnd):
+        log.warning("Spotify foreground activation was not accepted by Windows.")
+
+    max_polls = max(stable_polls, int(timeout / poll_s) + 1)
+    verified_polls = 0
+    current_hwnd = window.hwnd
+    for poll_number in range(max_polls):
+        frames = _spotify_main_windows_win32(include_hidden=True)
+        current = next(
+            (candidate for candidate in frames if candidate.hwnd == current_hwnd),
+            max(frames, key=lambda candidate: candidate.area, default=None),
+        )
+        if current is None:
+            verified_polls = 0
+        else:
+            current_hwnd = current.hwnd
+            current_rect = _window_rect_win32(current.hwnd) or current.rect
+            visible = current.visible
+            iconic = _window_is_minimized_win32(current.hwnd)
+            on_monitor = _rect_intersects_available_monitor_win32(current_rect)
+            if visible and not iconic and on_monitor:
+                verified_polls += 1
+                if verified_polls >= stable_polls:
+                    monitor = _monitor_number_for_window_win32(current.hwnd)
+                    log.info(
+                        "Spotify open verified: visible=True, iconic=False, "
+                        "monitor=%s",
+                        monitor if monitor is not None else "unknown",
+                    )
+                    return
+            else:
+                verified_polls = 0
+                _show_window_win32(current.hwnd, 9)  # SW_RESTORE
+                if not on_monitor:
+                    target_monitor = (
+                        config.spotify_monitor or _primary_monitor_number_win32()
+                    )
+                    _move_window_to_monitor_win32(
+                        current.hwnd,
+                        target_monitor,
+                        label="Spotify",
+                        maximize=False,
+                    )
+        if poll_number + 1 < max_polls:
+            time.sleep(poll_s)
+
+    raise RuntimeError("Spotify window could not be restored and verified")
 
 
 def _enforce_spotify_minimized_final(
@@ -1440,20 +1666,7 @@ def open_claude_in_chrome(config: JarvisConfig) -> None:
 
 def open_claude(config: JarvisConfig) -> None:
     if config.claude_scheme == "claude":
-        previous = (
-            _current_app_hwnds(process_names=("claude.exe",))
-            if config.claude_monitor is not None or config.claude_maximize
-            else set()
-        )
-        _open_registered_uri(config.claude_url, label="Claude Desktop URI")
-        log.info("Claude Desktop URI opened.")
-        _place_desktop_window(
-            label="Claude",
-            monitor=config.claude_monitor,
-            process_names=("claude.exe",),
-            previous_hwnds=previous,
-            maximize=config.claude_maximize,
-        )
+        _open_claude_desktop_verified(config)
         return
     open_claude_in_chrome(config)
 
@@ -1804,18 +2017,238 @@ def close_netflix_window() -> None:
         raise RuntimeError("Netflix did not accept the normal window close request")
 
 
-def _claude_desktop_windows_win32() -> list[DesktopWindow]:
+def _is_claude_desktop_window(window: DesktopWindow) -> bool:
+    return (
+        window.process_name.casefold() == "claude.exe"
+        and window.class_name.casefold() == "chrome_widgetwin_1"
+        and window.owner_hwnd == 0
+        and window.title.strip().casefold().startswith("claude")
+    )
+
+
+def _claude_desktop_windows_win32(
+    *,
+    include_hidden: bool = False,
+) -> list[DesktopWindow]:
     if sys.platform != "win32":
         return []
-    return _matching_app_windows_win32(process_names=("claude.exe",))
+    return [
+        window
+        for window in _visible_top_level_windows_win32(
+            include_hidden=include_hidden
+        )
+        if _is_claude_desktop_window(window)
+    ]
 
 
-def _claude_desktop_window_win32() -> DesktopWindow | None:
+def _claude_desktop_window_win32(
+    *,
+    include_hidden: bool = False,
+) -> DesktopWindow | None:
     return max(
-        _claude_desktop_windows_win32(),
-        key=lambda window: window.area,
+        _claude_desktop_windows_win32(include_hidden=include_hidden),
+        key=lambda window: (window.visible, window.area),
         default=None,
     )
+
+
+def _claude_window_is_presented_win32(window: DesktopWindow) -> bool:
+    return (
+        window.visible
+        and not window.iconic
+        and not _claude_window_is_cloaked_win32(window.hwnd)
+    )
+
+
+def _best_claude_desktop_window_win32(
+    candidates: list[DesktopWindow],
+    *,
+    preferred_hwnd: int | None = None,
+    require_presented: bool = False,
+) -> DesktopWindow | None:
+    ranked = [
+        (window, _claude_window_is_presented_win32(window))
+        for window in candidates
+    ]
+    if require_presented:
+        ranked = [(window, presented) for window, presented in ranked if presented]
+    return max(
+        ranked,
+        key=lambda item: (
+            item[1],
+            item[0].hwnd == preferred_hwnd,
+            item[0].area,
+        ),
+        default=(None, False),
+    )[0]
+
+
+def _wait_for_claude_desktop_window_win32(
+    *,
+    timeout: float = DESKTOP_WINDOW_WAIT_S,
+    preferred_hwnd: int | None = None,
+    require_presented: bool = False,
+) -> DesktopWindow | None:
+    deadline = time.monotonic() + timeout
+    while True:
+        window = _best_claude_desktop_window_win32(
+            _claude_desktop_windows_win32(include_hidden=True),
+            preferred_hwnd=preferred_hwnd,
+            require_presented=require_presented,
+        )
+        if window is not None:
+            return window
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(DESKTOP_WINDOW_POLL_S)
+
+
+def _apply_claude_desktop_open_state(
+    window: DesktopWindow,
+    config: JarvisConfig,
+) -> None:
+    current_monitor = _monitor_number_for_window_win32(window.hwnd)
+    needs_restore = not window.visible or window.iconic
+    if needs_restore:
+        log.info("Claude restore requested: hwnd=%d", window.hwnd)
+        _show_window_win32(window.hwnd, 9)  # SW_RESTORE
+
+    if config.claude_monitor is not None and current_monitor != config.claude_monitor:
+        _move_window_to_monitor_win32(
+            window.hwnd,
+            config.claude_monitor,
+            label="Claude",
+            maximize=config.claude_maximize,
+        )
+    elif config.claude_maximize:
+        _maximize_window_win32(window.hwnd, label="Claude")
+    if not _activate_window_win32(window.hwnd):
+        log.warning("Claude foreground activation was not accepted by Windows.")
+
+
+def _verify_claude_desktop_open_state(
+    config: JarvisConfig,
+    *,
+    preferred_hwnd: int,
+    timeout: float = CLAUDE_OPEN_VERIFY_TIMEOUT_S,
+    poll_s: float = DESKTOP_WINDOW_POLL_S,
+    stable_polls: int = CLAUDE_OPEN_STABLE_POLLS,
+) -> bool:
+    max_polls = max(stable_polls, int(timeout / poll_s) + 1)
+    verified_polls = 0
+    current_hwnd = preferred_hwnd
+    for poll_number in range(max_polls):
+        candidates = _claude_desktop_windows_win32(include_hidden=True)
+        current = _best_claude_desktop_window_win32(
+            candidates,
+            preferred_hwnd=current_hwnd,
+        )
+        if current is None:
+            verified_polls = 0
+        else:
+            current_hwnd = current.hwnd
+            visible = _claude_window_is_visible_win32(current.hwnd)
+            iconic = _window_is_minimized_win32(current.hwnd)
+            cloaked = _claude_window_is_cloaked_win32(current.hwnd)
+            monitor = _monitor_number_for_window_win32(current.hwnd)
+            maximized = _window_is_maximized_win32(current.hwnd)
+            monitor_ok = (
+                config.claude_monitor is None or monitor == config.claude_monitor
+            )
+            rect_ok = (
+                config.claude_monitor is None
+                or _claude_window_rect_matches_monitor_win32(
+                    current.hwnd,
+                    config.claude_monitor,
+                )
+            )
+            maximize_ok = not config.claude_maximize or maximized
+            if (
+                visible
+                and not iconic
+                and not cloaked
+                and monitor_ok
+                and rect_ok
+                and maximize_ok
+            ):
+                verified_polls += 1
+                if verified_polls >= stable_polls:
+                    log.info(
+                        "Claude open verified: visible=True, cloaked=False, "
+                        "monitor=%s, maximized=%s",
+                        monitor if monitor is not None else "unknown",
+                        maximized,
+                    )
+                    return True
+            else:
+                verified_polls = 0
+                if not visible or iconic:
+                    _show_window_win32(current.hwnd, 9)  # SW_RESTORE
+                if (
+                    config.claude_monitor is not None
+                    and (not monitor_ok or not rect_ok)
+                ):
+                    _move_window_to_monitor_win32(
+                        current.hwnd,
+                        config.claude_monitor,
+                        label="Claude",
+                        maximize=config.claude_maximize,
+                    )
+                elif config.claude_maximize and not maximized:
+                    _show_window_win32(current.hwnd, 3)  # SW_MAXIMIZE
+                _activate_window_win32(current.hwnd)
+        if poll_number + 1 < max_polls:
+            time.sleep(poll_s)
+    return False
+
+
+def _open_claude_desktop_verified(config: JarvisConfig) -> None:
+    if sys.platform != "win32":
+        _open_registered_uri(config.claude_url, label="Claude Desktop URI")
+        log.info("Claude Desktop URI opened.")
+        return
+
+    window = _claude_desktop_window_win32(include_hidden=True)
+    hidden_hwnd: int | None = None
+    if window is None:
+        _open_registered_uri(config.claude_url, label="Claude Desktop URI")
+        log.info("Claude Desktop URI opened.")
+        window = _wait_for_claude_desktop_window_win32(require_presented=True)
+    elif not _claude_window_is_presented_win32(window):
+        hidden_hwnd = window.hwnd
+        log.info("Claude hidden frame found: hwnd=%d", window.hwnd)
+        _open_registered_uri(config.claude_url, label="Claude Desktop URI")
+        log.info("Claude Desktop URI opened for hidden-frame reactivation.")
+        window = _wait_for_claude_desktop_window_win32(
+            preferred_hwnd=hidden_hwnd,
+            require_presented=True,
+        )
+    else:
+        log.info(
+            "Claude visible frame found: hwnd=%d, process=%s, title=%r, "
+            "class=%s",
+            window.hwnd,
+            window.process_name,
+            window.title,
+            window.class_name,
+        )
+        log.info("Claude already active.")
+    if window is None:
+        raise RuntimeError("Claude Desktop window was not found after URI activation")
+
+    if hidden_hwnd is not None:
+        log.info(
+            "Claude active frame acquired: hwnd=%d%s",
+            window.hwnd,
+            " (reactivated existing frame)" if window.hwnd == hidden_hwnd else "",
+        )
+
+    _apply_claude_desktop_open_state(window, config)
+    if not _verify_claude_desktop_open_state(
+        config,
+        preferred_hwnd=window.hwnd,
+    ):
+        raise RuntimeError("Claude Desktop open state could not be verified")
 
 
 def _request_claude_window_close_win32(
@@ -2189,11 +2622,22 @@ def _open_netflix_command(config: JarvisConfig) -> str:
     return "Netflix launch requested."
 
 
-def _open_spotify_command(config: JarvisConfig) -> str:
+def _play_spotify_command(config: JarvisConfig) -> str:
     if not config.spotify_enabled:
         raise RuntimeError("Spotify is disabled or SONG_URI is not configured")
     open_spotify(config)
-    return "Spotify URI opened."
+    log.info("Waiting for Spotify URI activation to settle.")
+    time.sleep(SPOTIFY_PLAY_SETTLE_S)
+    if not _enforce_spotify_minimized_final():
+        raise RuntimeError("Spotify could not be kept minimized after playback")
+    return "Spotify playing in background."
+
+
+def _show_spotify_command(config: JarvisConfig) -> str:
+    if not config.open_spotify:
+        raise RuntimeError("Spotify is disabled by OPEN_SPOTIFY")
+    show_spotify_window(config)
+    return "Spotify opened."
 
 
 def _minimize_spotify_command() -> str:
@@ -2227,9 +2671,14 @@ def create_command_router(
                 handler=lambda: _open_netflix_command(config),
             ),
             CommandDefinition(
-                name="open_spotify",
-                aliases=("open spotify", "play spotify"),
-                handler=lambda: _open_spotify_command(config),
+                name="show_spotify",
+                aliases=("open spotify", "show spotify"),
+                handler=lambda: _show_spotify_command(config),
+            ),
+            CommandDefinition(
+                name="play_spotify",
+                aliases=("play spotify",),
+                handler=lambda: _play_spotify_command(config),
             ),
             CommandDefinition(
                 name="close_netflix",
@@ -2257,6 +2706,256 @@ def create_command_router(
     )
 
 
+def _run_one_spoken_command(
+    config: JarvisConfig,
+    *,
+    input_idx: int,
+    input_name: str,
+    dry_run: bool = False,
+    recognizer: WindowsSpeechRecognizer | None = None,
+    router: CommandRouter | None = None,
+) -> int:
+    """Recognize and route one command using an already selected microphone."""
+    command_router = router or create_command_router(config)
+    speech_recognizer = recognizer or WindowsSpeechRecognizer(
+        timeout_s=config.voice_command_timeout_s,
+        min_confidence=config.voice_min_confidence,
+    )
+    log.info("Listening on microphone [%d]: %s", input_idx, input_name)
+    result: SpeechRecognitionResult = speech_recognizer.recognize_one_command(
+        device_index=input_idx,
+        phrases=command_router.accepted_phrases,
+        sample_rate=SAMPLE_RATE,
+        blocksize=block_samples(),
+    )
+    if not result.success:
+        if result.reason == "timeout":
+            message = "No command heard."
+        elif result.reason in {"no_match", "low_confidence"}:
+            message = "I didn't understand that command."
+            if result.reason == "low_confidence" and result.confidence is not None:
+                log.warning(
+                    "Speech recognition rejected low confidence %.2f (minimum %.2f).",
+                    result.confidence,
+                    config.voice_min_confidence,
+                )
+        elif result.reason == "microphone_error":
+            message = f"Speech recognition failed: microphone error: {result.error}"
+        else:
+            message = f"Speech recognition failed: {result.error or result.reason}"
+        log.warning("%s", message)
+        print(message)
+        return 1
+
+    log.info(
+        "Recognized command: %s (confidence=%.2f)",
+        result.text,
+        result.confidence if result.confidence is not None else 0.0,
+    )
+    command_result = command_router.route(result.text or "", dry_run=dry_run)
+    if command_result.success:
+        log.info("Command %s: %s", command_result.command, command_result.message)
+    elif command_result.recognized:
+        log.warning("Command %s: %s", command_result.command, command_result.message)
+    else:
+        log.warning("%s", command_result.message)
+    print(command_result.message)
+    return 0 if command_result.success else 1
+
+
+def run_listen_command_mode(
+    config: JarvisConfig,
+    *,
+    dry_run: bool = False,
+    recognizer: WindowsSpeechRecognizer | None = None,
+) -> int:
+    """Select the configured microphone, listen once, route, and exit."""
+    blocksize = block_samples()
+    input_idx = _choose_input_device(
+        blocksize,
+        configured_device=config.input_device,
+        log_devices=True,
+    )
+    input_name = sd.query_devices(input_idx)["name"]
+    return _run_one_spoken_command(
+        config,
+        input_idx=input_idx,
+        input_name=input_name,
+        dry_run=dry_run,
+        recognizer=recognizer,
+    )
+
+
+class VoiceWakeController:
+    """Run one non-overlapping recognition/router cycle with exclusive mic access."""
+
+    def __init__(
+        self,
+        config: JarvisConfig,
+        *,
+        input_idx: int,
+        input_name: str,
+        recognizer: WindowsSpeechRecognizer | None = None,
+        router: CommandRouter | None = None,
+        shutdown_event: threading.Event | None = None,
+    ) -> None:
+        self.config = config
+        self.input_idx = input_idx
+        self.input_name = input_name
+        self.recognizer = recognizer or WindowsSpeechRecognizer(
+            timeout_s=config.voice_command_timeout_s,
+            min_confidence=config.voice_min_confidence,
+        )
+        self.router = router or create_command_router(config)
+        self._shutdown_event = shutdown_event or threading.Event()
+        self._cycle_lock = threading.Lock()
+
+    @property
+    def busy(self) -> bool:
+        return self._cycle_lock.locked()
+
+    def stop(self) -> None:
+        self._shutdown_event.set()
+        self.recognizer.stop()
+
+    def run_cycle(self) -> bool:
+        if self._shutdown_event.is_set():
+            return False
+        if not self._cycle_lock.acquire(blocking=False):
+            log.warning("Voice wake ignored because a command cycle is already active.")
+            return False
+        try:
+            log.info("Command-listening cycle started; wake recognizer is stopped.")
+            log.info("Jarvis listening for command.")
+            _run_one_spoken_command(
+                self.config,
+                input_idx=self.input_idx,
+                input_name=self.input_name,
+                recognizer=self.recognizer,
+                router=self.router,
+            )
+            return True
+        except KeyboardInterrupt:
+            self._shutdown_event.set()
+            self.recognizer.stop()
+            raise
+        except Exception as exc:
+            detail = str(exc).strip() or type(exc).__name__
+            log.warning("Voice command cycle failed: %s", detail)
+            return True
+        finally:
+            log.info("Voice cycle completed.")
+            self._cycle_lock.release()
+
+
+def _validate_system_speech_microphone(
+    config: JarvisConfig,
+    *,
+    selected_input_idx: int,
+) -> None:
+    """Do not silently let System.Speech use a different configured microphone."""
+    if not config.input_device:
+        return
+    default_input = sd.default.device[0]
+    if default_input is None or int(default_input) != selected_input_idx:
+        raise RuntimeError(
+            "JARVIS_INPUT_DEVICE selects microphone "
+            f"[{selected_input_idx}], but Windows System.Speech wake recognition "
+            "can only use the current Windows/default input. Make the configured "
+            "microphone the Windows default or clear JARVIS_INPUT_DEVICE."
+        )
+
+
+class ActiveJarvisSession:
+    """Alternate one persistent wake recognizer with one-shot command capture."""
+
+    def __init__(
+        self,
+        config: JarvisConfig,
+        *,
+        voice_controller: VoiceWakeController,
+        wake_recognizer: WindowsWakeWordRecognizer | None = None,
+        restart_delay_s: float = WAKE_RECOGNIZER_RESTART_DELAY_S,
+        shutdown_event: threading.Event | None = None,
+    ) -> None:
+        self.config = config
+        self.voice_controller = voice_controller
+        self.wake_recognizer = wake_recognizer or WindowsWakeWordRecognizer(
+            wake_phrase=config.wake_phrase,
+            min_confidence=config.wake_word_min_confidence,
+        )
+        self.restart_delay_s = restart_delay_s
+        self._stop_event = shutdown_event or threading.Event()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        self.wake_recognizer.stop()
+        self.voice_controller.stop()
+
+    def run_until_command_cycle(self) -> bool:
+        """Wait for one accepted wake, then run exactly one routed command cycle."""
+        wake_accepted = False
+        try:
+            self.wake_recognizer.start()
+            log.info('Waiting for wake phrase: "%s".', self.config.wake_phrase)
+            while not self._stop_event.is_set():
+                result: WakeWordResult = self.wake_recognizer.wait_for_wake(
+                    shutdown_event=self._stop_event,
+                )
+                if result.detected:
+                    wake_accepted = True
+                    log.info(
+                        "Wake phrase detected: %s (confidence=%.2f).",
+                        result.text or self.config.wake_phrase,
+                        result.confidence if result.confidence is not None else 0.0,
+                    )
+                    break
+                if result.reason == "low_confidence":
+                    log.warning(
+                        "Wake phrase rejected: confidence=%.2f, minimum=%.2f.",
+                        result.confidence if result.confidence is not None else 0.0,
+                        self.config.wake_word_min_confidence,
+                    )
+                    continue
+                if result.reason == "no_match":
+                    continue
+                if result.reason == "shutdown":
+                    return False
+                log.warning(
+                    "Wake-word recognition failed: %s",
+                    result.error or result.reason or "unknown error",
+                )
+                return False
+        except KeyboardInterrupt:
+            self._stop_event.set()
+            raise
+        except Exception as exc:
+            detail = str(exc).strip() or type(exc).__name__
+            log.warning("Wake-word recognition failed: %s", detail)
+            return False
+        finally:
+            self.wake_recognizer.stop()
+
+        if not wake_accepted or self._stop_event.is_set():
+            return False
+        log.info("Wake recognizer stopped; microphone released for command.")
+        try:
+            self.voice_controller.run_cycle()
+        except KeyboardInterrupt:
+            self._stop_event.set()
+            raise
+        return True
+
+    def run_forever(self) -> None:
+        log.info("Jarvis session active.")
+        while not self._stop_event.is_set():
+            completed = self.run_until_command_cycle()
+            if self._stop_event.is_set():
+                return
+            if not completed and self.restart_delay_s:
+                self._stop_event.wait(self.restart_delay_s)
+
+
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Jarvis desktop clap listener")
     modes = parser.add_mutually_exclusive_group()
@@ -2270,14 +2969,19 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         metavar="TEXT",
         help="run one deterministic command through the production router and exit",
     )
+    modes.add_argument(
+        "--listen-command",
+        action="store_true",
+        help="recognize one spoken command, route it, and exit",
+    )
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="resolve --command without executing its registered action",
+        help="resolve --command or --listen-command without executing an action",
     )
     args = parser.parse_args(argv)
-    if args.dry_run and args.command is None:
-        parser.error("--dry-run requires --command")
+    if args.dry_run and args.command is None and not args.listen_command:
+        parser.error("--dry-run requires --command or --listen-command")
     return args
 
 
@@ -2380,6 +3084,13 @@ def _log_configuration(config: JarvisConfig) -> None:
 
 def _log_normal_mode_configuration(config: JarvisConfig) -> None:
     _log_configuration(config)
+    log.info("  Session mode: %s", config.session_mode)
+    if config.session_mode == "clap_then_voice":
+        log.info(
+            "  Wake phrase: %s (minimum confidence %.2f)",
+            config.wake_phrase,
+            config.wake_word_min_confidence,
+        )
     if config.focus_cursor:
         log.info(
             "Double clap will foreground an existing Cursor window (Windows API); "
@@ -2419,10 +3130,8 @@ def main(
     *,
     config: JarvisConfig | None = None,
 ) -> int:
-    global WINDOW_LIFECYCLE_DIAGNOSTICS_ENABLED
     args = _parse_args(argv)
     debug_audio = args.debug_audio
-    WINDOW_LIFECYCLE_DIAGNOSTICS_ENABLED = not debug_audio
     if config is None:
         try:
             config = load_config()
@@ -2442,9 +3151,12 @@ def main(
             log.warning("%s", result.message)
         print(result.message)
         return 0 if result.success else 1
+    if args.listen_command:
+        return run_listen_command_mode(config, dry_run=args.dry_run)
     blocksize = block_samples()
     detector = ClapDetector()
-    welcome_sequence_done = False
+    desk_sequence_done = False
+    shutdown_event = threading.Event()
 
     if debug_audio:
         log.info("Audio debug mode enabled: all desktop actions are disabled.")
@@ -2484,84 +3196,158 @@ def main(
         configured_device=config.input_device,
         log_devices=not debug_audio,
     )
+    input_name = sd.query_devices(input_idx)["name"]
     if debug_audio:
-        input_name = sd.query_devices(input_idx)["name"]
         log.info("Input device [%d]: %s", input_idx, input_name)
         log.info("Ready for calibration test. Ctrl+C to stop.")
+    voice_controller = (
+        VoiceWakeController(
+            config,
+            input_idx=input_idx,
+            input_name=input_name,
+            shutdown_event=shutdown_event,
+        )
+        if not debug_audio and config.session_mode == "clap_then_voice"
+        else None
+    )
+    active_session = None
+    if voice_controller is not None:
+        try:
+            _validate_system_speech_microphone(
+                config,
+                selected_input_idx=input_idx,
+            )
+        except RuntimeError as exc:
+            log.error("Wake-word microphone configuration error: %s", exc)
+            return 2
+        active_session = ActiveJarvisSession(
+            config,
+            voice_controller=voice_controller,
+            shutdown_event=shutdown_event,
+        )
+        log.info("Jarvis inactive.")
+        log.info("Waiting for activation double clap.")
 
     try:
-        with sd.InputStream(
-            device=input_idx,
-            samplerate=SAMPLE_RATE,
-            channels=CHANNELS,
-            dtype="float32",
-            blocksize=blocksize,
-        ) as stream:
-            summary_started = time.monotonic()
-            summary_count = 0
-            summary_total = 0.0
-            summary_min = float("inf")
-            summary_max = 0.0
+        while True:
+            activation_requested = False
+            with sd.InputStream(
+                device=input_idx,
+                samplerate=SAMPLE_RATE,
+                channels=CHANNELS,
+                dtype="float32",
+                blocksize=blocksize,
+            ) as stream:
+                summary_started = time.monotonic()
+                summary_count = 0
+                summary_total = 0.0
+                summary_min = float("inf")
+                summary_max = 0.0
 
-            while True:
-                data, overflowed = stream.read(blocksize)
-                if overflowed:
-                    log.warning("Input overflow; try a larger BLOCK_MS")
+                while True:
+                    data, overflowed = stream.read(blocksize)
+                    if overflowed:
+                        log.warning("Input overflow; try a larger BLOCK_MS")
 
-                level = rms_mono(data)
-                now = time.monotonic()
-                events = detector.process(level, now)
+                    level = rms_mono(data)
+                    now = time.monotonic()
+                    events = detector.process(level, now)
 
-                if debug_audio:
-                    _log_debug_events(events)
-                    summary_count += 1
-                    summary_total += level
-                    summary_min = min(summary_min, level)
-                    summary_max = max(summary_max, level)
-                    elapsed = now - summary_started
-                    if elapsed >= DEBUG_AUDIO_SUMMARY_S:
-                        log.info(
-                            "Audio RMS summary (%.1fs): mean=%.5f, min=%.5f, "
-                            "max=%.5f, noise_floor=%.5f, threshold=%.5f",
-                            elapsed,
-                            summary_total / summary_count,
-                            summary_min,
-                            summary_max,
-                            detector.noise_floor,
-                            detector.threshold,
-                        )
-                        summary_started = now
-                        summary_count = 0
-                        summary_total = 0.0
-                        summary_min = float("inf")
-                        summary_max = 0.0
-                    continue
+                    if debug_audio:
+                        _log_debug_events(events)
+                        summary_count += 1
+                        summary_total += level
+                        summary_min = min(summary_min, level)
+                        summary_max = max(summary_max, level)
+                        elapsed = now - summary_started
+                        if elapsed >= DEBUG_AUDIO_SUMMARY_S:
+                            log.info(
+                                "Audio RMS summary (%.1fs): mean=%.5f, min=%.5f, "
+                                "max=%.5f, noise_floor=%.5f, threshold=%.5f",
+                                elapsed,
+                                summary_total / summary_count,
+                                summary_min,
+                                summary_max,
+                                detector.noise_floor,
+                                detector.threshold,
+                            )
+                            summary_started = now
+                            summary_count = 0
+                            summary_total = 0.0
+                            summary_min = float("inf")
+                            summary_max = 0.0
+                        continue
 
-                for event in events:
-                    if (
-                        event.kind is ClapEventType.DOUBLE_CLAP
-                        and not welcome_sequence_done
-                    ):
-                        welcome_sequence_done = True
-                        log.info(
-                            "Double clap detected (gap=%.3fs, rms=%.5f, "
-                            "noise_floor=%.5f, threshold=%.5f) — running welcome once",
-                            event.interval,
-                            event.level,
-                            event.noise_floor,
-                            event.threshold,
-                        )
-                        threading.Thread(
-                            target=run_double_clap_actions,
-                            args=(config,),
-                            daemon=True,
-                            name="jarvis-startup-sequence",
-                        ).start()
+                    for event in events:
+                        if event.kind is not ClapEventType.DOUBLE_CLAP:
+                            continue
+                        if config.session_mode == "clap_then_voice":
+                            log.info(
+                                "Double clap detected (gap=%.3fs, rms=%.5f, "
+                                "noise_floor=%.5f, threshold=%.5f).",
+                                event.interval,
+                                event.level,
+                                event.noise_floor,
+                                event.threshold,
+                            )
+                            activation_requested = True
+                            break
+                        if not desk_sequence_done:
+                            desk_sequence_done = True
+                            log.info(
+                                "Double clap detected (gap=%.3fs, rms=%.5f, "
+                                "noise_floor=%.5f, threshold=%.5f) — running "
+                                "desk routine once",
+                                event.interval,
+                                event.level,
+                                event.noise_floor,
+                                event.threshold,
+                            )
+                            threading.Thread(
+                                target=run_double_clap_actions,
+                                args=(config,),
+                                daemon=True,
+                                name="jarvis-startup-sequence",
+                            ).start()
+                    if activation_requested:
+                        break
+
+            if not activation_requested:
+                continue
+            log.info("Clap stream stopped; microphone released for desk mode.")
+            try:
+                results = run_desk_mode(config)
+                failures = [result for result in results if not result.succeeded]
+                if failures:
+                    log.warning(
+                        "Desk mode completed with %d failed action(s); "
+                        "Jarvis session will still activate.",
+                        len(failures),
+                    )
+            except Exception as exc:
+                detail = str(exc).strip() or type(exc).__name__
+                log.warning(
+                    "Desk mode encountered an unexpected failure: %s; "
+                    "Jarvis session will still activate.",
+                    detail,
+                )
+            if active_session is None:
+                return 1
+            active_session.run_forever()
+            return 0
 
     except KeyboardInterrupt:
-        log.info("Stopped.")
+        log.info("Shutdown requested.")
+        shutdown_event.set()
+        if active_session is not None:
+            active_session.stop()
+        elif voice_controller is not None:
+            voice_controller.stop()
+        log.info("Stopping Jarvis.")
         return 0
     except sd.PortAudioError as e:
+        if active_session is not None:
+            active_session.stop()
         log.error("Audio error: %s", e)
         log.error("If PortAudio fails, install/repair drivers or try another SAMPLE_RATE.")
         return 1

@@ -148,7 +148,7 @@ class MainModeSafetyTests(unittest.TestCase):
 
     @patch("jarvis.threading.Thread")
     @patch("jarvis._choose_input_device", return_value=1)
-    def test_normal_mode_schedules_actions_only_once_per_process(
+    def test_desk_mode_schedules_actions_only_once_per_process(
         self,
         _choose_input_device,
         thread,
@@ -159,7 +159,10 @@ class MainModeSafetyTests(unittest.TestCase):
         with patch("jarvis.sd.InputStream", return_value=stream), patch(
             "jarvis.time.monotonic", side_effect=times
         ):
-            result = jarvis.main([], config=load_config({}))
+            result = jarvis.main(
+                [],
+                config=load_config({"DOUBLE_CLAP_MODE": "desk"}),
+            )
 
         self.assertEqual(result, 0)
         self.assertEqual(thread.call_count, 1)

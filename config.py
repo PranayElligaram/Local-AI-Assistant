@@ -17,6 +17,8 @@ TRUE_VALUES = frozenset({"true", "1", "yes", "on"})
 FALSE_VALUES = frozenset({"false", "0", "no", "off"})
 SPOTIFY_SCHEMES = frozenset({"spotify", "http", "https"})
 CLAUDE_SCHEMES = frozenset({"claude", "http", "https"})
+JARVIS_SESSION_MODES = frozenset({"clap_then_voice", "desk"})
+LEGACY_DOUBLE_CLAP_MODES = frozenset({"voice", "desk"})
 
 
 class ConfigError(ValueError):
@@ -57,6 +59,20 @@ def _bool(
     if raw == "":
         return default
     return parse_bool(raw, name=name)
+
+
+def _choice(
+    env: Mapping[str, str],
+    name: str,
+    default: str,
+    *,
+    allowed: frozenset[str],
+) -> str:
+    value = _text(env, name, default).casefold()
+    if value not in allowed:
+        choices = ", ".join(sorted(allowed))
+        raise ConfigError(f"{name} must be one of: {choices}; got {value!r}")
+    return value
 
 
 def _int(
@@ -102,6 +118,7 @@ def _float(
     default: float,
     *,
     minimum: float | None = None,
+    maximum: float | None = None,
 ) -> float:
     raw = _text(env, name)
     if raw == "":
@@ -112,6 +129,8 @@ def _float(
         raise ConfigError(f"{name} must be a number; got {raw!r}") from exc
     if minimum is not None and value < minimum:
         raise ConfigError(f"{name} must be at least {minimum}; got {value}")
+    if maximum is not None and value > maximum:
+        raise ConfigError(f"{name} must be at most {maximum}; got {value}")
     return value
 
 
@@ -154,6 +173,11 @@ def _validate_target(name: str, target: str, allowed_schemes: frozenset[str]) ->
 @dataclass(frozen=True)
 class JarvisConfig:
     input_device: str | None
+    session_mode: str
+    wake_phrase: str
+    wake_word_min_confidence: float
+    voice_command_timeout_s: float
+    voice_min_confidence: float
 
     open_spotify: bool
     song_uri: str
@@ -197,6 +221,11 @@ class JarvisConfig:
     @property
     def spotify_enabled(self) -> bool:
         return self.open_spotify and bool(self.song_uri)
+
+    @property
+    def double_clap_mode(self) -> str:
+        """Legacy view retained for callers that still distinguish voice/desk."""
+        return "voice" if self.session_mode == "clap_then_voice" else "desk"
 
     @property
     def claude_scheme(self) -> str:
@@ -368,9 +397,56 @@ def load_config(
     )
 
     input_device = _text(source, "JARVIS_INPUT_DEVICE") or None
+    session_mode_raw = _text(source, "JARVIS_SESSION_MODE")
+    if session_mode_raw:
+        session_mode = _choice(
+            source,
+            "JARVIS_SESSION_MODE",
+            "clap_then_voice",
+            allowed=JARVIS_SESSION_MODES,
+        )
+    else:
+        legacy_mode = _choice(
+            source,
+            "DOUBLE_CLAP_MODE",
+            "voice",
+            allowed=LEGACY_DOUBLE_CLAP_MODES,
+        )
+        session_mode = "clap_then_voice" if legacy_mode == "voice" else "desk"
+    wake_phrase = _text(source, "WAKE_PHRASE", "jarvis")
+    if not wake_phrase:
+        raise ConfigError("WAKE_PHRASE must not be empty")
+    if any(character in wake_phrase for character in "\r\n\0"):
+        raise ConfigError("WAKE_PHRASE must be a single line of text")
+    wake_word_min_confidence = _float(
+        source,
+        "WAKE_WORD_MIN_CONFIDENCE",
+        0.80,
+        minimum=0.0,
+        maximum=1.0,
+    )
+    voice_command_timeout_s = _float(
+        source,
+        "VOICE_COMMAND_TIMEOUT_S",
+        5.0,
+        minimum=1.0,
+        maximum=30.0,
+    )
+    voice_min_confidence = _float(
+        source,
+        "VOICE_MIN_CONFIDENCE",
+        0.75,
+        minimum=0.0,
+        maximum=1.0,
+    )
 
     return JarvisConfig(
         input_device=input_device,
+        session_mode=session_mode,
+        wake_phrase=wake_phrase,
+        wake_word_min_confidence=wake_word_min_confidence,
+        voice_command_timeout_s=voice_command_timeout_s,
+        voice_min_confidence=voice_min_confidence,
         open_spotify=open_spotify,
         song_uri=song_uri,
         spotify_monitor=spotify_monitor,

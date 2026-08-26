@@ -65,6 +65,14 @@ class CommandRouterTests(unittest.TestCase):
         self.assertEqual([result.command for result in results], ["desk_mode"] * 2)
         self.assertEqual(desk.call_count, 2)
 
+    def test_router_exposes_registered_spoken_aliases_as_grammar(self) -> None:
+        phrases = jarvis.create_command_router(self.config).accepted_phrases
+
+        self.assertIn("start my desk", phrases)
+        self.assertIn("open netflix", phrases)
+        self.assertIn("what time is it", phrases)
+        self.assertNotIn("desk_mode", phrases)
+
     def test_open_claude_routes_to_existing_desktop_action(self) -> None:
         with patch("jarvis.open_claude") as action:
             result = jarvis.create_command_router(self.config).route("launch claude")
@@ -98,13 +106,54 @@ class CommandRouterTests(unittest.TestCase):
         self.assertEqual(result.command, "open_netflix")
         action.assert_called_once_with(self.config)
 
-    def test_open_spotify_routes_to_existing_action(self) -> None:
-        with patch("jarvis.open_spotify") as action:
+    def test_play_spotify_routes_to_existing_background_action(self) -> None:
+        with patch("jarvis.open_spotify") as action, patch(
+            "jarvis._enforce_spotify_minimized_final", return_value=True
+        ) as enforce, patch("jarvis.time.sleep") as settle:
             result = jarvis.create_command_router(self.config).route("play spotify")
 
         self.assertTrue(result.success)
-        self.assertEqual(result.command, "open_spotify")
+        self.assertEqual(result.command, "play_spotify")
+        self.assertEqual(result.message, "Spotify playing in background.")
         action.assert_called_once_with(self.config)
+        settle.assert_called_once_with(jarvis.SPOTIFY_PLAY_SETTLE_S)
+        enforce.assert_called_once_with()
+
+    def test_play_spotify_fails_if_final_minimize_is_not_verified(self) -> None:
+        with patch("jarvis.open_spotify"), patch(
+            "jarvis._enforce_spotify_minimized_final", return_value=False
+        ), patch("jarvis.time.sleep"):
+            result = jarvis.create_command_router(self.config).route("play spotify")
+
+        self.assertFalse(result.success)
+        self.assertIn("could not be kept minimized", result.message)
+
+    def test_play_spotify_is_background_even_if_general_launch_minimize_is_off(self) -> None:
+        config = load_config(
+            {
+                "OPEN_SPOTIFY": "true",
+                "SONG_URI": "spotify:track:test",
+                "SPOTIFY_MINIMIZE": "false",
+            }
+        )
+        with patch("jarvis.open_spotify"), patch(
+            "jarvis.time.sleep"
+        ), patch("jarvis._enforce_spotify_minimized_final", return_value=True) as enforce:
+            result = jarvis.create_command_router(config).route("play spotify")
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.message, "Spotify playing in background.")
+        enforce.assert_called_once_with()
+
+    def test_open_and_show_spotify_route_to_foreground_action(self) -> None:
+        with patch("jarvis.show_spotify_window") as action:
+            router = jarvis.create_command_router(self.config)
+            open_result = router.route("open spotify")
+            show_result = router.route("show spotify")
+
+        self.assertEqual(open_result.command, "show_spotify")
+        self.assertEqual(show_result.command, "show_spotify")
+        self.assertEqual(action.call_count, 2)
 
     def test_close_netflix_targets_only_identified_netflix_hwnd(self) -> None:
         netflix = jarvis.DesktopWindow(
@@ -127,7 +176,14 @@ class CommandRouterTests(unittest.TestCase):
     def test_close_claude_targets_visible_desktop_process_only(self) -> None:
         windows = [
             jarvis.DesktopWindow(10, "python.exe", "Claude CLI", 2_000_000),
-            jarvis.DesktopWindow(11, "claude.exe", "Claude", 1_000_000),
+            jarvis.DesktopWindow(
+                11,
+                "claude.exe",
+                "Claude",
+                1_000_000,
+                class_name="Chrome_WidgetWin_1",
+                visible=True,
+            ),
         ]
         with patch(
             "jarvis._visible_top_level_windows_win32", return_value=windows
@@ -377,6 +433,21 @@ class CommandCliTests(unittest.TestCase):
             jarvis._parse_args(
                 ["--debug-audio", "--command", "open netflix"]
             )
+
+    def test_listen_command_conflicts_with_other_execution_modes(self) -> None:
+        for arguments in (
+            ["--debug-audio", "--listen-command"],
+            ["--command", "open netflix", "--listen-command"],
+        ):
+            with self.subTest(arguments=arguments):
+                with self.assertRaises(SystemExit):
+                    jarvis._parse_args(arguments)
+
+    def test_listen_command_accepts_dry_run(self) -> None:
+        args = jarvis._parse_args(["--listen-command", "--dry-run"])
+
+        self.assertTrue(args.listen_command)
+        self.assertTrue(args.dry_run)
 
     def test_dry_run_requires_command(self) -> None:
         with self.assertRaises(SystemExit):

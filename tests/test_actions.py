@@ -41,26 +41,27 @@ class DesktopRoutingTests(unittest.TestCase):
             CLAUDE_URL="claude://claude.ai/new",
             FOCUS_CURSOR="false",
         )
-        with patch.object(jarvis.os, "startfile", create=True) as startfile:
+        with patch("jarvis._open_claude_desktop_verified") as desktop:
             jarvis.open_claude(config)
 
-        startfile.assert_called_once_with("claude://claude.ai/new")
+        desktop.assert_called_once_with(config)
 
     def test_claude_desktop_mode_bypasses_all_chrome_logic(self) -> None:
         config = action_config(
             CLAUDE_URL="claude://claude.ai/new",
             FOCUS_CURSOR="false",
         )
-        with patch("jarvis._open_registered_uri") as dispatch, patch(
+        with patch("jarvis._open_claude_desktop_verified") as desktop, patch(
+            "jarvis._open_registered_uri"
+        ) as dispatch, patch(
             "jarvis.open_claude_in_chrome"
         ) as browser, patch("jarvis._chrome_monitor_top_left") as position, patch(
             "jarvis._chrome_monitor_pixel_size"
         ) as size, patch("jarvis._wait_new_chrome_hwnd_win32") as wait:
             jarvis.open_claude(config)
 
-        dispatch.assert_called_once_with(
-            "claude://claude.ai/new", label="Claude Desktop URI"
-        )
+        desktop.assert_called_once_with(config)
+        dispatch.assert_not_called()
         browser.assert_not_called()
         position.assert_not_called()
         size.assert_not_called()
@@ -386,19 +387,10 @@ class MonitorPlacementTests(unittest.TestCase):
             CLAUDE_URL="claude://claude.ai/new",
             CLAUDE_MONITOR="1",
         )
-        with patch("jarvis._current_app_hwnds", return_value={20}), patch(
-            "jarvis._open_registered_uri"
-        ) as launch, patch("jarvis._place_desktop_window", return_value=True) as place:
+        with patch("jarvis._open_claude_desktop_verified") as desktop:
             jarvis.open_claude(config)
 
-        launch.assert_called_once_with(config.claude_url, label="Claude Desktop URI")
-        place.assert_called_once_with(
-            label="Claude",
-            monitor=1,
-            process_names=("claude.exe",),
-            previous_hwnds={20},
-            maximize=False,
-        )
+        desktop.assert_called_once_with(config)
 
     def test_claude_moves_then_maximizes(self) -> None:
         self._assert_move_then_maximize(

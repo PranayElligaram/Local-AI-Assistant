@@ -1,7 +1,8 @@
-# Desktop clap → Jarvis-style welcome
+# Jarvis desktop assistant
 
-Python script that listens to your default microphone and runs a configurable
-**double-clap** desktop workflow.
+Windows-focused Python assistant with one-time double-clap session activation,
+offline System.Speech wake recognition, deterministic spoken commands, and a
+configurable desktop routine.
 
 ## Setup
 
@@ -45,6 +46,10 @@ clear configuration error.
 | `JARVIS_WELCOME_PHRASE` | `Welcome home.` | Spoken welcome text. |
 | `ELEVENLABS_API_KEY` / `ELEVENLABS_VOICE_ID` | empty | Optional ElevenLabs credentials. These are never logged and belong only in `.env` or the process environment. |
 | `JARVIS_INPUT_DEVICE` | empty | Optional mic index or unique device-name substring. Ambiguous names are rejected. |
+| `JARVIS_SESSION_MODE` | `clap_then_voice` | One activation double clap runs desk mode, then Jarvis waits persistently for its wake phrase. `desk` retains the legacy once-per-process routine. |
+| `WAKE_PHRASE` / `WAKE_WORD_MIN_CONFIDENCE` | `jarvis` / `0.80` | Single-phrase persistent System.Speech wake grammar and its acceptance threshold. |
+| `VOICE_COMMAND_TIMEOUT_S` | `5` | Maximum seconds to wait for speech in one-shot command-listening mode. |
+| `VOICE_MIN_CONFIDENCE` | `0.75` | Reject constrained-grammar recognition below this confidence (range `0.0`-`1.0`). |
 | `OPEN_CHROME_FULLSCREEN` / `CLAUDE_CHROME_MONITOR` | `true` / `1` | Windows Chrome placement. |
 
 Advanced optional values and defaults are listed in `.env.example`, including
@@ -91,10 +96,15 @@ python jarvis.py --command "start my desk"
 ```
 
 Supported commands are desk mode (`start my desk`, `desk mode`, `start desk
-mode`), opening Claude/Netflix/Spotify, closing Claude/Netflix, minimizing
-Spotify, and reporting the local time. Commands are normalized for case,
-whitespace, and simple punctuation, but are otherwise exact and deterministic.
-Unknown text never becomes a shell command or an application launch.
+mode`), opening Claude/Netflix, showing Spotify, background Spotify playback,
+closing Claude/Netflix, minimizing Spotify, and reporting the local time.
+`open spotify` and `show spotify` restore and foreground the existing desktop
+window without replaying the configured URI. `play spotify` and desk mode retain
+the configured URI; `play spotify` always waits for URI activation to settle and
+then verifies Spotify is minimized, while desk mode retains its configured final
+minimization behavior. Commands are normalized for case, whitespace, and simple
+punctuation, but are otherwise exact and deterministic. Unknown text never
+becomes a shell command or an application launch.
 
 Use `--dry-run` with `--command` to resolve a command without executing it:
 
@@ -102,9 +112,62 @@ Use `--dry-run` with `--command` to resolve a command without executing it:
 python jarvis.py --command "open netflix" --dry-run
 ```
 
-`--command` and `--debug-audio` are mutually exclusive. Until the separately
-tested speech-recognition phase is implemented, the normal double clap continues
-to run the existing desk routine directly.
+`--command` and `--debug-audio` are mutually exclusive. Normal no-argument
+execution follows `JARVIS_SESSION_MODE`.
+
+### One-shot speech command mode
+
+On Windows, Jarvis can record one bounded utterance from the same selected
+`JARVIS_INPUT_DEVICE`, release the microphone, and transcribe the recording with
+the installed **Microsoft Speech Recognizer 8.0 for Windows (English - UK)**.
+Recognition is offline and constrained to the aliases exposed by the production
+command router. Recognized text cannot become a shell command.
+
+Test recognition without launching desktop applications:
+
+```powershell
+python jarvis.py --listen-command --dry-run
+```
+
+Or recognize and execute one registered command, then exit:
+
+```powershell
+python jarvis.py --listen-command
+```
+
+`--listen-command`, `--command`, and `--debug-audio` are mutually exclusive.
+`--dry-run` is valid with either command mode.
+
+With `JARVIS_SESSION_MODE=clap_then_voice`, Jarvis starts inactive. The first
+double clap permanently closes the clap stream, runs the existing desk routine,
+and starts a persistent System.Speech recognizer whose grammar contains only
+`WAKE_PHRASE`. After that phrase is accepted, the wake process releases the
+microphone, the existing one-shot command recognizer records and routes one
+command, and wake recognition starts again. Timeout, no-match, low confidence,
+integration failure, and command failure all return to wake-phrase listening.
+The legacy `DOUBLE_CLAP_MODE=voice` value maps to `clap_then_voice`; prefer the
+new setting. `JARVIS_SESSION_MODE=desk` retains the original one-shot routine.
+
+System.Speech wake recognition uses the Windows default input device. If
+`JARVIS_INPUT_DEVICE` explicitly selects a different device, Jarvis stops with a
+clear configuration error instead of silently listening on the wrong microphone.
+
+### Start Jarvis automatically at Windows login
+
+`start_jarvis.bat` derives the repository directory from its own location, uses
+`.venv\Scripts\python.exe`, and keeps the console visible. After runtime behavior
+has been physically validated, install a current-user Startup shortcut once:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\install_startup.ps1
+```
+
+This requires no administrator rights and does not create a service or scheduled
+task. Remove only the Jarvis shortcut with:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\uninstall_startup.ps1
+```
 
 ## Audio calibration
 
