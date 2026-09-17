@@ -1,8 +1,18 @@
 import { BRIDGE_HTTP_URL } from '../config'
-import { getMic } from './audio'
+import { getMic, onMicChange } from './audio'
 import { speakingNow, speakingSince } from './tts'
-import { startVad, type Vad } from './vad'
+import { startVad, type Vad, type VadHandlers } from './vad'
 import { caps } from './capabilities'
+import {
+  MAX_HOLD_MS,
+  OVERRIDE,
+  SELF_GUARD_MS,
+  WAKE,
+  WAKE_DEBOUNCE,
+  afterWake,
+  holdFor,
+  isEcho,
+} from './wake'
 
 /**
  * The voice loop.
@@ -58,39 +68,6 @@ export type Voice = {
 }
 
 // ---------------------------------------------------------------------------
-// Endpointing
-// ---------------------------------------------------------------------------
-
-/** One utterance often produces several partials containing his name. */
-const WAKE_DEBOUNCE = 1500
-
-/**
- * His name, and the only wake phrase.
- *
- * The optional prefix is genuinely optional: addressing him by name alone is
- * correct, and during an answer "Jarvis" on its own is the natural way to cut
- * in. The negative lookahead keeps possessives ("Jarvis's job") from waking him.
- *
- * The alternates are not padding. "Jarvis" is not in a general dictation
- * model's high-frequency vocabulary, and Chrome routinely returns Travis,
- * Jervis, Jarvys or Java's for a perfectly clear utterance — every one of which
- * used to be silently discarded, so the wake word "just didn't work" with no
- * indication why. Better a rare false wake than a name that does not answer.
- */
-const WAKE =
-  /\b(?:hey|hi|ok|okay|yo)?\s*(?:jarvis|jarvys|jervis|jarvis's|travis|jarviss|java's|jarv)\b(?!'s)/i
-
-/** Everything after the wake phrase, which is usually the actual command. */
-function afterWake(text: string): string {
-  const m = WAKE.exec(text)
-  if (!m) return ''
-  return text
-    .slice(m.index + m[0].length)
-    .replace(/^[\s,.:;!?-]+/, '')
-    .trim()
-}
-
-// ---------------------------------------------------------------------------
 // Assembling one utterance out of several segments
 // ---------------------------------------------------------------------------
 
@@ -116,68 +93,6 @@ function afterWake(text: string): string {
  * is a reason to wait.
  */
 
-/**
- * Ending on one of these means the sentence is not over, whatever the silence
- * says. Function words only: they are closed-class, so the list is complete in
- * a way a content-word list could never be, and none of them is a plausible
- * last word of a real request.
- */
-const CONTINUES =
-  /\b(and|or|but|so|because|since|if|when|while|that|which|who|whose|to|of|in|on|at|by|for|with|from|about|into|onto|over|under|between|through|the|a|an|my|your|his|her|its|our|their|is|are|was|were|be|been|do|does|did|have|has|had|can|could|would|should|will|shall|might|must|like|than|then|as|very|really|just|some|any|all|both|either|neither)$/i
-
-/** Trailing punctuation a transcriber emits mid-thought. */
-const TRAILS = /[,;:–—-]$/
-
-/**
- * A barge-in this soon after he starts a sentence is him, not you.
- *
- * Echo cancellation and the raised guard threshold stop most of his playback
- * reaching the detector, but the attack of the very first syllable is the
- * loudest, least-cancelled thing in the whole answer — it arrives before the
- * canceller has adapted to it. Without this, a long answer could interrupt
- * itself on its own first word, which reads as JARVIS refusing to speak.
- *
- * Kept short deliberately. This is the one window where a genuine interruption
- * is also least likely: the user has not yet heard enough to want to stop him.
- */
-const SELF_GUARD_MS = 350
-
-/**
- * A quiet gap this long with a finished-looking sentence ends the turn.
- *
- * Small on purpose: by the time a transcript reaches the assembler the detector
- * has already sat through SILENCE_MS of quiet and the transcriber has taken its
- * own few hundred milliseconds, so roughly a second of real silence has passed
- * already. All this window has to catch is someone drawing breath to add one
- * more clause. Making it generous here is what would make every ordinary
- * question feel slow.
- */
-const SETTLE_MS = 250
-/** ...and this long when the sentence is plainly unfinished. */
-const CONTINUE_MS = 1600
-/**
- * Nothing is held longer than this in total. A ceiling rather than a timer:
- * without it, someone who ends every clause on "and" could hold a turn open
- * for ever, and the assistant would look like it had stopped listening.
- */
-const MAX_HOLD_MS = 6000
-
-/**
- * How long to keep waiting, given what has been said so far.
- * 0 means "this is a complete thought, send it now".
- */
-function holdFor(text: string): number {
-  const words = text.trim().split(/\s+/).filter(Boolean)
-  if (!words.length) return CONTINUE_MS
-  // An explicit terminator is the speaker telling us they are done.
-  if (/[.!?]$/.test(text)) return 0
-  if (TRAILS.test(text.trim())) return CONTINUE_MS
-  if (CONTINUES.test(words[words.length - 1])) return CONTINUE_MS
-  // One or two words is usually the start of something, not the whole of it —
-  // except for the short commands that genuinely are complete.
-  if (words.length <= 2 && !OVERRIDE.test(text)) return CONTINUE_MS
-  return SETTLE_MS
-}
 
 type Assembler = {
   /** Add a transcript. `active` is true if the user is audibly still going. */
@@ -250,72 +165,6 @@ function makeAssembler(h: {
   }
 }
 
-// ---------------------------------------------------------------------------
-// Hearing himself
-// ---------------------------------------------------------------------------
-
-const norm = (s: string) =>
-  s
-    .toLowerCase()
-    .replace(/[^a-z0-9' ]+/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim()
-
-/**
- * Short words that must always cut through, even when they collide with what
- * he happens to be saying. Suppressing "stop" because he just said "stop"
- * would be the single most infuriating failure this file could have.
- */
-const OVERRIDE =
-  /\b(stop|wait|jarvis|cancel|enough|quiet|hold on|shut up|never ?mind|forget it|no)\b/i
-
-/**
- * Words too common to be evidence of anything.
- *
- * This set is the difference between a usable filter and an infuriating one.
- * "What about the second one?" is a perfectly ordinary follow-up, and every
- * word in it is likely to appear somewhere in the answer it follows — so a
- * naive bag-of-words match suppresses the user's real question as an echo.
- * Only distinctive words count as proof he is hearing himself.
- */
-const STOP = new Set(
-  ('a an the and or but so of to in on at by for with from is are was were be ' +
-    'it its this that these those i you he she we they me him her them my your ' +
-    'our their what which who how why when where do does did can could would ' +
-    'should will shall not no yes if then than as about into over under out up ' +
-    'down one two three first second third now here there just very really got ' +
-    'get have has had say said tell me okay ok well right').split(' '),
-)
-
-/**
- * Is this the microphone hearing the speakers?
- *
- * Compared as bags of words rather than by string distance: the recogniser
- * mangles its own playback badly enough that a substring match rarely holds,
- * but the *words* survive.
- */
-function isEcho(heard: string, spoken: string): boolean {
-  if (!spoken) return false
-  if (OVERRIDE.test(heard)) return false
-
-  const all = norm(heard).split(' ').filter(Boolean)
-  if (!all.length) return true
-
-  const mine = new Set(norm(spoken).split(' '))
-  const content = all.filter((w) => !STOP.has(w))
-
-  // Nothing distinctive was said at all, so there is no strong evidence either
-  // way. Demand a total match before discarding it — the cost of dropping a
-  // real question is much higher than the cost of one stray echo getting in.
-  if (content.length < 2) {
-    if (all.length < 2) return false
-    return all.every((w) => mine.has(w))
-  }
-
-  let hits = 0
-  for (const w of content) if (mine.has(w)) hits++
-  return hits / content.length >= 0.6
-}
 
 // ---------------------------------------------------------------------------
 // Diagnostics
@@ -517,7 +366,7 @@ async function startElevenVoice(h: VoiceHandlers): Promise<Voice> {
     }
   }
 
-  vad = await startVad({
+  const vadHandlers: VadHandlers = {
     onStart: () => {
       const mode = h.mode()
       diag.mode = mode
@@ -553,13 +402,37 @@ async function startElevenVoice(h: VoiceHandlers): Promise<Voice> {
       if (assemble.held()) return
       h.onPartial(v > 0.04 ? '…' : '')
     },
-    onError: (message) => {
+    onError: (message: string) => {
       diag.lastError = 'capture'
       diag.running = false
       h.onError(message)
     },
-  })
+  }
+
+  vad = await startVad(vadHandlers)
   diag.running = vad.live()
+
+  /**
+   * The detector is bound to one MediaStream, so a device that goes away and
+   * comes back leaves it analysing a dead track — silently, for ever. audio.ts
+   * reopens the device; this rebuilds the detector on top of the new stream.
+   * Without it, "unplug the headset" is a permanent deafness that only a page
+   * reload fixes.
+   */
+  const stopWatchingMic = onMicChange(() => {
+    void (async () => {
+      try {
+        vad?.stop()
+        vad = await startVad(vadHandlers)
+        diag.running = vad.live()
+        diag.restarts++
+        diag.lastError = ''
+      } catch (err) {
+        diag.running = false
+        diag.lastError = `mic restart: ${String(err)}`
+      }
+    })()
+  })
 
   // Raise the trigger bar exactly while he speaks. The mode is polled rather
   // than pushed because nothing in the app pushes phase changes here, and a
@@ -577,6 +450,7 @@ async function startElevenVoice(h: VoiceHandlers): Promise<Voice> {
   return {
     stop: () => {
       clearInterval(guardPoll)
+      stopWatchingMic()
       assemble.cancel()
       vad?.stop()
       diag.running = false

@@ -8,11 +8,11 @@
  * Two things this buys over calling the Claude API from the browser:
  *   1. No API key. It authenticates exactly the way `claude` does, off your
  *      existing login, and bills to that same account.
- *   2. Every MCP server in your Claude Code config is available, including the
- *      local stdio ones a browser could never reach — higgsfield, elevenlabs,
- *      android, playwright, palmier-pro and the rest.
+ *   2. It can spawn local stdio MCP servers, which a browser tab cannot. In
+ *      THIS fork those servers are opt-in and project-local (see MCP_SERVERS
+ *      below); the user's global Claude Code configuration is never read.
  *
- *   node bridge/server.mjs
+ *   node bridge/server.mjs            (add --writes to permit effectful tools)
  */
 
 import { WebSocketServer } from 'ws'
@@ -22,13 +22,49 @@ import { uiServer } from './ui.mjs'
 import { chromeAvailable, chromeServer } from './chrome.mjs'
 import { visionServer } from './vision.mjs'
 import { homedir, tmpdir } from 'node:os'
-import { readFileSync, realpathSync } from 'node:fs'
+import { mkdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { readFile, realpath, stat } from 'node:fs/promises'
 import { isAbsolute, join, relative, resolve as resolvePath } from 'node:path'
+import { randomUUID } from 'node:crypto'
 import { openRemote, proxyError, vetTarget, PROXY_UA } from './net.mjs'
-import { probeUrl, renderPage } from './page.mjs'
+import { renderPage } from './page.mjs'
+import {
+  ALLOW_NO_ORIGIN,
+  ALLOW_WRITES,
+  EFFORT,
+  ELEVEN_TIMEOUT_MS,
+  ENABLE_CAMERA,
+  ENABLE_CHROME,
+  ENV_FILES_LOADED,
+  EXTRA_ORIGINS,
+  MIN_NODE_MAJOR,
+  MODEL,
+  PORT,
+  ROOT,
+  STT_TIMEOUT_MS,
+  VOICE_ID,
+  WORKSPACE,
+  describeElevenSource,
+  elevenKey,
+  mcpConfigPath,
+  nodeTooOld,
+  projectServers,
+} from './config.mjs'
+import { decideTool as decide, originAllowed as allowOrigin } from './policy.mjs'
 
-const PORT = Number(process.env.JARVIS_BRIDGE_PORT ?? 8787)
+/**
+ * The Agent SDK and several of the APIs below (structuredClone, fetch with
+ * FormData, AbortSignal.timeout) need a modern Node. On Windows the default
+ * `node` on PATH is frequently an old one left over from another project, and
+ * the failure without this check is a stack trace deep inside a dependency.
+ */
+if (nodeTooOld()) {
+  console.error(
+    `[jarvis] this is Node ${process.versions.node}; JARVIS needs Node ${MIN_NODE_MAJOR} or newer.\n` +
+      '        On Windows, start it with scripts\\jarvis.ps1, which finds a suitable Node for you.',
+  )
+  process.exit(1)
+}
 
 /**
  * A crash here takes the whole assistant down mid-sentence, and most of what
@@ -55,240 +91,69 @@ process.on('unhandledRejection', (err) => {
  * That is also exactly what local malware looks like, so it is refused on the
  * socket unless JARVIS_ALLOW_NO_ORIGIN=1 says otherwise.
  */
-const EXTRA_ORIGINS = new Set(
-  (process.env.JARVIS_ALLOWED_ORIGINS ?? '')
-    .split(',')
-    .map((s) => s.trim().replace(/\/+$/, ''))
-    .filter(Boolean),
-)
-const ALLOW_NO_ORIGIN = process.env.JARVIS_ALLOW_NO_ORIGIN === '1'
-
-const LOCAL_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]'])
+const originAllowed = (origin) =>
+  allowOrigin(origin, {
+    extraOrigins: EXTRA_ORIGINS,
+    allowNoOrigin: ALLOW_NO_ORIGIN,
+  })
 
 /**
- * Vite takes the next free port when 5173 is busy and `vite preview` starts at
- * 4173, so the dev ranges are allowed rather than two exact numbers. Anything
- * else — including localhost on a port some other app is serving — has to be
- * named in JARVIS_ALLOWED_ORIGINS.
+ * The tool gate. See policy.mjs for the rules; writes are off unless
+ * JARVIS_ALLOW_WRITES=1 or `npm run bridge:writes` (which passes --writes,
+ * because inline `VAR=1 cmd` is not valid PowerShell).
  */
-const isDevPort = (port) =>
-  (port >= 5173 && port <= 5199) || (port >= 4173 && port <= 4199)
+const decideTool = (name) => decide(name, ALLOW_WRITES)
 
-function originAllowed(origin) {
-  if (!origin) return ALLOW_NO_ORIGIN
-  if (EXTRA_ORIGINS.has(origin.replace(/\/+$/, ''))) return true
-  let url
-  try {
-    url = new URL(origin)
-  } catch {
-    return false
-  }
-  if (url.protocol !== 'http:') return false
-  if (!LOCAL_HOSTS.has(url.hostname)) return false
-  return isDevPort(Number(url.port))
+/**
+ * The MCP servers JARVIS is given, and the part of this file most worth
+ * reading.
+ *
+ * Upstream hands the agent every server in the user's global `~/.claude.json`.
+ * That is how the assistant is meant to reach a phone, a mailbox, a calendar.
+ * It is also how a spoken sentence reaches all of them the moment one is
+ * installed for something else entirely, without anyone having decided that it
+ * should. This fork therefore reads NOTHING outside the repository: no global
+ * Claude Code configuration, no account connectors, no ambient servers. The
+ * global config is not read, not written, and not required to exist.
+ *
+ * What is left is opt-in and project-local — `jarvis.mcp.json`, git-ignored,
+ * absent by default. With no such file JARVIS still answers, searches the web
+ * with the built-in WebSearch and WebFetch tools, draws its own interface,
+ * opens blades and looks through the camera, which is the whole core
+ * assistant. Anything beyond that is added here, deliberately, one at a time.
+ */
+const MCP_SERVERS = projectServers()
+
+/**
+ * What the bridge has actually been doing, for `GET /diagnostics`.
+ *
+ * Every half of this pipeline fails silently by nature — a microphone that
+ * hears nothing, a transcriber that times out and a model that never answers
+ * all look identical from the outside, which is "it doesn't work" with no
+ * further information. Counting the events makes each one a fact you can read
+ * off a page. Nothing here holds a transcript, a key or a spoken line: only
+ * counts, timestamps, and error CATEGORIES.
+ */
+const stats = {
+  startedAt: Date.now(),
+  clients: 0,
+  clientsEver: 0,
+  turns: 0,
+  turnErrors: 0,
+  toolsAllowed: 0,
+  toolsDenied: 0,
+  ttsRequests: 0,
+  ttsFailures: 0,
+  sttRequests: 0,
+  sttFailures: 0,
+  lastHeardAt: 0,
+  lastTurnAt: 0,
+  lastTtsError: '',
+  lastSttError: '',
+  lastTurnError: '',
 }
 
-/**
- * Voice is a bad interface for a confirmation dialog: there is no window to
- * click and the model can't pause for one. So the bridge decides.
- *
- * Read-only and generative tools run freely. Anything that writes to disk,
- * runs a shell, or changes the world waits for JARVIS_ALLOW_WRITES=1. Start
- * without it, and turn it on once you trust what you're demoing.
- */
-const ALLOW_WRITES = process.env.JARVIS_ALLOW_WRITES === '1'
-
-/**
- * The orchestrator model. Override with JARVIS_MODEL to trade quality for pace
- * — claude-sonnet-5 is noticeably snappier on camera if Opus feels slow.
- */
-const MODEL = process.env.JARVIS_MODEL ?? 'claude-opus-5'
-
-/**
- * How hard the model thinks before answering.
- *
- * This was 'low', on the reasoning that a voice assistant is judged on latency
- * — and that is true right up until the answer is thin. Low effort scopes the
- * work tightly to what was literally asked: fewer tool calls, less
- * cross-referencing, no second look. On a model of this tier that is leaving
- * most of it on the table.
- *
- * 'medium' is the compromise worth having here. It reasons and reaches for
- * tools noticeably more than 'low' while still answering inside the window a
- * spoken conversation tolerates. Raise it to 'high' or 'xhigh' when quality
- * matters more than pace; drop back to 'low' when filming and every second of
- * dead air shows.
- */
-const EFFORT = process.env.JARVIS_EFFORT ?? 'high'
-
-/**
- * Both spellings of every renamed built-in are listed on purpose. The SDK
- * presents several tools to the model under newer names — Task is Agent,
- * BashOutput is TaskOutput, KillShell is TaskStop, and the MCP resource tools
- * gained a "Tool" suffix — so a set holding only the old names never matches
- * and the tool falls through to the write branch, which is the opposite of
- * what these lists mean. Keep both until the old names are certainly gone.
- */
-const READ_ONLY_BUILTINS = new Set([
-  'Read', 'Glob', 'Grep', 'WebFetch', 'WebSearch', 'TodoWrite',
-  'Task', 'Agent', 'ToolSearch',
-  'ListMcpResources', 'ListMcpResourcesTool',
-  'ReadMcpResource', 'ReadMcpResourceTool',
-  'BashOutput', 'TaskOutput',
-])
-const WRITE_BUILTINS = new Set([
-  'Bash', 'Write', 'Edit', 'MultiEdit', 'NotebookEdit',
-  'KillShell', 'TaskStop',
-])
-
-/**
- * Every MCP server Claude Code has configured, read out of its own config.
- *
- * This does two jobs. The HUD wants the names while the boot animation plays,
- * and the agent doesn't emit its init message — and therefore its server
- * list — until the first user message flows through, which is far too late.
- * More importantly, this bridge turns filesystem settings off (see
- * settingSources below) and the SDK stops discovering these servers on its
- * own, so handing them over explicitly is what keeps the local stdio ones —
- * the whole reason the bridge exists — in play.
- *
- * Only the global block and the home-directory project scope, because
- * homedir() is our cwd. That makes the list a close but not exact match for
- * the agent's own: the 'ready' sent on connect comes from here and the second
- * one, sent from the init message a turn later, carries live status. Expect
- * the two to differ, and treat the later one as authoritative.
- */
-function configuredServers() {
-  try {
-    const cfg = JSON.parse(
-      readFileSync(join(homedir(), '.claude.json'), 'utf8'),
-    )
-    return {
-      ...(cfg.mcpServers ?? {}),
-      // Servers scoped to the home directory apply too, since that's our cwd.
-      ...(cfg.projects?.[homedir()]?.mcpServers ?? {}),
-    }
-  } catch {
-    return {}
-  }
-}
-
-const MCP_SERVERS = configuredServers()
-
-/** MCP tools arrive as `mcp__<server>__<tool>`. */
-const mcpServerOf = (toolName) =>
-  toolName.startsWith('mcp__') ? toolName.split('__')[1] : null
-
-/** The tool half, which can itself contain underscores: `mcp__x__a__b` -> `a__b`. */
-const mcpToolOf = (toolName) => toolName.split('__').slice(2).join('__')
-
-/**
- * MCP policy, and why it is shaped this way.
- *
- * A short list of "servers that can change things" is the wrong default,
- * because it is a list of what we happened to think of. Every server not on it
- * runs unconditionally — and on a real machine that quietly includes placing a
- * phone call, spending an advertising budget, deleting a generated character
- * and writing files to disk. A voice assistant cannot ask "are you sure", so
- * the bridge has to be the one that is sure.
- *
- * So the default is deny, softened in two ways so the demo stays usable:
- *
- *   1. READ_ONLY_MCP is an explicit allowlist of servers whose whole surface is
- *      lookups and generation — search, registries, analytics reads. Anything
- *      there runs in read-only mode.
- *   2. Everywhere else, the tool has to argue for itself: its own name must
- *      begin with a read verb. `list_devices` runs; `install_apk` does not.
- *
- * On top of both sits a veto: a name containing a plainly effectful verb needs
- * ALLOW_WRITES no matter which server it came from, which is what keeps
- * `make_outbound_call` and `download_lottie` still until you ask for them.
- */
-const READ_ONLY_MCP = new Set([
-  'exa', 'exa-code', 'serper', 'serpapi', 'lottie-search', 'mcp-registry',
-  'openrouter', 'openrouter-image', 'Microsoft_Clarity',
-  // The generation servers belong here too, and leaving them out was a real
-  // regression: `generate_image` begins with no read verb, so it fell to the
-  // deny branch and "generate an image of the Mark VII suit" — the headline
-  // demo — stopped working in the default mode.
-  //
-  // Putting them on the allowlist is safe because the veto below still applies
-  // to allowlisted servers: it is what continues to withhold
-  // make_outbound_call, delete_character, create_* and edit_image. Generation
-  // runs; acting on the world does not.
-  'higgsfield', 'heygen', 'elevenlabs',
-])
-
-/**
- * Anchored on the tool name, so it reads the verb rather than the noun.
- * `screenshot` is in here because it is a read that doesn't sound like one,
- * and the persona is told in as many words to put screenshots on the display.
- */
-const READ_VERB =
-  /^(get|list|read|search|find|query|fetch|check|describe|inspect|show|view|explain|screenshot)/i
-
-/**
- * Unanchored on purpose — `make_outbound_call` and `Bulk-Edit-Events` both
- * hide their verb in the middle. `download` is here because it writes a file
- * even though it sounds like a read.
- */
-const EFFECTFUL_VERB =
-  /(send|call|post|create|delete|remove|update|edit|write|install|launch|tap|swipe|press|type|buy|pay|charge|publish|deploy|outbound|download)/i
-
-/**
- * Tools whose names trip the veto without deserving it.
- *
- * The veto reads verbs out of names, which is the right instinct and
- * occasionally the wrong answer. `openrouter send-message` sends a prompt to a
- * language model and gets text back — nothing in the world changes — but it is
- * indistinguishable by name from sending mail. Asking a second model a question
- * is one of the better things this assistant can do, so it is named here
- * instead of being lost to a regex.
- *
- * Full `server__tool` keys, so an exemption can never leak across servers.
- */
-const VETO_EXEMPT = new Set([
-  'openrouter__send-message',
-  'openrouter__send-feedback',
-])
-
-function decideTool(name) {
-  if (READ_ONLY_BUILTINS.has(name)) return true
-  if (WRITE_BUILTINS.has(name)) return ALLOW_WRITES
-
-  const server = mcpServerOf(name)
-  if (server) {
-    // The HUD, and the interface controls beside it. Both run in this process
-    // and draw on our own screen, so neither is something to withhold —
-    // without them JARVIS has no display at all. They also have to be named
-    // here rather than left to the verb rules below, which read `ui_theme` as
-    // a write and would hold the whole surface back behind ALLOW_WRITES.
-    if (server === 'jarvis' || server === 'jarvis_ui') return true
-
-    // The browser server gates itself, at construction: chromeServer() only
-    // builds the acting tools — click, type, form input, close tab — when
-    // ALLOW_WRITES is set, so anything that reaches here at all is something
-    // the same policy has already permitted. Deciding it a second time by
-    // reading verbs out of the name would only get it wrong: `chrome_navigate`
-    // begins with no read verb and would fall to the write branch, which would
-    // withhold the one tool the whole server is for.
-    if (server === 'jarvis_chrome') return true
-
-    // The camera. Not withheld behind ALLOW_WRITES: looking changes nothing,
-    // and the real gate is the browser's own camera permission plus an
-    // indicator the user can see for as long as it is live.
-    if (server === 'jarvis_eyes') return true
-
-    const tool = mcpToolOf(name)
-    if (EFFECTFUL_VERB.test(tool) && !VETO_EXEMPT.has(`${server}__${tool}`)) {
-      return ALLOW_WRITES
-    }
-    // The session tools this bridge is developed inside count as read-only too.
-    if (READ_ONLY_MCP.has(server) || server.startsWith('ccd_session')) return true
-    return READ_VERB.test(tool) ? true : ALLOW_WRITES
-  }
-  return ALLOW_WRITES
-}
+let chromeReady = null
 
 const SYSTEM_PROMPT = `You are JARVIS. You are speaking out loud to one person.
 
@@ -439,25 +304,14 @@ Using tools:
 - If you don't know, say you don't know.`
 
 /**
- * ElevenLabs credentials, borrowed from the MCP server config.
+ * ElevenLabs credentials.
  *
- * If you've set up the elevenlabs MCP server, the key is already on this
- * machine — no reason to make you paste it into a second .env file. The browser
- * never sees it: it POSTs text to /tts here and gets audio back.
+ * `elevenKey()` and `VOICE_ID` come from config.mjs, which reads the project's
+ * own `.env.local` / `.env` and nothing else — upstream borrowed the key from
+ * the global `~/.claude.json`, which this fork does not touch. The browser
+ * never sees the key either way: it POSTs text to /tts here and gets audio
+ * back, and the value is never logged, not even redacted.
  */
-function elevenKey() {
-  if (process.env.ELEVENLABS_API_KEY) return process.env.ELEVENLABS_API_KEY
-  try {
-    const cfg = JSON.parse(
-      readFileSync(join(homedir(), '.claude.json'), 'utf8'),
-    )
-    return cfg.mcpServers?.elevenlabs?.env?.ELEVENLABS_API_KEY ?? null
-  } catch {
-    return null
-  }
-}
-
-const VOICE_ID = process.env.JARVIS_VOICE_ID ?? 'JBFqnCBsd6RMkjVDRZzb'
 
 /**
  * Where /file is permitted to read from, and how big a read may get.
@@ -687,6 +541,87 @@ const handleRequest = async (req, res) => {
     return res.end(JSON.stringify({ ok: true, tts: eleven, stt: eleven }))
   }
 
+  /**
+   * The bridge half of the diagnostics panel, and the one thing you can curl
+   * when the interface itself is the suspect. Deliberately free of anything
+   * private: no key, no transcript, no spoken text, no file paths beyond the
+   * workspace the user configured themselves.
+   */
+  /**
+   * "Stop, please", for platforms where a signal cannot say it. Authorised by
+   * the token in .jarvis/bridge.json — see the shutdown section at the end of
+   * this file for why this endpoint exists at all.
+   */
+  if (req.method === 'POST' && req.url === '/shutdown') {
+    if (req.headers['x-jarvis-token'] !== shutdownToken) {
+      console.warn('[jarvis] refused a shutdown request with the wrong token')
+      res.writeHead(403, cors)
+      return res.end('forbidden')
+    }
+    res.writeHead(200, cors)
+    res.end('stopping')
+    setTimeout(() => shutdown('a stop request'), 50)
+    return
+  }
+
+  if (req.method === 'GET' && req.url === '/diagnostics') {
+    res.writeHead(200, { ...cors, 'content-type': 'application/json' })
+    return res.end(
+      JSON.stringify(
+        {
+          ok: true,
+          bridge: {
+            port: PORT,
+            uptimeSeconds: Math.round((Date.now() - stats.startedAt) / 1000),
+            node: process.versions.node,
+            pid: process.pid,
+            clients: stats.clients,
+            clientsEver: stats.clientsEver,
+          },
+          agent: {
+            model: MODEL,
+            effort: EFFORT,
+            writes: ALLOW_WRITES,
+            workspace: WORKSPACE,
+            turns: stats.turns,
+            turnErrors: stats.turnErrors,
+            lastTurnAt: stats.lastTurnAt,
+            lastTurnError: stats.lastTurnError,
+            toolsAllowed: stats.toolsAllowed,
+            toolsDenied: stats.toolsDenied,
+          },
+          speech: {
+            elevenlabsConfigured: Boolean(elevenKey()),
+            voiceId: VOICE_ID,
+            timeoutMs: ELEVEN_TIMEOUT_MS,
+            ttsRequests: stats.ttsRequests,
+            ttsFailures: stats.ttsFailures,
+            sttRequests: stats.sttRequests,
+            sttFailures: stats.sttFailures,
+            lastHeardAt: stats.lastHeardAt,
+            lastTtsError: stats.lastTtsError,
+            lastSttError: stats.lastSttError,
+          },
+          mcp: {
+            // Names only, and only from the project's own opt-in file.
+            source: mcpConfigPath(),
+            servers: Object.keys(MCP_SERVERS),
+            globalConfigRead: false,
+            chromeEnabled: ENABLE_CHROME,
+            chromeReachable: chromeReady,
+            cameraEnabled: ENABLE_CAMERA,
+          },
+          env: {
+            // Key NAMES that came from the project env files. Never values.
+            files: ENV_FILES_LOADED,
+          },
+        },
+        null,
+        2,
+      ),
+    )
+  }
+
   // Serve local image files to the page. Screenshots and generated art land on
   // disk as absolute paths, and a page served over http can't read file:// —
   // so the bridge, which can, hands them over.
@@ -841,6 +776,17 @@ const handleRequest = async (req, res) => {
       res.writeHead(400, cors)
       return res.end('no text')
     }
+    /**
+     * One bounded wait, and no retries.
+     *
+     * Carried over from the previous implementation, where an unbounded speech
+     * request was a real failure mode: the assistant stood silent with nothing
+     * to report while a socket hung. The clock covers the wait for headers;
+     * once audio is flowing it is re-armed generously, because cutting a
+     * sentence in half mid-stream would be its own bug.
+     */
+    const ac = new AbortController()
+    let timer = setTimeout(() => ac.abort(), ELEVEN_TIMEOUT_MS)
     try {
       const upstream = await fetch(
         `https://api.elevenlabs.io/v1/text-to-speech/${VOICE_ID}/stream` +
@@ -862,12 +808,20 @@ const handleRequest = async (req, res) => {
               speed: 1.05,
             },
           }),
+          signal: ac.signal,
         },
       )
+      clearTimeout(timer)
+      timer = setTimeout(() => ac.abort(), ELEVEN_TIMEOUT_MS * 6)
       if (!upstream.ok) {
+        stats.ttsFailures++
+        // Deliberately not logging the body: an ElevenLabs error can echo the
+        // request, and the request carries the line about to be spoken.
+        console.warn(`[jarvis] elevenlabs speech refused the request (${upstream.status})`)
         res.writeHead(upstream.status, cors)
         return res.end(await upstream.text())
       }
+      stats.ttsRequests++
 
       // Pipe it through rather than buffering. Waiting for the whole file here
       // would throw away everything the streaming endpoint just bought us.
@@ -879,8 +833,17 @@ const handleRequest = async (req, res) => {
       for await (const chunk of upstream.body) res.write(Buffer.from(chunk))
       return res.end()
     } catch (err) {
-      res.writeHead(502, cors)
-      return res.end(String(err?.message ?? err))
+      stats.ttsFailures++
+      const timedOut = err?.name === 'AbortError' || ac.signal.aborted
+      stats.lastTtsError = timedOut ? 'timed out' : String(err?.message ?? err)
+      console.warn(`[jarvis] speech generation failed: ${stats.lastTtsError}`)
+      if (res.headersSent) return res.destroy()
+      res.writeHead(504, cors)
+      // The browser treats any non-200 here as "fall back to the local voice",
+      // so a dead ElevenLabs costs the better voice and nothing else.
+      return res.end(timedOut ? 'elevenlabs timed out' : 'elevenlabs unavailable')
+    } finally {
+      clearTimeout(timer)
     }
   }
 
@@ -947,17 +910,30 @@ const handleRequest = async (req, res) => {
         method: 'POST',
         headers: { 'xi-api-key': key },
         body: form,
+        // Bounded, for the same reason /tts is: a transcription that never
+        // returns is a segment of the conversation silently lost, and the
+        // browser's queue would stall behind it.
+        signal: AbortSignal.timeout(STT_TIMEOUT_MS),
       })
       if (!upstream.ok) {
+        stats.sttFailures++
+        stats.lastSttError = `http ${upstream.status}`
+        console.warn(`[jarvis] transcription refused the request (${upstream.status})`)
         res.writeHead(upstream.status, cors)
         return res.end(await upstream.text())
       }
       const data = await upstream.json()
+      stats.sttRequests++
+      stats.lastHeardAt = Date.now()
       res.writeHead(200, { ...cors, 'content-type': 'application/json' })
       return res.end(JSON.stringify({ text: (data.text ?? '').trim() }))
     } catch (err) {
-      res.writeHead(502, cors)
-      return res.end(String(err?.message ?? err))
+      stats.sttFailures++
+      const timedOut = err?.name === 'TimeoutError' || err?.name === 'AbortError'
+      stats.lastSttError = timedOut ? 'timed out' : String(err?.message ?? err)
+      console.warn(`[jarvis] transcription failed: ${stats.lastSttError}`)
+      res.writeHead(timedOut ? 504 : 502, cors)
+      return res.end(stats.lastSttError)
     }
   }
 
@@ -998,34 +974,176 @@ const wss = new WebSocketServer({
     done(true)
   },
 })
-server.listen(PORT)
+/**
+ * Only one bridge at a time.
+ *
+ * Two of them fighting over 8787 is the confusing kind of broken: the second
+ * one dies, the first one is still answering, and which of the two terminals
+ * you are looking at decides what you believe. Say plainly which it is.
+ */
+server.on('error', (err) => {
+  if (err?.code === 'EADDRINUSE') {
+    console.error(
+      `[jarvis] port ${PORT} is already in use — JARVIS is probably already running.\n` +
+        '        Stop it with scripts\\stop.ps1, or set JARVIS_BRIDGE_PORT to another port.',
+    )
+    process.exit(1)
+  }
+  console.error('[jarvis] the bridge could not start:', err)
+  process.exit(1)
+})
 
-console.log(`[jarvis] bridge listening on ws://localhost:${PORT}`)
-console.log(
-  `[jarvis] speech ${elevenKey() ? 'via ElevenLabs (key from MCP config)' : 'using browser fallback voice'}`,
-)
-console.log(`[jarvis] model ${MODEL} · effort ${EFFORT}`)
-console.log(
-  `[jarvis] writes ${ALLOW_WRITES ? 'ENABLED' : 'disabled'}` +
-    (ALLOW_WRITES ? '' : ' — set JARVIS_ALLOW_WRITES=1 to permit shell/file/device actions'),
-)
+server.listen(PORT, '127.0.0.1', () => {
+  writeRunFile()
+  console.log(`[jarvis] bridge listening on ws://localhost:${PORT} (loopback only)`)
+  for (const { file, keys } of ENV_FILES_LOADED) {
+    // Names only. A value never reaches a log line in this process.
+    console.log(
+      `[jarvis] read ${file}: ${keys.length ? keys.join(', ') : 'nothing new'}`,
+    )
+  }
+  console.log(`[jarvis] ${describeElevenSource()}`)
+  console.log(`[jarvis] model ${MODEL} · effort ${EFFORT}`)
+  console.log(`[jarvis] workspace ${WORKSPACE}`)
+  console.log(
+    `[jarvis] MCP: ${
+      Object.keys(MCP_SERVERS).length
+        ? `${Object.keys(MCP_SERVERS).join(', ')} (from ${mcpConfigPath()})`
+        : 'no external servers — the global ~/.claude.json is deliberately not read'
+    }`,
+  )
+  console.log(
+    `[jarvis] writes ${ALLOW_WRITES ? 'ENABLED' : 'disabled'}` +
+      (ALLOW_WRITES ? '' : ' — run `npm run bridge:writes` to permit shell/file/device actions'),
+  )
+  console.log(
+    '[jarvis] accepting local dev origins' +
+      (EXTRA_ORIGINS.length ? ` plus ${EXTRA_ORIGINS.join(', ')}` : '') +
+      (ALLOW_NO_ORIGIN ? ' and clients that send no origin' : ''),
+  )
+})
+
 // Asynchronous, so it lands a beat after the rest of the banner. Worth printing
 // at all because an extension that is simply not running is indistinguishable
 // at the tool boundary from one that is broken, and this is the one place the
 // difference can be stated before anybody asks a question that depends on it.
-void chromeAvailable().then((ok) => {
+if (ENABLE_CHROME) {
+  void chromeAvailable().then((ok) => {
+    chromeReady = ok
+    console.log(
+      ok
+        ? `[jarvis] browser control ready${ALLOW_WRITES ? '' : ' (reading only — clicking and typing need writes enabled)'}`
+        : '[jarvis] browser control unavailable — open Chrome with the Claude extension enabled',
+    )
+  })
+} else {
   console.log(
-    ok
-      ? `[jarvis] browser control ready${ALLOW_WRITES ? '' : ' (reading only — clicking and typing need JARVIS_ALLOW_WRITES=1)'}`
-      : '[jarvis] browser control unavailable — open Chrome with the Claude extension enabled',
+    '[jarvis] browser control off — set JARVIS_ENABLE_CHROME=1 to let JARVIS read and drive your own Chrome',
   )
+}
+
+/**
+ * Shutting down on purpose.
+ *
+ * Ctrl-C, `stop.ps1`, or the launcher taking the other half down: in every case
+ * the sockets have to be closed and the Agent SDK's child process reaped, or a
+ * restart lands on a port still held by a process nobody can see. The second
+ * signal is the escape hatch for a child that will not go.
+ */
+let shuttingDown = false
+const sessions = new Set()
+
+function shutdown(signal) {
+  if (shuttingDown) {
+    console.log('[jarvis] second signal — exiting now.')
+    process.exit(1)
+  }
+  shuttingDown = true
+  console.log(`[jarvis] ${signal} — shutting down.`)
+  for (const end of sessions) {
+    try {
+      end()
+    } catch {
+      /* the session is going away regardless */
+    }
+  }
+  for (const client of wss.clients) {
+    try {
+      client.close(1001, 'bridge shutting down')
+    } catch {
+      /* already gone */
+    }
+  }
+  wss.close()
+  server.close(() => process.exit(0))
+  // A socket that refuses to close must not hold the port for ever; the
+  // restart is what the user is waiting for.
+  setTimeout(() => process.exit(0), 2000).unref()
+}
+
+process.on('SIGINT', () => shutdown('SIGINT'))
+process.on('SIGTERM', () => shutdown('SIGTERM'))
+
+/**
+ * Stopping cleanly on Windows, which SIGTERM cannot do.
+ *
+ * On Windows `process.kill(pid, 'SIGTERM')` is TerminateProcess: the handler
+ * above never runs, the sockets are never closed, and — the part that actually
+ * costs something — the Agent SDK's `claude` child process is orphaned and
+ * keeps running after JARVIS is "stopped". So there are two more ways in, both
+ * of which reach the same graceful path:
+ *
+ *   1. stdin closing. The launcher owns this pipe, so when `npm start` goes
+ *      away, so does the bridge — no PID files, no signals.
+ *   2. POST /shutdown carrying the token written to .jarvis/bridge.json. The
+ *      file is in the user's own directory, so holding the token means already
+ *      being the user; it exists so stop.ps1 can ask rather than kill.
+ */
+const shutdownToken = randomUUID()
+const RUN_DIR = join(ROOT, '.jarvis')
+const RUN_FILE = join(RUN_DIR, 'bridge.json')
+
+/**
+ * Only the instance that actually got the port owns this file.
+ *
+ * Written from the listen callback rather than at startup, and removed only by
+ * whoever wrote it. A second bridge that loses the race for port 8787 must not
+ * overwrite the running instance's token on the way in, nor delete its file on
+ * the way out — that would leave the real JARVIS running and unstoppable by
+ * anything except a kill.
+ */
+let ownsRunFile = false
+
+function writeRunFile() {
+  try {
+    mkdirSync(RUN_DIR, { recursive: true })
+    writeFileSync(
+      RUN_FILE,
+      JSON.stringify({ pid: process.pid, port: PORT, token: shutdownToken }, null, 2),
+    )
+    ownsRunFile = true
+  } catch (err) {
+    console.warn(`[jarvis] could not write ${RUN_FILE}: ${err.message}`)
+  }
+}
+
+process.on('exit', () => {
+  if (!ownsRunFile) return
+  try {
+    rmSync(RUN_FILE, { force: true })
+  } catch {
+    /* nothing to clean up */
+  }
 })
 
-console.log(
-  '[jarvis] accepting local dev origins' +
-    (EXTRA_ORIGINS.size ? ` plus ${[...EXTRA_ORIGINS].join(', ')}` : '') +
-    (ALLOW_NO_ORIGIN ? ' and clients that send no origin' : ''),
-)
+// The launcher pipes stdin; a bare `npm run bridge` in a terminal does not,
+// and an interactive stdin must not be treated as a shutdown request the
+// moment it reports end-of-file.
+if (!process.stdin.isTTY) {
+  process.stdin.on('end', () => shutdown('the launcher exited'))
+  process.stdin.on('close', () => shutdown('the launcher exited'))
+  process.stdin.resume()
+}
 
 /**
  * What to tell the browser when a turn ends badly. Plain sentences, because
@@ -1040,6 +1158,8 @@ const RESULT_FAILURES = {
 }
 
 wss.on('connection', (socket) => {
+  stats.clients++
+  stats.clientsEver++
   console.log('[jarvis] client connected')
 
   // Answer the HUD straight away rather than making it wait for the agent's
@@ -1211,18 +1331,27 @@ wss.on('connection', (socket) => {
         // The user's own Chrome, over the extension's native-host socket. It
         // holds no per-connection state, but it is built here with the rest so
         // the write gate is read once, at the same point as everything else.
-        jarvis_chrome: chromeServer({ allowWrites: ALLOW_WRITES }),
+        // Opt-in here, unlike upstream: reading every signed-in tab is a
+        // capability to grant on purpose rather than inherit from a clone.
+        ...(ENABLE_CHROME
+          ? { jarvis_chrome: chromeServer({ allowWrites: ALLOW_WRITES }) }
+          : {}),
         // The camera, which unlike everything else here has to ask and wait.
-        jarvis_eyes: visionServer(ask),
+        // The browser's own permission prompt is the real gate; this switch
+        // exists so the tool can be taken away entirely.
+        ...(ENABLE_CAMERA ? { jarvis_eyes: visionServer(ask) } : {}),
       },
       // A plain system prompt, not the claude_code preset. The preset is
       // tuned for a coding agent — verbose, file-oriented, and a large chunk
       // of input tokens on every turn. Replacing it makes the persona stick,
       // keeps answers short enough to speak, and cuts cost per turn.
       systemPrompt: SYSTEM_PROMPT,
-      // Run from the home directory so project-scoped MCP servers don't shadow
-      // the global ones, and so file tools have a sane root.
-      cwd: homedir(),
+      // Run from a directory inside this repository rather than the home
+      // directory. Upstream used home so that home-scoped MCP servers applied;
+      // this fork reads no ambient configuration at all, so the only thing cwd
+      // still decides is where a relative path lands — and a project workspace
+      // is a better answer than the user's home folder.
+      cwd: WORKSPACE,
       // No filesystem settings at all. Left to its default the SDK loads
       // ~/.claude/settings.json and settings.local.json exactly as the CLI
       // does — which on a working machine means a bypassPermissions default
@@ -1263,6 +1392,8 @@ wss.on('connection', (socket) => {
       // reliable; an absence of a call here is not proof nothing ran.
       canUseTool: async (toolName) => {
         const ok = decideTool(toolName)
+        if (ok) stats.toolsAllowed++
+        else stats.toolsDenied++
         console.log(`[jarvis] tool ${toolName} -> ${ok ? 'allow' : 'deny'}`)
         return ok
           ? { behavior: 'allow' }
@@ -1342,6 +1473,8 @@ wss.on('connection', (socket) => {
             // empty text is indistinguishable from a turn that simply had
             // nothing to say — the HUD stops spinning and JARVIS stands there
             // silent. Say what happened instead.
+            stats.turns++
+            stats.lastTurnAt = Date.now()
             if (msg.subtype === 'success') {
               sendTurn({
                 type: 'done',
@@ -1349,6 +1482,8 @@ wss.on('connection', (socket) => {
                 costUsd: msg.total_cost_usd ?? null,
               })
             } else {
+              stats.turnErrors++
+              stats.lastTurnError = String(msg.subtype)
               console.error(
                 `[jarvis] turn failed: ${msg.subtype}`,
                 msg.errors ?? '',
@@ -1454,10 +1589,18 @@ wss.on('connection', (socket) => {
     }
   })
 
-  socket.on('close', () => {
-    console.log('[jarvis] client disconnected')
+  /** Ending this session, whoever asked: the browser, or a shutdown signal. */
+  const endSession = () => {
     closed = true
     deliver?.(null)
     session.close?.()
+  }
+  sessions.add(endSession)
+
+  socket.on('close', () => {
+    stats.clients = Math.max(0, stats.clients - 1)
+    console.log('[jarvis] client disconnected')
+    sessions.delete(endSession)
+    endSession()
   })
 })

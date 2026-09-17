@@ -12,6 +12,20 @@ dist
 dist-ssr
 *.local
 
+# Secrets and machine-local configuration. The ElevenLabs key lives in one of
+# these; neither is ever committed.
+.env
+.env.local
+.env.*.local
+.env.txt
+
+# Opt-in, project-local MCP servers. Absent by default, and may carry tokens.
+jarvis.mcp.json
+
+# Runtime state: the PID file the launcher writes, and the agent's workspace.
+.jarvis/
+workspace/
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

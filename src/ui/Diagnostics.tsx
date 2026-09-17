@@ -1,5 +1,8 @@
 import { useEffect, useState } from 'react'
 import { useStore } from '../store'
+import { isConnected } from '../lib/bridge'
+import { engineLabel } from '../lib/capabilities'
+import { BACKEND, BRIDGE_WS_URL, WAKE_ENGINE } from '../config'
 
 /**
  * The "why can't he hear me / why can't I hear him" panel.
@@ -30,6 +33,18 @@ type VoiceDiag = {
   accepted: number
   restarts: number
   idleMs: number
+}
+
+type MicDiag = {
+  open: boolean
+  label: string
+  preference: string
+  reason: string
+  fallback: string
+  devices: number
+  recoveries: number
+  lastError: string
+  lostAt: number
 }
 
 type TtsDiag = {
@@ -84,11 +99,13 @@ export function Diagnostics() {
   const w = window as unknown as Record<string, unknown>
   const v = (w.__voice ?? {}) as Partial<VoiceDiag>
   const t = (w.__tts ?? {}) as Partial<TtsDiag>
+  const m = (w.__mic ?? {}) as Partial<MicDiag>
 
-  // The two verdicts worth stating outright, rather than making you infer them
-  // from the numbers underneath.
+  // The three verdicts worth stating outright, rather than making you infer
+  // them from the numbers underneath.
   const earsOk = Boolean(v.running) && (v.accepted ?? 0) > 0
   const mouthOk = (t.started ?? 0) > 0 || (t.rescued ?? 0) > 0
+  const brainOk = BACKEND !== 'bridge' || isConnected()
 
   return (
     <div className="diag" aria-live="polite">
@@ -101,7 +118,33 @@ export function Diagnostics() {
         <span className={mouthOk ? 'diag-ok' : 'diag-bad'}>
           {mouthOk ? '● speaking' : '● no sound produced'}
         </span>
+        <span className={brainOk ? 'diag-ok' : 'diag-bad'}>
+          {brainOk ? '● bridge connected' : '● bridge unreachable'}
+        </span>
       </div>
+
+      {/* The microphone comes first because every other reading below is
+          meaningless if no audio is arriving, and "which device is this
+          actually listening to" is the question that used to take an
+          afternoon. */}
+      <div className="diag-sec">MICROPHONE</div>
+      <Row k="device" v={m.open ? m.label || 'default device' : 'NOT OPEN'} bad={!m.open} />
+      <Row k="chosen by" v={String(m.reason ?? '—')} />
+      <Row k="preference" v={m.preference ? m.preference : '— (system default)'} />
+      {m.fallback ? <Row k="fallback" v={m.fallback} bad /> : null}
+      <Row k="inputs seen" v={String(m.devices ?? 0)} bad={(m.devices ?? 0) === 0} />
+      <Row
+        k="recoveries"
+        v={m.lostAt ? `${m.recoveries ?? 0} (last loss ${ago(m.lostAt)})` : String(m.recoveries ?? 0)}
+        bad={(m.recoveries ?? 0) > 0}
+      />
+      <Row k="error" v={m.lastError || '—'} bad={Boolean(m.lastError)} />
+
+      <div className="diag-sec">BRIDGE</div>
+      <Row k="backend" v={BACKEND} />
+      <Row k="socket" v={brainOk ? `connected · ${BRIDGE_WS_URL}` : `DOWN · ${BRIDGE_WS_URL}`} bad={!brainOk} />
+      <Row k="speech stack" v={engineLabel()} />
+      <Row k="wake engine" v={WAKE_ENGINE === 'porcupine' ? 'porcupine (offline)' : 'transcript match'} />
 
       <div className="diag-sec">LISTENING</div>
       <Row k="recogniser" v={v.running ? 'running' : 'STOPPED'} bad={!v.running} />

@@ -10,13 +10,19 @@
   },
   "scripts": {
     "start": "node scripts/start.mjs",
+    "start:writes": "node scripts/start.mjs --writes",
     "dev": "vite",
     "build": "tsc -b && vite build",
     "lint": "oxlint",
+    "test": "node --import tsx --test tests/*.test.mjs",
     "preview": "vite preview",
     "bridge": "node bridge/server.mjs",
-    "bridge:writes": "JARVIS_ALLOW_WRITES=1 node bridge/server.mjs",
-    "setup": "node scripts/setup.mjs"
+    "bridge:writes": "node bridge/server.mjs --writes",
+    "diagnostics": "node scripts/diagnostics.mjs",
+    "setup": "node scripts/diagnostics.mjs"
+  },
+  "volta": {
+    "node": "22.23.2"
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.3.220",

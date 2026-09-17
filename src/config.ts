@@ -128,6 +128,18 @@ export const KOKORO_VOICE = choice(
   'bm_george',
 )
 
+/**
+ * Which microphone to use: blank for the system default, a 0-based index, or
+ * part of the device name. The rules live in src/lib/mic.ts — an ambiguous name
+ * is refused rather than guessed at, and a preference that no longer matches
+ * falls back to the default and says so in the diagnostics panel.
+ *
+ * Carried over from the previous implementation, where being stuck on whatever
+ * Windows called the default device was a recurring source of "it can't hear
+ * me" with nothing on screen to explain it.
+ */
+export const MIC_PREFERENCE = str(import.meta.env.VITE_JARVIS_MIC) ?? ''
+
 export const env = {
   anthropicKey: str(import.meta.env.VITE_ANTHROPIC_API_KEY) ?? '',
   elevenKey: str(import.meta.env.VITE_ELEVENLABS_API_KEY) ?? '',
