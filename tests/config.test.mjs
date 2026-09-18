@@ -12,10 +12,8 @@ import {
   elevenKey,
   describeElevenSource,
   flag,
-  mcpConfigPath,
   nodeTooOld,
   num,
-  projectServers,
 } from '../bridge/config.mjs'
 
 const tmp = () => mkdtempSync(join(tmpdir(), 'jarvis-test-'))
@@ -95,7 +93,11 @@ test('numbers outside their range fall back instead of poisoning a timeout', () 
 test('the Node floor is enforced', () => {
   assert.equal(nodeTooOld('16.20.2'), true)
   assert.equal(nodeTooOld('18.19.0'), true)
-  assert.equal(nodeTooOld('20.0.0'), false)
+  assert.equal(nodeTooOld('20.0.0'), true)
+  assert.equal(nodeTooOld('20.19.0'), false)
+  assert.equal(nodeTooOld('21.7.0'), true)
+  assert.equal(nodeTooOld('22.11.0'), true)
+  assert.equal(nodeTooOld('22.12.0'), false)
   assert.equal(nodeTooOld('22.23.2'), false)
 })
 
@@ -110,38 +112,4 @@ test('the key is never part of what gets printed', () => {
   assert.ok(described.includes('present'))
   assert.ok(!described.includes('sk-secret-value'), 'the banner must not carry the key')
   assert.ok(describeElevenSource({}).includes('no ElevenLabs key'))
-})
-
-test('MCP servers are opt-in: no file means no external servers', () => {
-  const dir = tmp()
-  assert.deepEqual(projectServers({ JARVIS_MCP_CONFIG: join(dir, 'absent.json') }), {})
-})
-
-test('a project MCP file is honoured when it exists', () => {
-  const dir = tmp()
-  const path = join(dir, 'jarvis.mcp.json')
-  writeFileSync(
-    path,
-    JSON.stringify({ mcpServers: { exa: { command: 'npx', args: ['exa-mcp'] } } }),
-  )
-  const servers = projectServers({ JARVIS_MCP_CONFIG: path })
-  assert.deepEqual(Object.keys(servers), ['exa'])
-})
-
-test('a broken MCP file degrades to none rather than taking the bridge down', () => {
-  const dir = tmp()
-  const path = join(dir, 'jarvis.mcp.json')
-  writeFileSync(path, '{ this is not json')
-  assert.deepEqual(projectServers({ JARVIS_MCP_CONFIG: path }), {})
-
-  const wrong = join(dir, 'wrong.json')
-  writeFileSync(wrong, JSON.stringify({ servers: [] }))
-  assert.deepEqual(projectServers({ JARVIS_MCP_CONFIG: wrong }), {})
-})
-
-test('the MCP config path stays inside the project unless made absolute', () => {
-  const relative = mcpConfigPath({ JARVIS_MCP_CONFIG: 'custom.json' })
-  assert.ok(relative.endsWith('custom.json'))
-  assert.ok(!relative.startsWith('custom.json'), 'a relative path resolves against the repo')
-  assert.equal(mcpConfigPath({}).endsWith('jarvis.mcp.json'), true)
 })

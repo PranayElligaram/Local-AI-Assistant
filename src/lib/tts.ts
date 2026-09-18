@@ -1,7 +1,6 @@
 import {
   env,
   USE_ELEVENLABS,
-  BACKEND,
   TTS_ENGINE,
   KOKORO_VOICE,
   BRIDGE_HTTP_URL,
@@ -19,7 +18,7 @@ import { caps } from './capabilities'
  * conversation that gap is much more noticeable than the timbre.
  *
  * Either way, text is cut at sentence boundaries as it streams in and spoken a
- * sentence at a time, so JARVIS starts talking while Claude is still writing.
+ * sentence at a time, so JARVIS starts talking while the model is still writing.
  *
  * The queue is an explicit array with a single pump rather than a promise
  * chain. A chain cannot be cut: cancelling mid-sentence left the chain's tail
@@ -104,11 +103,18 @@ if (typeof window !== 'undefined') {
 let nativeBroken = false
 
 let speakingAt = 0
+let speakingEnded = 0
 
 /** When the current sentence started, or 0 if nothing is being spoken. The
  *  voice loop uses this to refuse to interrupt him in his own first syllable. */
 export function speakingSince(): number {
   return speaking ? speakingAt : 0
+}
+
+/** When the last sentence stopped coming out of the speakers, or 0. The voice
+ *  loop keeps the microphone closed for a short re-arm window after it. */
+export function speakingEndedAt(): number {
+  return speakingEnded
 }
 
 function setSpeaking(text: string) {
@@ -120,6 +126,7 @@ function setSpeaking(text: string) {
   if (speaking) {
     recent = speaking
     recentUntil = Date.now() + ECHO_TAIL_MS
+    speakingEnded = Date.now()
   }
   speaking = ''
 }
@@ -440,8 +447,8 @@ export function createSpeaker(): Speaker {
 
       // The OS voice produced no sound. That is not recoverable by retrying it,
       // so latch it off and rescue this sentence through the bridge's speech
-      // proxy — which already holds an ElevenLabs key borrowed from the MCP
-      // config. Losing the better timbre is a far smaller failure than a
+      // proxy, when an ElevenLabs key is configured there. Losing the better
+      // timbre is a far smaller failure than a
       // assistant that answers in silence.
       if (!nativeBroken) {
         nativeBroken = true
@@ -739,17 +746,16 @@ export function createSpeaker(): Speaker {
 /** Only used when USE_ELEVENLABS is on. Bridge proxy first (it already holds
  *  the key), then a direct key, then null to fall back to the native voice. */
 async function fetchCloudAudio(text: string): Promise<string | null> {
-  if (BACKEND === 'bridge') {
-    try {
-      const res = await fetch(`${BRIDGE_HTTP_URL}/tts`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ text }),
-      })
-      if (res.ok) return URL.createObjectURL(await res.blob())
-    } catch {
-      /* fall through */
-    }
+  try {
+    const res = await fetch(`${BRIDGE_HTTP_URL}/tts`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ text }),
+      signal: AbortSignal.timeout(15000),
+    })
+    if (res.ok) return URL.createObjectURL(await res.blob())
+  } catch {
+    /* fall through */
   }
 
   if (env.elevenKey) {

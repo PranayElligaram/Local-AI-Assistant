@@ -7,7 +7,7 @@ export type Phase =
   | 'waking'    // wake word hit, spin-up animation
   | 'listening' // capturing speech
   | 'thinking'  // model is generating
-  | 'tooling'   // an MCP tool is running
+  | 'tooling'   // a JARVIS tool is running
   | 'speaking'  // reading the answer back
 
 /**

@@ -6,7 +6,7 @@
     A restart is its own command rather than two typed in sequence because the
     interesting part is the wait in the middle: the bridge has to release port
     8787 before the new one can bind it, and a start that races the stop fails
-    with "port already in use" — which reads as a bug rather than as impatience.
+    with "port already in use"  -  which reads as a bug rather than as impatience.
 #>
 [CmdletBinding()]
 param(
@@ -14,7 +14,7 @@ param(
     [switch] $Open,
     [int] $Monitor = 0,
     [switch] $Fullscreen,
-    [int] $Port = 8787
+    [int] $Port = $(if ($env:JARVIS_BRIDGE_PORT) { [int]$env:JARVIS_BRIDGE_PORT } else { 8787 })
 )
 
 $ErrorActionPreference = 'Stop'
@@ -36,10 +36,6 @@ while ((Get-Date) -lt $deadline) {
     Start-Sleep -Milliseconds 400
 }
 
-$startArgs = @()
-if ($Writes) { $startArgs += '-Writes' }
-if ($Open) { $startArgs += '-Open' }
-if ($Monitor -gt 0) { $startArgs += @('-Monitor', $Monitor) }
-if ($Fullscreen) { $startArgs += '-Fullscreen' }
+$startArgs = @{ Writes = $Writes; Open = $Open; Monitor = $Monitor; Fullscreen = $Fullscreen }
 
 & (Join-Path $PSScriptRoot 'jarvis.ps1') @startArgs

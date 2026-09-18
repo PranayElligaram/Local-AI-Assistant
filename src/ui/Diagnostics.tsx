@@ -1,8 +1,8 @@
 import { useEffect, useState } from 'react'
 import { useStore } from '../store'
 import { isConnected } from '../lib/bridge'
-import { engineLabel } from '../lib/capabilities'
-import { BACKEND, BRIDGE_WS_URL, WAKE_ENGINE } from '../config'
+import { caps, engineLabel } from '../lib/capabilities'
+import { BRIDGE_HTTP_URL, BRIDGE_WS_URL, TTS_ENGINE, USE_ELEVENLABS, WAKE_ENGINE } from '../config'
 
 /**
  * The "why can't he hear me / why can't I hear him" panel.
@@ -15,7 +15,11 @@ import { BACKEND, BRIDGE_WS_URL, WAKE_ENGINE } from '../config'
  * developer toy, it is the instrument that turns "it doesn't work" into a
  * specific, answerable fact.
  *
- * Press D to show it. It polls rather than subscribing, because the two
+ * Press D to show it (or say "show diagnostics"). The bridge half - the local
+ * brain, the application catalogue, the tools - is read from the bridge's own
+ * GET /diagnostics, so what is shown is measured state, never an assumed green.
+ *
+ * It polls rather than subscribing, because the two
  * diagnostic records are plain mutable objects written from outside React —
  * that is deliberate, since the whole point is to observe the loop without
  * changing its timing.
@@ -59,6 +63,40 @@ type TtsDiag = {
   lastText: string
 }
 
+/** The subset of the bridge's GET /diagnostics this panel shows. */
+type BridgeDiag = {
+  bridge?: { port: number; pid: number; uptimeSeconds: number; ownsRunFile: boolean; clients: number }
+  brain?: {
+    mode: string
+    provider: string
+    endpoint: string
+    primary: { model: string; ok: boolean; reachable: boolean; loaded: boolean; error: string }
+    fallback: { model: string; ok: boolean; reachable: boolean; loaded: boolean; error: string } | null
+    lastModel: string | null
+    lastFallbackUsed: boolean
+    lastLatencyMs: number | null
+    lastFirstTokenMs: number | null
+    lastError: string
+    lastSource: string
+    cloudRequired: boolean
+    claudeRuntime: string
+  }
+  tools?: { mode: string; last: string; lastResult: string; executed: number; rejected: number }
+  apps?: {
+    status: string
+    count: number
+    lastRequested: string
+    lastResolved: string
+    resolutionMethod: string
+    lastLaunch: string
+    dryRun: boolean
+  }
+  speech?: { elevenlabsConfigured: boolean; elevenlabsSttDenied: boolean; elevenlabsTtsDenied: boolean }
+}
+
+const health = (m?: { model: string; ok: boolean; reachable: boolean; loaded: boolean; error: string } | null) =>
+  !m ? '—' : m.ok ? `${m.model} · ${m.loaded ? 'loaded' : 'ready'}` : `${m.model} · ${m.reachable ? m.error || 'not ready' : 'Ollama unreachable'}`
+
 const ago = (t: number) => (t ? `${((Date.now() - t) / 1000).toFixed(1)}s ago` : '—')
 
 function Row({ k, v, bad }: { k: string; v: string; bad?: boolean }) {
@@ -73,7 +111,39 @@ function Row({ k, v, bad }: { k: string; v: string; bad?: boolean }) {
 export function Diagnostics() {
   const [open, setOpen] = useState(false)
   const [, tick] = useState(0)
+  const [bridgeDiag, setBridgeDiag] = useState<BridgeDiag | null>(null)
+  const [bridgeErr, setBridgeErr] = useState('')
   const phase = useStore((s) => s.phase)
+
+  // "Show diagnostics", spoken, arrives as a bridge ui op.
+  useEffect(() => {
+    const onAsk = () => setOpen(true)
+    window.addEventListener('jarvis:diagnostics', onAsk)
+    return () => window.removeEventListener('jarvis:diagnostics', onAsk)
+  }, [])
+
+  useEffect(() => {
+    if (!open) return
+    let alive = true
+    const load = async () => {
+      try {
+        const res = await fetch(`${BRIDGE_HTTP_URL}/diagnostics`, { signal: AbortSignal.timeout(4000) })
+        const d = (await res.json()) as BridgeDiag
+        if (alive) {
+          setBridgeDiag(d)
+          setBridgeErr('')
+        }
+      } catch (err) {
+        if (alive) setBridgeErr((err as Error)?.message || 'unreachable')
+      }
+    }
+    void load()
+    const id = setInterval(load, 2000)
+    return () => {
+      alive = false
+      clearInterval(id)
+    }
+  }, [open])
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -105,7 +175,14 @@ export function Diagnostics() {
   // them from the numbers underneath.
   const earsOk = Boolean(v.running) && (v.accepted ?? 0) > 0
   const mouthOk = (t.started ?? 0) > 0 || (t.rescued ?? 0) > 0
-  const brainOk = BACKEND !== 'bridge' || isConnected()
+  const bridgeOk = isConnected()
+  const b = bridgeDiag?.brain
+  const brainOk = Boolean(b?.primary?.ok || b?.fallback?.ok)
+  const apps = bridgeDiag?.apps
+  const tl = bridgeDiag?.tools
+  const proc = bridgeDiag?.bridge
+  const sttProvider = caps().stt ? 'ElevenLabs Scribe' : 'browser recognition'
+  const ttsProvider = caps().tts && USE_ELEVENLABS ? 'ElevenLabs (browser fallback)' : TTS_ENGINE === 'kokoro' ? 'Kokoro (in browser)' : 'browser speech'
 
   return (
     <div className="diag" aria-live="polite">
@@ -118,8 +195,11 @@ export function Diagnostics() {
         <span className={mouthOk ? 'diag-ok' : 'diag-bad'}>
           {mouthOk ? '● speaking' : '● no sound produced'}
         </span>
+        <span className={bridgeOk ? 'diag-ok' : 'diag-bad'}>
+          {bridgeOk ? '● bridge connected' : '● bridge unreachable'}
+        </span>
         <span className={brainOk ? 'diag-ok' : 'diag-bad'}>
-          {brainOk ? '● bridge connected' : '● bridge unreachable'}
+          {brainOk ? '● local brain online' : '● local brain unavailable'}
         </span>
       </div>
 
@@ -140,11 +220,57 @@ export function Diagnostics() {
       />
       <Row k="error" v={m.lastError || '—'} bad={Boolean(m.lastError)} />
 
-      <div className="diag-sec">BRIDGE</div>
-      <Row k="backend" v={BACKEND} />
-      <Row k="socket" v={brainOk ? `connected · ${BRIDGE_WS_URL}` : `DOWN · ${BRIDGE_WS_URL}`} bad={!brainOk} />
+      <div className="diag-sec">BRAIN</div>
+      {bridgeErr ? <Row k="bridge" v={`unreachable · ${bridgeErr}`} bad /> : null}
+      <Row k="mode" v={b ? `${b.mode === 'local' ? 'Local' : b.mode} · ${b.provider}` : '—'} />
+      <Row k="primary" v={health(b?.primary)} bad={Boolean(b) && !b?.primary?.ok} />
+      <Row k="fallback" v={health(b?.fallback)} bad={Boolean(b?.fallback) && !b?.fallback?.ok} />
+      <Row k="last model" v={b?.lastModel ? `${b.lastModel}${b.lastFallbackUsed ? ' (fallback)' : ''}` : '—'} />
+      <Row
+        k="last latency"
+        v={b?.lastLatencyMs != null ? `${b.lastLatencyMs} ms (first words ${b.lastFirstTokenMs ?? '—'} ms)` : '—'}
+      />
+      <Row k="last source" v={b?.lastSource || '—'} />
+      <Row k="brain error" v={b?.lastError || '—'} bad={Boolean(b?.lastError)} />
+      <Row k="endpoint" v={b?.endpoint ?? '—'} />
+      <Row k="cloud required" v={b ? (b.cloudRequired ? 'YES' : 'No') : '—'} bad={Boolean(b?.cloudRequired)} />
+      <Row k="Claude runtime" v={b ? (b.claudeRuntime === 'none' ? 'None' : b.claudeRuntime) : '—'} />
+
+      <div className="diag-sec">APPLICATIONS</div>
+      <Row k="catalogue" v={apps ? `${apps.status} · ${apps.count} apps${apps.dryRun ? ' · DRY RUN' : ''}` : '—'} bad={apps?.status === 'error' || apps?.count === 0} />
+      <Row k="last requested" v={apps?.lastRequested || '—'} />
+      <Row k="resolved to" v={apps?.lastResolved || '—'} />
+      <Row k="method" v={apps?.resolutionMethod || '—'} />
+      <Row k="launch" v={apps?.lastLaunch || '—'} bad={Boolean(apps?.lastLaunch?.startsWith('failed'))} />
+
+      <div className="diag-sec">TOOLS</div>
+      <Row k="mode" v={tl ? (tl.mode === 'safe' ? 'safe (read-only)' : 'WRITES enabled') : '—'} />
+      <Row k="last tool" v={tl?.last || '—'} />
+      <Row k="last result" v={tl?.lastResult || '—'} bad={Boolean(tl?.lastResult?.startsWith('rejected'))} />
+      <Row k="executed / rejected" v={tl ? `${tl.executed} / ${tl.rejected}` : '—'} />
+
+      <div className="diag-sec">PROCESS</div>
+      <Row k="socket" v={bridgeOk ? `connected · ${BRIDGE_WS_URL}` : `DOWN · ${BRIDGE_WS_URL}`} bad={!bridgeOk} />
+      <Row k="bridge" v={proc ? `pid ${proc.pid} · port ${proc.port} · up ${proc.uptimeSeconds}s` : '—'} />
+      <Row k="run file" v={proc ? (proc.ownsRunFile ? 'owned by this bridge' : 'NOT owned') : '—'} bad={Boolean(proc) && !proc?.ownsRunFile} />
+      <Row k="UI" v={window.location.origin} />
+
+      <div className="diag-sec">VOICE</div>
+      <Row k="wake" v={WAKE_ENGINE === 'porcupine' ? '"Hey Jarvis" · porcupine (offline)' : '"Hey Jarvis" · transcript match'} />
       <Row k="speech stack" v={engineLabel()} />
-      <Row k="wake engine" v={WAKE_ENGINE === 'porcupine' ? 'porcupine (offline)' : 'transcript match'} />
+      <Row k="STT" v={sttProvider} />
+      <Row k="TTS" v={ttsProvider} />
+      <Row
+        k="ElevenLabs"
+        v={
+          bridgeDiag?.speech
+            ? !bridgeDiag.speech.elevenlabsConfigured
+              ? 'not configured'
+              : `configured${bridgeDiag.speech.elevenlabsSttDenied ? ' · STT denied' : ''}${bridgeDiag.speech.elevenlabsTtsDenied ? ' · TTS denied' : ''}`
+            : '—'
+        }
+      />
+      <Row k="barge-in" v={v.mode === 'guard' ? 'armed (speaking/thinking)' : 'idle'} />
 
       <div className="diag-sec">LISTENING</div>
       <Row k="recogniser" v={v.running ? 'running' : 'STOPPED'} bad={!v.running} />

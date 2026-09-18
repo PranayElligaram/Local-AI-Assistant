@@ -1,49 +1,73 @@
-# JARVIS rebuild — working state
+# JARVIS rebuild - working state
 
-Resume notes for an interrupted/compacted session. Keep this current.
+Resume notes for an interrupted session. The filesystem and git state are
+authoritative; this file says what the last session did.
 
 ## Where the work lives
-- Canonical repo: `C:\Users\prana\dev\src\Jarvis` (main @ ff5d8e9, untouched)
-- Work happens in git worktree `C:\Users\prana\dev\src\Jarvis\.claude\worktrees\jarvis-rebuild`,
-  branch `worktree-jarvis-rebuild`, based on ff5d8e9. No pushes, no PRs.
-- Recovery: tags `pre-jarvis-rebuild-head-20260917-185654` (ff5d8e9),
-  `pre-jarvis-rebuild-worktree-20260917-185654` (= stash@{0} "pre-jarvis-rebuild-working-tree-20260917-185654",
-  untracked EVIE files in its ^3 parent). Never delete these.
-- Upstream: https://github.com/adewaskar/jarvis @ 1c4016afdf86f7043efc6882ceffef84ad0d8783
-  (temp clone: `C:\Users\prana\.claude\jobs\1544a243\tmp\upstream`)
+- Canonical repo: `C:\Users\prana\dev\src\Jarvis`
+- Worktree: `C:\Users\prana\dev\src\Jarvis\.claude\worktrees\jarvis-rebuild`,
+  branch `worktree-jarvis-rebuild`. All work is uncommitted in the working tree.
+  No pushes, no PRs.
+- Recovery: tags `pre-jarvis-rebuild-head-20260917-185654`,
+  `pre-jarvis-rebuild-worktree-20260917-185654`, and stash
+  `pre-jarvis-rebuild-working-tree-20260917-185654`. Never delete these.
 
-## Environment facts
-- Default `node` on PATH is v16.20.2 (Volta default). Upstream needs Node >= 20.
-  Node 22.23.2 exists in Volta's image store; use `volta run --node 22.23.2 ...` or the
-  project `volta` pin in package.json.
-- Claude Code CLI: `C:\Users\prana\.local\bin\claude.exe`.
-- Existing local `.env` in the main checkout (gitignored) holds ELEVENLABS_API_KEY and
-  ELEVENLABS_VOICE_ID among old EVIE settings. Never print values.
+## Current phase
+COMPLETE (automatable scope), 2026-09-18. Only physical/human validation
+remains - see the checklist in JARVIS_REBUILD_REPORT.md ("Human validation
+required").
 
-## Phases
-- [x] 1 Verify repo/env
-- [x] 2-3 Inspect history + preserved EVIE state; extract requirements
-- [x] 4-5 Inspect upstream, record SHA
-- [x] 6-7 Remove old Python impl, import upstream (commit 22df865)
-- [ ] 8 npm install
-- [ ] 9 Prove unmodified upstream baseline (build/lint)
-- [ ] 10-12 Configure: MCP isolation, Windows fixes, env loading, mic selection/recovery,
-      ElevenLabs timeouts, diagnostics, start/stop/restart scripts, startup task
-- [ ] 13 Tests (node:test + tsx)
-- [ ] 14-19 Build, diagnostics, run bridge/UI, exercise, repair
-- [ ] 20 JARVIS_REBUILD_REPORT.md
+## Completed
+- Claude runtime removed (Agent SDK, Anthropic SDK, MCP servers, direct browser
+  path); packages uninstalled; isolation tests guard against regression.
+- Local brain: `bridge/brain/` (BrainChain + OllamaBrain), granite4:3b primary,
+  qwen3.5:4b fallback, keep_alive 30m, think:false, bounded timeouts.
+- Deterministic router, JARVIS-owned tools, conversation engine with claim guard.
+- Installed-application catalogue/resolver, aliases and portable apps
+  (`npm run app -- ...`, `jarvis.apps.json`, git-ignored).
+- Diagnostics (bridge `/diagnostics` + D panel) extended: brain, apps, tools,
+  process, voice.
+- Lifecycle: duplicate-start rejection, stale PID handling, per-child start
+  times, spoken restart (exit 75 -> launcher respawns bridge), restart option
+  forwarding. Codex's interrupted launcher test fixed (default grace period).
+- Docs: README, .env.example, JARVIS_REBUILD_REPORT.md.
 
-## Decisions
-- Upstream wake is transcript-regex based ("Hey Jarvis" matched in STT output),
-  Porcupine used only if VITE_PICOVOICE_ACCESS_KEY set.
-- Global ~/.claude.json MCP servers must NOT be imported (upstream does); replace with
-  opt-in project-local config. Don't read ~/.claude.json for ElevenLabs key either.
+## Current tests (final run)
+- `npm test`: 147 tests, 147 pass, 0 fail.
+- typecheck pass; lint 0 findings; build pass; 7/7 PowerShell scripts parse.
+- `npm run e2e`: 10 passed, 0 failed (real Ollama); `e2e:offline` 6/6.
 
-## Tests run
-(none yet)
+## Live instance
+The new build is running (started with `scripts\jarvis.ps1` in a minimized
+PowerShell window): bridge 127.0.0.1:8787, UI http://localhost:5173.
 
-## Failures remaining
-(none recorded yet)
+## Known blockers
+None for automatable work. Human-only: microphone, speakers, wake word,
+barge-in by voice, ElevenLabs voice quality.
 
-## Next action
-npm ci with Node 22, build, lint.
+## Next action if resuming
+Run the human validation checklist in JARVIS_REBUILD_REPORT.md. If committing,
+review `git status` (tracked deletions of bridge/{panels,ui,chrome,vision}.mjs
+and src/lib/anthropic.ts are intentional).
+
+## Repair pass 2026-09-18 — voice pipeline, self-listening, Discord duplicate
+
+- Voice root cause: ElevenLabs STT is refused (401) so the browser recogniser runs, and it never touches
+  `/stt` (hence sttRequests/lastHeardAt 0 — those fields only ever measured Scribe). Browser wake fired on
+  *partials* ("hey jarvis what" -> sent "what"); the loop was full-duplex with voice barge-in, so JARVIS's
+  own ElevenLabs output became barge-ins / follow-up commands (cancelledTurns), and after every answer it
+  stayed in command mode for 11 s (`FOLLOW_UP_MS`) hearing its own tail.
+- Fix (src/lib/voice.ts, src/App.tsx, src/lib/tts.ts): half-duplex (`VOICE_BARGE_IN = false`, keyboard
+  interrupt kept), `effectiveMode` closes the mic while TTS plays + `REARM_MS` 500 ms, recognition
+  generation (`diag.recognitionGeneration`) bumps on every close/re-open; stale segments, STT responses,
+  endpoint timers and old recogniser callbacks are dropped; browser recogniser is aborted while he speaks
+  and rebuilt afterwards; after a turn the app returns to `dormant` (wake word only).
+- Diagnostics: `window.__voice` gains voiceState/wakeListening/commandRecognitionActive/ttsActive/
+  recognitionGeneration/lastFinalTranscript/lastUtteranceSentAt/lastWakeAt; bridge `/diagnostics.voice`
+  shows asksReceived/lastAskAt plus the page's reported state (no transcript text).
+- Apps: discovery reads each Start Menu .lnk's target/args/workdir (bounded, by index); `buildCatalogue`
+  merges same-name rows with the same `launchIdentity` (`<root>|<exe>`, `app-<ver>` and
+  `Update.exe --processStart X.exe` normalised) and keeps the best `targetRank`. Different roots stay ambiguous.
+- Verified: 159/159 tests, typecheck, lint, build; live bridge: time->router, "Why is the sky blue?"->
+  granite4:3b, "Open Discord"->router open_application ok; `npm run app -- resolve Discord` -> one entry.
+- Human-only: physical mic/speaker confirmation of no self-listening.

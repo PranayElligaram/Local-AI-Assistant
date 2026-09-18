@@ -1,6 +1,6 @@
 import { BRIDGE_HTTP_URL } from '../config'
-import { getMic, onMicChange } from './audio'
-import { speakingNow, speakingSince } from './tts'
+import { getMicSoon, onMicChange } from './audio'
+import { speakingEndedAt, speakingNow, speakingSince } from './tts'
 import { startVad, type Vad, type VadHandlers } from './vad'
 import { caps } from './capabilities'
 import {
@@ -210,6 +210,16 @@ export const diag = {
   restarts: 0,
   /** Milliseconds the last transcription round-trip took. */
   idleMs: 0,
+  /** WAKE_LISTENING | COMMAND_LISTENING | TRANSCRIBING | THINKING | SPEAKING | REARMING | OFF */
+  voiceState: 'OFF',
+  wakeListening: false,
+  commandRecognitionActive: false,
+  ttsActive: false,
+  /** Moves every time the microphone opens or closes; see makeCycle. */
+  recognitionGeneration: 0,
+  lastFinalTranscript: '',
+  lastUtteranceSentAt: 0,
+  lastWakeAt: 0,
 }
 
 /** Record why a transcript went nowhere. Silence always has a reason; this is
@@ -220,6 +230,85 @@ function drop(why: string) {
 
 if (typeof window !== 'undefined') {
   ;(window as unknown as Record<string, unknown>).__voice = diag
+}
+
+// ---------------------------------------------------------------------------
+// Half-duplex
+// ---------------------------------------------------------------------------
+
+/**
+ * Voice barge-in: the open-microphone design, where talking over him cuts him
+ * off. It is off because it made him hear himself - his own ElevenLabs voice
+ * came back through the speakers, was taken for an interruption or a command,
+ * and he answered it. Until there is real acoustic echo cancellation the loop
+ * is half-duplex: while he thinks or talks, nothing the microphone hears can
+ * become a wake, a barge-in or a turn. Escape and Space still interrupt.
+ */
+export const VOICE_BARGE_IN = false
+
+/** After his last word, how long the microphone stays shut before re-arming.
+ *  Covers the gap between two sentences and the room's reverb. */
+export const REARM_MS = 500
+
+/** Modes in which something heard may become a wake or a turn. */
+const accepting = (m: VoiceMode | '') => m === 'wake' || m === 'command'
+
+/**
+ * The mode as the voice loop must treat it. The app's mode says what the
+ * conversation expects; this also closes the microphone for as long as sound
+ * is coming out of the speakers, whatever phase the app thinks it is in - the
+ * greeting after the wake word plays while the app is already 'listening'.
+ */
+export function effectiveMode(h: Pick<VoiceHandlers, 'mode'>): VoiceMode {
+  const m = h.mode()
+  if (VOICE_BARGE_IN || m === 'deaf') return m
+  const ended = speakingEndedAt()
+  if (speakingSince() || (ended && Date.now() - ended < REARM_MS)) {
+    diag.voiceState = speakingSince() ? 'SPEAKING' : 'REARMING'
+    return 'guard'
+  }
+  return m
+}
+
+/**
+ * The recognition generation.
+ *
+ * It moves every time the microphone closes (a turn went to the bridge, he
+ * started talking) and every time it re-opens. Every capture, pending
+ * transcription and endpoint timer carries the generation it began in, and a
+ * result arriving under a different one belongs to a cycle that is already
+ * over - most often his own voice, captured while he spoke - so it is dropped
+ * rather than becoming a second turn.
+ */
+function makeCycle(h: Pick<VoiceHandlers, 'mode'>, onChange: (open: boolean) => void) {
+  let last: VoiceMode | '' = ''
+  return {
+    sync(): VoiceMode {
+      const m = effectiveMode(h)
+      const changed = last !== '' && accepting(m) !== accepting(last)
+      last = m
+      diag.mode = m
+      diag.wakeListening = m === 'wake'
+      diag.commandRecognitionActive = m === 'command'
+      diag.ttsActive = Boolean(speakingSince())
+      if (m === 'wake') diag.voiceState = 'WAKE_LISTENING'
+      else if (m === 'command') diag.voiceState = 'COMMAND_LISTENING'
+      else if (m === 'deaf') diag.voiceState = 'OFF'
+      else if (!diag.ttsActive && diag.voiceState !== 'REARMING') diag.voiceState = 'THINKING'
+      if (changed && !VOICE_BARGE_IN) {
+        diag.recognitionGeneration++
+        onChange(accepting(m))
+      }
+      return m
+    },
+    open: () => accepting(last),
+    generation: () => diag.recognitionGeneration,
+  }
+}
+
+/** A finished command, on its way to the app and so to the bridge. */
+function noteFinal(text: string) {
+  diag.lastFinalTranscript = text.slice(0, 200)
 }
 
 /**
@@ -237,24 +326,86 @@ if (typeof window !== 'undefined') {
  */
 export async function startVoice(h: VoiceHandlers): Promise<Voice> {
   try {
-    await getMic()
+    // Bounded, because an unanswered permission prompt never settles either
+    // way: without the clock this await is where the interface stops for good.
+    await getMicSoon()
   } catch (err) {
-    diag.lastError = 'mic'
-    h.onError(
-      err instanceof DOMException && err.name === 'NotAllowedError'
-        ? 'Microphone access denied — voice input is unavailable.'
-        : 'No microphone available.',
-    )
-    return { stop: () => {}, live: () => false }
+    const name = err instanceof DOMException ? err.name : ''
+    diag.lastError = name === 'TimeoutError' ? 'mic-permission-pending' : 'mic'
+    if (name === 'NotAllowedError') {
+      h.onError('Microphone access denied - voice input is unavailable.')
+      diag.engine = 'browser'
+      return startBrowserVoice(h, true)
+    }
+    if (name === 'TimeoutError') {
+      // The prompt is still sitting there unanswered. Say so, and carry on:
+      // the browser recogniser raises its own request, and audio.ts picks the
+      // device up the moment permission is granted.
+      h.onError('Waiting for microphone permission - allow it to speak to me.')
+      diag.engine = 'browser'
+      return startBrowserVoice(h)
+    }
+    h.onError('No microphone available.')
+    diag.engine = 'browser'
+    return startBrowserVoice(h, true)
   }
-  diag.engine = caps().stt ? 'elevenlabs' : 'browser'
-  return caps().stt ? startElevenVoice(h) : startBrowserVoice(h)
+  if (!caps().stt) {
+    diag.engine = 'browser'
+    return startBrowserVoice(h)
+  }
+
+  /**
+   * The premium path, with a way back.
+   *
+   * Choosing the engine once at boot assumes the capability probe was right,
+   * and it is not always: a key can exist, pass /health, and still be refused
+   * for transcription — measured on this machine, a key carrying
+   * text_to_speech but not speech_to_text. The symptom is the worst one this
+   * project has: a live microphone, a running detector, and an assistant that
+   * never hears a word, with no error anywhere the user would look.
+   *
+   * So the fallback is live rather than only at boot. A hard refusal,
+   * and the browser's own recogniser takes over — which needs no key, and is
+   * the engine a fresh clone uses anyway.
+   */
+  diag.engine = 'elevenlabs'
+  let current: Voice | null = null
+  let stopped = false
+  let fallen = false
+
+  const fallBack = () => {
+    if (fallen || stopped) return
+    fallen = true
+    diag.engine = 'browser'
+    diag.lastError = 'transcription refused — using the browser recogniser'
+    console.warn(
+      '[jarvis] the speech service refused this key; falling back to the browser recogniser.',
+    )
+    current?.stop()
+    current = startBrowserVoice(h)
+  }
+
+  current = await startElevenVoice(h, fallBack)
+  return {
+    stop: () => {
+      stopped = true
+      current?.stop()
+    },
+    live: () => (stopped ? false : (current?.live() ?? false)),
+  }
 }
 
 /** VAD + ElevenLabs Scribe. */
-async function startElevenVoice(h: VoiceHandlers): Promise<Voice> {
+async function startElevenVoice(
+  h: VoiceHandlers,
+  onUnavailable: () => void,
+): Promise<Voice> {
   let lastWake = 0
+  let stopped = false
+  const abort = new AbortController()
   let vad: Vad | null = null
+  /** Generation the segment being captured right now started in. */
+  let segmentGen: number | null = null
 
   /**
    * Segments waiting for the transcriber, oldest first.
@@ -269,7 +420,7 @@ async function startElevenVoice(h: VoiceHandlers): Promise<Voice> {
    * Order is preserved because the drain is single-flight, which matters —
    * "London" arriving before "what's the weather in" is worse than either.
    */
-  const pendingAudio: Blob[] = []
+  const pendingAudio: { blob: Blob; gen: number }[] = []
   let draining = false
 
   /**
@@ -278,12 +429,25 @@ async function startElevenVoice(h: VoiceHandlers): Promise<Voice> {
    */
   const assemble = makeAssembler({
     emit: (text) => {
+      if (!VOICE_BARGE_IN && cycle.sync() !== 'command') {
+        drop('microphone closed before the command was sent')
+        return
+      }
       diag.dropped = ''
       diag.accepted++
       diag.holding = ''
+      noteFinal(text)
       h.onUtterance(text)
     },
     partial: (text) => h.onPartial(text),
+  })
+
+  // Closing or re-opening the microphone throws away everything in flight:
+  // queued segments and held text belong to the cycle that just ended.
+  const cycle = makeCycle(h, () => {
+    pendingAudio.length = 0
+    segmentGen = null
+    assemble.cancel()
   })
 
   /**
@@ -294,26 +458,47 @@ async function startElevenVoice(h: VoiceHandlers): Promise<Voice> {
    * transcript arriving — and the transcript belongs to the mode the user is in
    * now, not the one they interrupted.
    */
-  const transcribe = async (blob: Blob) => {
-    const mode = h.mode()
-    if (mode === 'deaf') return
+  const transcribe = async ({ blob, gen }: { blob: Blob; gen: number }) => {
+    if (stopped || cycle.sync() === 'deaf') return
+    if (!VOICE_BARGE_IN && gen !== cycle.generation()) {
+      drop('stale segment from an earlier cycle')
+      return
+    }
+    diag.voiceState = 'TRANSCRIBING'
     const t0 = performance.now()
     try {
       const res = await fetch(`${BRIDGE_HTTP_URL}/stt`, {
         method: 'POST',
         headers: { 'content-type': blob.type || 'audio/webm' },
         body: blob,
+        signal: AbortSignal.any([abort.signal, AbortSignal.timeout(25_000)]),
       })
+      if (stopped) return
       diag.idleMs = Math.round(performance.now() - t0)
       if (!res.ok) {
         diag.restarts++
         diag.lastError = `stt ${res.status}`
         drop(`transcription failed (${res.status})`)
+        // 401/403 is the key being refused, and it will be refused again for
+        // every segment after this one. 503 is the bridge saying it has no key
+        // at all. None of those get better by waiting.
+        if (res.status === 401 || res.status === 403 || res.status === 503) {
+          onUnavailable()
+        }
         return
       }
       const { text } = (await res.json()) as { text?: string }
+      if (stopped) return
       const said = (text ?? '').trim()
       diag.lastError = ''
+      // Re-read now: the transcript belongs to the mode the user is in when it
+      // lands. Half-duplex, one that lands in a different cycle, or while he
+      // is thinking or talking, is never a turn.
+      const mode = cycle.sync()
+      if (!VOICE_BARGE_IN && (gen !== cycle.generation() || !accepting(mode))) {
+        drop('stale transcription - the cycle moved on')
+        return
+      }
 
       if (!said) {
         drop('nothing intelligible in the segment')
@@ -333,6 +518,7 @@ async function startElevenVoice(h: VoiceHandlers): Promise<Voice> {
       if (mode === 'wake') {
         if (WAKE.test(said) && Date.now() - lastWake > WAKE_DEBOUNCE) {
           lastWake = Date.now()
+          diag.lastWakeAt = lastWake
           diag.wakes++
           diag.dropped = ''
           diag.accepted++
@@ -347,6 +533,7 @@ async function startElevenVoice(h: VoiceHandlers): Promise<Voice> {
       // is finished, reading the words and whether the room is still noisy.
       assemble.feed(said, vad?.meter().speaking ?? false)
     } catch (err) {
+      if (stopped) return
       diag.restarts++
       diag.lastError = String(err)
       drop('could not reach the speech service')
@@ -358,7 +545,7 @@ async function startElevenVoice(h: VoiceHandlers): Promise<Voice> {
     if (draining) return
     draining = true
     try {
-      while (pendingAudio.length) {
+      while (!stopped && pendingAudio.length) {
         await transcribe(pendingAudio.shift()!)
       }
     } finally {
@@ -368,9 +555,9 @@ async function startElevenVoice(h: VoiceHandlers): Promise<Voice> {
 
   const vadHandlers: VadHandlers = {
     onStart: () => {
-      const mode = h.mode()
-      diag.mode = mode
+      const mode = cycle.sync()
       diag.sessions++
+      segmentGen = cycle.generation()
       if (mode === 'deaf') return
       // Standing down mid-thought throws the thought away with it. Otherwise
       // held text would surface as the opening of the *next* conversation.
@@ -378,7 +565,7 @@ async function startElevenVoice(h: VoiceHandlers): Promise<Voice> {
       // The barge-in. In guard mode the user has started talking over him, and
       // because the guard threshold is high this is a real interruption rather
       // than leaked playback — so cut him off now, do not wait for the words.
-      if (mode === 'guard') {
+      if (mode === 'guard' && VOICE_BARGE_IN) {
         const since = speakingSince()
         if (since && Date.now() - since < SELF_GUARD_MS) {
           diag.selfGuarded++
@@ -388,13 +575,21 @@ async function startElevenVoice(h: VoiceHandlers): Promise<Voice> {
       }
     },
     onEnd: (blob) => {
-      pendingAudio.push(blob)
+      if (stopped) return
+      const mode = cycle.sync()
+      const gen = segmentGen ?? cycle.generation()
+      segmentGen = null
+      if (!VOICE_BARGE_IN && (gen !== cycle.generation() || !accepting(mode))) {
+        drop('captured while the microphone was closed')
+        return
+      }
+      pendingAudio.push({ blob, gen })
       void drain()
     },
     onLevel: (v) => {
       // Only paint the live level while actually listening for a command, so a
       // dormant reactor stays calm and does not twitch at every room noise.
-      const mode = h.mode()
+      const mode = cycle.sync()
       if (mode !== 'command') return
       // Never over the assembled text. This used to run unconditionally and
       // overwrote a half-built sentence with an ellipsis sixty times a second,
@@ -423,7 +618,9 @@ async function startElevenVoice(h: VoiceHandlers): Promise<Voice> {
     void (async () => {
       try {
         vad?.stop()
-        vad = await startVad(vadHandlers)
+        const next = await startVad(vadHandlers)
+        if (stopped) { next.stop(); return }
+        vad = next
         diag.running = vad.live()
         diag.restarts++
         diag.lastError = ''
@@ -438,7 +635,7 @@ async function startElevenVoice(h: VoiceHandlers): Promise<Voice> {
   // than pushed because nothing in the app pushes phase changes here, and a
   // 200ms lag on the echo gate is imperceptible.
   const guardPoll = setInterval(() => {
-    const mode = h.mode()
+    const mode = cycle.sync()
     vad?.setGuard(mode === 'guard')
     // He has stood down — by Escape, by the idle timeout, or by dropping back
     // to the wake word. Anything half-said belonged to a conversation that is
@@ -449,6 +646,9 @@ async function startElevenVoice(h: VoiceHandlers): Promise<Voice> {
 
   return {
     stop: () => {
+      stopped = true
+      abort.abort()
+      pendingAudio.length = 0
       clearInterval(guardPoll)
       stopWatchingMic()
       assemble.cancel()
@@ -473,7 +673,7 @@ async function startElevenVoice(h: VoiceHandlers): Promise<Voice> {
  * between "the wake word stopped working halfway through the lesson" and an
  * assistant that keeps listening.
  */
-function startBrowserVoice(h: VoiceHandlers): Voice {
+function startBrowserVoice(h: VoiceHandlers, blocked = false): Voice {
   const Ctor =
     (window as any).SpeechRecognition ?? (window as any).webkitSpeechRecognition
   if (!Ctor) {
@@ -483,6 +683,7 @@ function startBrowserVoice(h: VoiceHandlers): Voice {
 
   let stopped = false
   let running = false
+  let starting = false
   let rec: any = null
   let settled = ''
   let interim = ''
@@ -495,12 +696,30 @@ function startBrowserVoice(h: VoiceHandlers): Voice {
   /** Same assembly rules as the premium path — a pause is not a full stop. */
   const assemble = makeAssembler({
     emit: (text) => {
+      if (!VOICE_BARGE_IN && cycle.sync() !== 'command') {
+        drop('microphone closed before the command was sent')
+        return
+      }
       diag.dropped = ''
       diag.accepted++
       diag.holding = ''
+      noteFinal(text)
       h.onUtterance(text)
     },
     partial: (text) => h.onPartial(text),
+  })
+
+  /**
+   * Half-duplex: the recogniser is torn down the moment the microphone closes
+   * and a fresh one built when it re-opens. Aborting is the only reliable way
+   * to discard what Chrome has already buffered — his own voice, heard while
+   * he spoke, would otherwise arrive as a final result a second later.
+   */
+  const cycle = makeCycle(h, (open) => {
+    reset()
+    assemble.cancel()
+    retire()
+    if (open) spin()
   })
 
   const touch = () => {
@@ -522,8 +741,9 @@ function startBrowserVoice(h: VoiceHandlers): Voice {
 
   const emit = () => {
     const text = `${settled} ${interim}`.replace(/\s+/g, ' ').trim()
-    const mode = h.mode()
+    const mode = cycle.sync()
     reset()
+    if (!VOICE_BARGE_IN && !accepting(mode)) return
     if (!text || mode === 'deaf') return
     if (isEcho(text, speakingNow())) {
       drop('echo of his own voice')
@@ -535,6 +755,7 @@ function startBrowserVoice(h: VoiceHandlers): Voice {
       assemble.cancel()
       if (WAKE.test(text) && Date.now() - lastWake > WAKE_DEBOUNCE) {
         lastWake = Date.now()
+        diag.lastWakeAt = lastWake
         diag.wakes++
         diag.dropped = ''
         diag.accepted++
@@ -554,14 +775,16 @@ function startBrowserVoice(h: VoiceHandlers): Voice {
     clearSilence()
     // Endpoint on a short quiet gap; the ElevenLabs path tunes this more
     // finely, but a fixed window is plenty for the fallback.
-    silenceTimer = setTimeout(emit, 900)
+    const gen = cycle.generation()
+    silenceTimer = setTimeout(() => {
+      silenceTimer = null
+      if (gen === cycle.generation()) emit()
+    }, 900)
   }
 
-  const onResult = (e: any) => {
+  const onResult = (e: any, mode: VoiceMode) => {
     touch()
-    const mode = h.mode()
-    diag.mode = mode
-    if (mode === 'deaf') {
+    if (mode === 'deaf' || (!VOICE_BARGE_IN && mode === 'guard')) {
       interim = ''
       return
     }
@@ -582,7 +805,16 @@ function startBrowserVoice(h: VoiceHandlers): Voice {
     if (mode === 'wake') {
       settled += fresh
       if (WAKE.test(heard) && Date.now() - lastWake > WAKE_DEBOUNCE) {
+        // Still mid-phrase: "hey jarvis what" is not a command yet. Waking on
+        // the partial sent that fragment to the bridge as the question. Let
+        // the recogniser finish (or the quiet gap endpoint it) and wake from
+        // the whole phrase in emit().
+        if (interim.trim()) {
+          bumpSilence()
+          return
+        }
         lastWake = Date.now()
+        diag.lastWakeAt = lastWake
         diag.wakes++
         const trailing = afterWake(heard)
         reset()
@@ -630,27 +862,43 @@ function startBrowserVoice(h: VoiceHandlers): Voice {
   }
 
   const spin = () => {
-    if (stopped || running) return
+    if (stopped || blocked || running || starting) return
+    if (!VOICE_BARGE_IN && !cycle.open()) return
+    starting = true
     rec = new Ctor()
+    const instance = rec
     rec.continuous = true
     rec.interimResults = true
     rec.lang = 'en-GB'
     rec.onstart = () => {
+      if (stopped || rec !== instance) return
+      starting = false
       running = true
+      diag.lastError = ''
       diag.running = true
       diag.sessions++
       touch()
     }
-    rec.onresult = onResult
+    rec.onresult = (e: any) => {
+      if (stopped || rec !== instance) return
+      const mode = cycle.sync()
+      // sync() may just have retired this very recogniser.
+      if (rec === instance) onResult(e, mode)
+    }
     rec.onerror = (ev: any) => {
+      if (stopped || rec !== instance) return
       diag.lastError = String(ev.error ?? '')
       if (ev.error === 'not-allowed' || ev.error === 'service-not-allowed') {
-        stopped = true
+        blocked = true
+        starting = false
+        running = false
         diag.running = false
         h.onError('Microphone access was refused — voice input is unavailable.')
       }
     }
     rec.onend = () => {
+      if (stopped || rec !== instance) return
+      starting = false
       running = false
       diag.running = false
       touch()
@@ -660,29 +908,48 @@ function startBrowserVoice(h: VoiceHandlers): Voice {
     try {
       rec.start()
     } catch {
+      starting = false
       running = false
       setTimeout(spin, 250)
     }
   }
 
+  const retire = () => {
+    const old = rec
+    rec = null
+    running = false
+    starting = false
+    diag.running = false
+    try { old?.abort() } catch { /* already gone */ }
+  }
+  const stopWatchingMic = onMicChange(() => {
+    if (stopped) return
+    blocked = false
+    retire()
+    touch()
+    spin()
+  })
+  cycle.sync()
   spin()
+
+  // The app's phase changes without telling the voice loop, so the loop looks.
+  const phasePoll = setInterval(() => {
+    if (!stopped) cycle.sync()
+  }, 150)
 
   // The heartbeat. If nothing has been heard from the engine for a while it has
   // gone quiet on us — tear it down and build a fresh one.
   const health = setInterval(() => {
-    if (stopped) return
+    if (stopped || blocked) return
+    if (!VOICE_BARGE_IN && !cycle.open()) {
+      touch()
+      return
+    }
     const idle = Date.now() - lastAlive
     diag.idleMs = idle
     if (idle < 15000) return
     diag.restarts++
-    try {
-      rec?.abort()
-    } catch {
-      /* already gone */
-    }
-    rec = null
-    running = false
-    diag.running = false
+    retire()
     touch()
     spin()
   }, 5000)
@@ -691,6 +958,9 @@ function startBrowserVoice(h: VoiceHandlers): Voice {
     stop: () => {
       stopped = true
       clearInterval(health)
+      clearInterval(phasePoll)
+      stopWatchingMic()
+      retire()
       clearSilence()
       assemble.cancel()
       diag.running = false

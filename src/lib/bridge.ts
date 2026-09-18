@@ -1,16 +1,20 @@
-import type { AskHandlers } from './anthropic'
+export type AskHandlers = {
+  /** Fires for each chunk of the spoken answer. */
+  onText: (delta: string) => void
+  /** Fires when the bridge reports a tool at work. */
+  onTool: (name: string) => void
+}
 import type { Blade, Panel } from '../store'
 import { BRIDGE_WS_URL } from '../config'
 
 /**
  * Client for the local bridge (see bridge/server.mjs).
  *
- * Same `ask()` shape as the browser-direct path, so App.tsx doesn't care which
- * brain is behind it. The difference is what's reachable: this one runs on your
- * machine, so every MCP server in your Claude Code config is in play.
+ * The bridge answers each question with its deterministic router, its own
+ * tools, or the local Ollama model - all on this machine.
  *
- * The socket is the session. The bridge holds one Claude Agent SDK query per
- * connection and the whole conversation lives inside it, so a dropped socket
+ * The socket is the session. The bridge holds one conversation per
+ * connection and the whole exchange lives inside it, so a dropped socket
  * silently wipes JARVIS's memory of the exchange while the transcript on screen
  * still shows it. That is why the reconnect below is loud rather than
  * invisible: `watchConnection` exists so the HUD can say so.
@@ -169,9 +173,8 @@ function dispatch(ws: WebSocket) {
     }
 
     if (msg.type === 'ready') {
-      // The bridge announces immediately on connect from Claude Code's config,
-      // then again with live status once the agent initialises. Keep listening
-      // so the later, more accurate list wins.
+      // The bridge announces its systems on connect. Keep listening so a
+      // later, more accurate list (after a bridge restart) wins.
       servers = (msg.servers ?? [])
         .map((s) => (typeof s === 'string' ? s : (s.name ?? '')))
         .filter(Boolean)
@@ -493,6 +496,26 @@ export function cancel(): void {
 /** The older name for `cancel()`. */
 export function interrupt(): void {
   cancel()
+}
+
+/** The voice loop's state, for the bridge's /diagnostics. The bridge keeps
+ *  only states and times; the transcript itself is sent as a length. */
+export function reportVoice(v: {
+  engine: string
+  voiceState: string
+  wakeListening: boolean
+  commandRecognitionActive: boolean
+  ttsActive: boolean
+  recognitionGeneration: number
+  wakes: number
+  accepted: number
+  lastFinalTranscript: string
+  lastUtteranceSentAt: number
+  lastWakeAt: number
+}): void {
+  if (socket?.readyState !== WebSocket.OPEN) return
+  const { lastFinalTranscript, ...rest } = v
+  socket.send(JSON.stringify({ type: 'voice', ...rest, lastFinalTranscriptChars: lastFinalTranscript.length }))
 }
 
 /** `mcp__higgsfield__generate_image` -> `higgsfield · generate image` */

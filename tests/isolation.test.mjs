@@ -2,15 +2,17 @@
  * The promises this fork makes about the machine it runs on.
  *
  * Every test here guards something that would be invisible if it regressed:
- * nothing reads the user's global Claude Code configuration, no secret is
- * tracked by git, and the launcher works on Windows. A code review catches
+ * JARVIS has no Claude/Anthropic runtime at all, nothing reads the user's
+ * global Claude Code configuration, no secret is tracked by git, and the
+ * launcher works on Windows. A code review catches
  * these once; a test catches them every time.
  */
 
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { execFileSync } from 'node:child_process'
-import { readFileSync, readdirSync, statSync } from 'node:fs'
+import { execFileSync, spawn } from 'node:child_process'
+import { mkdtempSync, readFileSync, readdirSync, statSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -69,18 +71,69 @@ test('the global Claude configuration is never written or modified', () => {
   assert.deepEqual(writes, [])
 })
 
-test('the bridge hands the agent only the project-local servers', () => {
-  const server = code(join(ROOT, 'bridge/server.mjs'))
-  assert.ok(server.includes('projectServers()'), 'servers come from the project config')
-  // settingSources: [] is what stops the SDK loading filesystem settings —
-  // including a global bypassPermissions default that would sit in front of
-  // the tool gate and make it unreachable.
-  assert.ok(/settingSources:\s*\[\]/.test(server))
+test('there is no Claude or Anthropic runtime dependency', () => {
+  const pkg = JSON.parse(read('package.json'))
+  const deps = Object.keys({ ...pkg.dependencies, ...pkg.devDependencies })
+  assert.deepEqual(deps.filter((d) => /anthropic|claude/i.test(d)), [])
+  const lock = read('package-lock.json')
+  assert.ok(!/node_modules\/@anthropic-ai\//.test(lock), 'the lockfile still carries an Anthropic package')
+  const runtime = sources().filter((f) => /^(bridge|src|scripts)[\\/]/.test(f.slice(ROOT.length + 1)))
+  assert.ok(runtime.length > 20, 'the runtime sources were found')
+  const offenders = runtime.filter((f) => {
+    const c = code(f)
+    return (
+      /from\s+['"]@anthropic-ai|import\(\s*['"]@anthropic-ai|claude-agent-sdk/.test(c) ||
+      /spawn(?:Sync)?\(\s*['"]claude/.test(c) ||
+      /ANTHROPIC_API_KEY|api\.anthropic\.com/.test(c)
+    )
+  })
+  assert.deepEqual(offenders.map((f) => f.slice(ROOT.length + 1)), [])
+})
+
+test('the bridge starts with no Claude login, key, config or home directory', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'jarvis-nohome-'))
+  const env = Object.fromEntries(Object.entries(process.env).filter(([k]) => !/^(ANTHROPIC|CLAUDE)/i.test(k)))
+  const port = 8795
+  const child = spawn(process.execPath, ['bridge/server.mjs'], {
+    cwd: ROOT,
+    env: {
+      ...env,
+      HOME: home,
+      USERPROFILE: home,
+      APPDATA: join(home, 'AppData'),
+      JARVIS_BRIDGE_PORT: String(port),
+      JARVIS_RUN_DIR: join(home, 'run'),
+      JARVIS_OLLAMA_URL: 'http://127.0.0.1:9',
+      JARVIS_WARM_MODEL: '0',
+      JARVIS_UNLOAD_ON_EXIT: '0',
+      JARVIS_APPS_FILE: join(home, 'apps.json'),
+      ELEVENLABS_API_KEY: '',
+    },
+    stdio: ['pipe', 'pipe', 'pipe'],
+  })
+  let log = ''
+  child.stdout.on('data', (d) => (log += d))
+  child.stderr.on('data', (d) => (log += d))
+  try {
+    let ok = false
+    for (let i = 0; i < 100 && !ok; i++) {
+      try {
+        ok = (await fetch(`http://127.0.0.1:${port}/health`)).ok
+      } catch {
+        await new Promise((r) => setTimeout(r, 100))
+      }
+    }
+    assert.ok(ok, log)
+    assert.doesNotMatch(log, /claude login|anthropic|api key required/i)
+  } finally {
+    child.stdin.end()
+    await new Promise((r) => (child.exitCode !== null ? r() : child.once('exit', r)))
+  }
 })
 
 test('secrets and machine-local files are ignored by git', () => {
   const ignored = read('.gitignore')
-  for (const entry of ['.env', '.env.local', 'jarvis.mcp.json', '.jarvis/', 'workspace/']) {
+  for (const entry of ['.env', '.env.local', 'jarvis.apps.json', 'jarvis.mcp.json', '.jarvis/']) {
     assert.ok(ignored.includes(entry), `${entry} must be git-ignored`)
   }
 })
@@ -90,7 +143,7 @@ test('no secret file is actually tracked', () => {
     .split('\n')
     .map((l) => l.trim())
     .filter(Boolean)
-  for (const name of ['.env', '.env.local', 'jarvis.mcp.json']) {
+  for (const name of ['.env', '.env.local', 'jarvis.apps.json', 'jarvis.mcp.json']) {
     assert.ok(!tracked.includes(name), `${name} must not be tracked`)
   }
   // The example file is tracked on purpose, and must stay free of real values.
@@ -140,6 +193,8 @@ test('the Windows scripts the documentation promises all exist', () => {
     'scripts/uninstall-startup.ps1',
     'scripts/node.ps1',
     'scripts/diagnostics.mjs',
+    'scripts/apps.mjs',
+    'scripts/e2e.mjs',
   ]) {
     assert.doesNotThrow(() => read(script), `${script} is missing`)
   }

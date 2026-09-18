@@ -19,10 +19,15 @@ dist-ssr
 .env.*.local
 .env.txt
 
-# Opt-in, project-local MCP servers. Absent by default, and may carry tokens.
+# The user's own application aliases and portable-app paths (npm run app).
+jarvis.apps.json
+jarvis.apps.json.tmp
+
+# Legacy opt-in MCP file from the Claude-era bridge. No longer read; kept
+# ignored so an old copy with tokens in it can never be committed.
 jarvis.mcp.json
 
-# Runtime state: the PID file the launcher writes, and the agent's workspace.
+# Runtime state: the PID and run files, the application cache, old workspace.
 .jarvis/
 workspace/
 
@@ -39,3 +44,6 @@ workspace/
 
 # Copied out of node_modules by scripts/start.mjs — 34MB of build output.
 public/mediapipe/
+
+# Local Claude Code backup files
+.claude/*.bak

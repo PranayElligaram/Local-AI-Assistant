@@ -10,7 +10,7 @@
     good Node 22 sits in Volta's or nvm's store is a bad way to start.
 
     Search order: PATH, Volta's image store, nvm-for-windows, Program Files.
-    Nothing is installed and nothing is changed — this only looks.
+    Nothing is installed and nothing is changed  -  this only looks.
 #>
 
 function Get-NodeMajor {
@@ -65,7 +65,13 @@ function Find-JarvisNode {
 
     foreach ($candidate in $candidates) {
         if (-not $candidate) { continue }
-        if ((Get-NodeMajor -Exe $candidate) -ge $Minimum) { return $candidate }
+        if ((Get-NodeMajor -Exe $candidate) -lt $Minimum) { continue }
+        $rawVersion = (& $candidate -v 2>$null | Select-Object -First 1)
+        if (-not $rawVersion) { continue }
+        $version = [version]$rawVersion.Trim().TrimStart('v')
+        if (($version.Major -eq 20 -and $version.Minor -ge 19) -or
+            ($version.Major -eq 22 -and $version.Minor -ge 12) -or
+            $version.Major -gt 22) { return $candidate }
     }
     return $null
 }

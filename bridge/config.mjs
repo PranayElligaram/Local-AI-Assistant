@@ -1,24 +1,16 @@
 /**
  * Everything the bridge is allowed to know about this machine.
  *
- * Upstream reads the user's global Claude Code configuration (`~/.claude.json`)
- * for two things: the list of MCP servers to hand the agent, and an ElevenLabs
- * key. Both are deliberately removed here.
+ * Project-local only. Settings come from the real environment, then the
+ * project's own `.env.local` / `.env` (both git-ignored). Nothing outside the
+ * repository is read: no global Claude Code configuration, no MCP discovery,
+ * no account connectors. JARVIS does not use Claude at runtime at all - the
+ * brain is a local Ollama model (see brain/).
  *
- *   - MCP servers. Importing every globally configured server means the voice
- *     assistant silently inherits whatever was installed for something else —
- *     mail, calendars, payment tools — and the first time anyone notices is
- *     when a spoken sentence reaches one of them. This fork starts with none,
- *     and reads an OPT-IN, project-local `jarvis.mcp.json` if (and only if) the
- *     user writes one. Nothing outside the repository is read, and nothing
- *     outside the repository is ever written.
- *
- *   - Secrets. The ElevenLabs key comes from the project's own `.env.local` or
- *     `.env`, both ignored by git. The key itself is never logged, never sent
- *     to the browser, and never written to disk by this process.
+ * Secrets: the optional ElevenLabs key is never logged, never sent to the
+ * browser, and never written to disk by this process.
  */
 
-import { existsSync, mkdirSync, readFileSync } from 'node:fs'
 import { dirname, isAbsolute, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { loadEnvFiles } from './env.mjs'
@@ -28,12 +20,12 @@ export const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 
 export const ENV_FILES_LOADED = loadEnvFiles(ROOT)
 
-/** Minimum Node the Agent SDK and this code need. */
+/** Minimum Node this code (and Vite) need: 20.19+ or 22.12+. */
 export const MIN_NODE_MAJOR = 20
 
 export function nodeTooOld(version = process.versions.node) {
-  const major = Number(String(version).split('.')[0])
-  return Number.isFinite(major) ? major < MIN_NODE_MAJOR : false
+  const [major, minor] = String(version).replace(/^v/, '').split('.').map(Number)
+  return !Number.isFinite(major) || major < 20 || (major === 20 && minor < 19) || major === 21 || (major === 22 && minor < 12)
 }
 
 // --- small parsers ---------------------------------------------------------
@@ -76,11 +68,68 @@ export const PORT = num('JARVIS_BRIDGE_PORT', process.env.JARVIS_BRIDGE_PORT, {
   fallback: 8787,
 })
 
-export const MODEL = str(process.env.JARVIS_MODEL) ?? 'claude-opus-5'
-export const EFFORT = str(process.env.JARVIS_EFFORT) ?? 'medium'
+/** Runtime files: the launcher's PID file, the bridge's run file, caches. */
+export const RUN_DIR = resolve(str(process.env.JARVIS_RUN_DIR) ?? join(ROOT, '.jarvis'))
 
 /**
- * Writes are off unless asked for twice over: the environment variable, or the
+ * The local brain. Defaults are the measured-good setup on this machine:
+ * granite4:3b answers (about 17 tokens/s warm on CPU), qwen3.5:4b is the
+ * fallback, and keep_alive holds granite in memory between questions.
+ */
+export function brainConfig(env = process.env) {
+  const seconds = (name, fallback, max) =>
+    num(name, env[name], { min: 1, max, fallback }) * 1000
+  const url = str(env.JARVIS_OLLAMA_URL) ?? 'http://127.0.0.1:11434'
+  let parsed = null
+  try {
+    parsed = new URL(url)
+  } catch {
+    /* reported below */
+  }
+  const okUrl = parsed && (parsed.protocol === 'http:' || parsed.protocol === 'https:')
+  if (!okUrl) console.warn(`[jarvis] JARVIS_OLLAMA_URL="${url}" is not an http(s) URL - using the default.`)
+  return {
+    provider: (str(env.JARVIS_BRAIN_PROVIDER) ?? 'ollama').toLowerCase(),
+    ollamaUrl: okUrl ? url.replace(/\/+$/, '') : 'http://127.0.0.1:11434',
+    model: str(env.JARVIS_LOCAL_MODEL) ?? 'granite4:3b',
+    fallbackModel: str(env.JARVIS_LOCAL_FALLBACK_MODEL) ?? 'qwen3.5:4b',
+    keepAlive: str(env.JARVIS_MODEL_KEEP_ALIVE) ?? '30m',
+    connectTimeoutMs: seconds('JARVIS_OLLAMA_CONNECT_TIMEOUT_S', 3, 60),
+    responseTimeoutMs: seconds('JARVIS_OLLAMA_RESPONSE_TIMEOUT_S', 20, 300),
+    loadTimeoutMs: seconds('JARVIS_OLLAMA_LOAD_TIMEOUT_S', 60, 600),
+    maxTokens: num('JARVIS_MAX_RESPONSE_TOKENS', env.JARVIS_MAX_RESPONSE_TOKENS, {
+      min: 16,
+      max: 4096,
+      fallback: 256,
+    }),
+  }
+}
+
+export const BRAIN = brainConfig()
+
+/**
+ * Applications. The user's own aliases and portable registrations live in
+ * jarvis.apps.json (git-ignored); the discovered catalogue is a cache in the
+ * run directory. JARVIS_LAUNCH_DRY_RUN=1 resolves without launching, for the
+ * end-to-end check.
+ */
+export const APPS_FILE = (() => {
+  const configured = str(process.env.JARVIS_APPS_FILE)
+  if (!configured) return join(ROOT, 'jarvis.apps.json')
+  return isAbsolute(configured) ? configured : join(ROOT, configured)
+})()
+export const APP_CACHE_FILE = join(RUN_DIR, 'app-catalog.json')
+export const LAUNCH_DRY_RUN = flag('JARVIS_LAUNCH_DRY_RUN', process.env.JARVIS_LAUNCH_DRY_RUN, false)
+
+/** Which search engine "search for X" opens. */
+export const SEARCH_ENGINE = (() => {
+  const v = (str(process.env.JARVIS_SEARCH_ENGINE) ?? 'google').toLowerCase()
+  return ['google', 'bing', 'duckduckgo'].includes(v) ? v : 'google'
+})()
+
+/**
+ * Safe mode is the default. Writes (effectful actions) are off unless asked
+ * for twice over: the environment variable, or the
  * explicit `--writes` flag that `npm run bridge:writes` passes. The flag exists
  * because `VAR=1 node ...` is not valid on Windows PowerShell, which is the
  * primary target here.
@@ -88,25 +137,6 @@ export const EFFORT = str(process.env.JARVIS_EFFORT) ?? 'medium'
 export const ALLOW_WRITES =
   flag('JARVIS_ALLOW_WRITES', process.env.JARVIS_ALLOW_WRITES, false) ||
   process.argv.includes('--writes')
-
-/**
- * The user's own Chrome, driven through the Claude browser extension. Upstream
- * has this always on; here it is opt-in, because a voice assistant that can
- * read every signed-in tab is a capability to grant deliberately rather than
- * inherit from a clone.
- */
-export const ENABLE_CHROME = flag(
-  'JARVIS_ENABLE_CHROME',
-  process.env.JARVIS_ENABLE_CHROME,
-  false,
-)
-
-/** The camera. Gated by the browser's own permission prompt as well. */
-export const ENABLE_CAMERA = flag(
-  'JARVIS_ENABLE_CAMERA',
-  process.env.JARVIS_ENABLE_CAMERA,
-  true,
-)
 
 export const EXTRA_ORIGINS = (process.env.JARVIS_ALLOWED_ORIGINS ?? '')
   .split(',')
@@ -137,6 +167,9 @@ export const ELEVEN_TIMEOUT_MS =
     fallback: 10,
   }) * 1000
 
+/** The ElevenLabs API origin. Overridable only so tests can stand in for it. */
+export const ELEVEN_BASE = (str(process.env.JARVIS_ELEVENLABS_BASE) ?? 'https://api.elevenlabs.io').replace(/\/+$/, '')
+
 /** Transcription gets its own, longer budget: the audio has to upload first. */
 export const STT_TIMEOUT_MS = Math.max(ELEVEN_TIMEOUT_MS, 20_000)
 
@@ -154,57 +187,4 @@ export function describeElevenSource(env = process.env) {
   return elevenKey(env)
     ? 'ElevenLabs key present (from the project .env — value never logged)'
     : 'no ElevenLabs key — browser speech will be used'
-}
-
-/**
- * Where the agent runs. A directory inside the repository rather than the home
- * directory, so a spoken "what's in this folder" lands somewhere expected and
- * project-scoped configuration elsewhere on the machine cannot apply.
- */
-export const WORKSPACE = (() => {
-  const configured = str(process.env.JARVIS_WORKSPACE)
-  const path = configured
-    ? isAbsolute(configured)
-      ? configured
-      : join(ROOT, configured)
-    : join(ROOT, 'workspace')
-  try {
-    mkdirSync(path, { recursive: true })
-  } catch (err) {
-    console.warn(`[jarvis] could not create the workspace directory: ${err.message}`)
-  }
-  return path
-})()
-
-/**
- * MCP servers, opt-in and project-local.
- *
- * `jarvis.mcp.json` (git-ignored) may hold `{ "mcpServers": { ... } }` in the
- * same shape Claude Code uses. Absent — the normal case — JARVIS runs with only
- * its own in-process servers: the display, the interface controls, and the
- * camera. The global `~/.claude.json` is never read, in any case, for any
- * reason.
- */
-export function mcpConfigPath(env = process.env) {
-  const configured = str(env.JARVIS_MCP_CONFIG)
-  if (!configured) return join(ROOT, 'jarvis.mcp.json')
-  return isAbsolute(configured) ? configured : join(ROOT, configured)
-}
-
-export function projectServers(env = process.env) {
-  const path = mcpConfigPath(env)
-  if (!existsSync(path)) return {}
-  try {
-    const parsed = JSON.parse(readFileSync(path, 'utf8'))
-    const servers = parsed?.mcpServers
-    if (!servers || typeof servers !== 'object' || Array.isArray(servers)) {
-      console.warn(`[jarvis] ${path} has no "mcpServers" object — ignoring it.`)
-      return {}
-    }
-    return servers
-  } catch (err) {
-    // A broken opt-in file must not take the assistant down with it.
-    console.warn(`[jarvis] could not read ${path}: ${err.message}`)
-    return {}
-  }
 }

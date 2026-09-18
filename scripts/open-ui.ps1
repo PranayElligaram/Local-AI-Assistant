@@ -45,7 +45,7 @@ function Get-MonitorRect {
     Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
     $screens = [System.Windows.Forms.Screen]::AllScreens
     if (-not $screens) { return $null }
-    # Left to right, then top to bottom — the same ordering the previous
+    # Left to right, then top to bottom  -  the same ordering the previous
     # implementation used, so a monitor number means the same thing it did.
     $ordered = $screens | Sort-Object { $_.Bounds.X }, { $_.Bounds.Y }
     if ($Index -gt $ordered.Count) {

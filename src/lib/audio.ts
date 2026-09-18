@@ -22,6 +22,11 @@ let ctx: AudioContext | null = null
 let analyser: AnalyserNode | null = null
 let buf: Uint8Array | null = null
 let opening: Promise<MediaStream> | null = null
+let wanted = false
+let generation = 0
+let recovering = false
+let retryTimer: ReturnType<typeof setTimeout> | null = null
+let source: MediaStreamAudioSourceNode | null = null
 
 /**
  * Live state of the microphone, published on `window.__mic` and read by the
@@ -122,32 +127,25 @@ async function open(): Promise<MediaStream> {
     }
   }
 
-  const track = live.getAudioTracks()[0]
-  micDiag.open = true
-  micDiag.label = track?.label ?? ''
-  micDiag.lastError = ''
-  watch(live)
   return live
 }
 
 /** Reopen after a loss, patiently, and hand the new stream to consumers. */
 async function reacquire(attempt = 0): Promise<void> {
+  if (!wanted || recovering) return
+  recovering = true
+  const epoch = generation
+  if (retryTimer) clearTimeout(retryTimer)
+  retryTimer = null
   if (attempt === 0) micDiag.recoveries++
   try {
-    stream = await open()
-    for (const fn of listeners) {
-      try {
-        fn(stream)
-      } catch (err) {
-        console.warn('[jarvis] a microphone consumer failed to restart:', err)
-      }
-    }
-    console.log(`[jarvis] microphone recovered: ${micDiag.label || 'default device'}`)
+    await getMic()
   } catch (err) {
+    if (!wanted || epoch !== generation) return
     micDiag.lastError = err instanceof Error ? err.name : String(err)
-    // Never give up entirely: the usual cause is a device being plugged back
-    // in, which can be minutes away. The delay tops out, it does not stop.
-    setTimeout(() => void reacquire(attempt + 1), retryDelay(attempt))
+    retryTimer = setTimeout(() => void reacquire(attempt + 1), retryDelay(attempt))
+  } finally {
+    if (epoch === generation) recovering = false
   }
 }
 
@@ -187,35 +185,101 @@ if (typeof navigator !== 'undefined' && navigator.mediaDevices) {
       // back in. A live track is left alone: switching device mid-sentence
       // would cost the sentence.
       const track = stream?.getAudioTracks()[0]
-      if (!track || track.readyState === 'ended') void reacquire()
+      if (wanted && (!track || track.readyState === 'ended')) void reacquire()
     })
   })
 }
 
+/**
+ * An unanswered permission prompt is not a failure — it is a wait with no end.
+ *
+ * `getUserMedia` neither resolves nor rejects while the Chrome prompt sits
+ * there, so anything that awaits it without a clock waits for ever. Measured:
+ * the boot sequence stopped at "INITIATING SYSTEM" indefinitely because the
+ * prompt had not been answered, which reads as a broken interface rather than
+ * as a question the user has not noticed.
+ */
+export const MIC_WAIT_MS = 12_000
+
+/** Bound the wait without abandoning the pending permission request. */
+export async function getMicSoon(ms = MIC_WAIT_MS): Promise<MediaStream> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    return await Promise.race([
+      getMic(),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new DOMException('the microphone was not granted in time', 'TimeoutError')), ms)
+      }),
+    ])
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+/**
+ * Permission granted later, after the interface has already come up. Chrome
+ * reports the change here, and picking it up is what saves a page reload.
+ */
+if (typeof navigator !== 'undefined' && navigator.permissions?.query) {
+  void navigator.permissions
+    .query({ name: 'microphone' as PermissionName })
+    .then((status) => {
+      status.addEventListener('change', () => {
+        if (status.state !== 'granted') return
+        const track = stream?.getAudioTracks()[0]
+        if (wanted && (!track || track.readyState === 'ended')) void reacquire()
+      })
+    })
+    .catch(() => {
+      /* Firefox and Safari do not expose this query; the rest still works. */
+    })
+}
+
 export async function getMic(): Promise<MediaStream> {
+  wanted = true
   if (stream && stream.getAudioTracks()[0]?.readyState === 'live') return stream
-  // Concurrent callers (the VAD, the analyser, the voice loop) must not each
-  // open their own stream — Chrome drops the earlier one when they do.
   if (!opening) {
-    opening = open()
+    const epoch = generation
+    const request = open()
       .then((s) => {
+        if (!wanted || epoch !== generation) {
+          for (const track of s.getTracks()) track.stop()
+          throw new DOMException('Microphone released while opening', 'AbortError')
+        }
+        for (const track of stream?.getTracks() ?? []) track.stop()
         stream = s
+        micDiag.open = true
+        micDiag.label = s.getAudioTracks()[0]?.label ?? ''
+        micDiag.lastError = ''
+        watch(s)
+        for (const fn of listeners) {
+          try { fn(s) } catch (err) { console.warn('[jarvis] microphone consumer:', err) }
+        }
         return s
       })
       .catch((err) => {
-        micDiag.open = false
-        micDiag.lastError = err instanceof Error ? err.name : String(err)
+        if (epoch === generation) {
+          micDiag.open = false
+          micDiag.lastError = err instanceof Error ? err.name : String(err)
+        }
         throw err
       })
       .finally(() => {
-        opening = null
+        if (opening === request) opening = null
       })
+    opening = request
   }
   return opening
 }
 
 /** Hand the device back. Used on shutdown, so the OS indicator goes out. */
 export function releaseMic(): void {
+  wanted = false
+  generation++
+  opening = null
+  recovering = false
+  if (retryTimer) clearTimeout(retryTimer)
+  retryTimer = null
   for (const track of stream?.getTracks() ?? []) {
     try {
       track.stop()
@@ -227,25 +291,26 @@ export function releaseMic(): void {
   micDiag.open = false
 }
 
+let watchingAnalyser = false
 export async function startAnalyser(): Promise<void> {
   if (analyser) return
-  const s = await getMic()
-  ctx = new AudioContext()
-  attach(s)
-  // The reactor's meter has to follow the device across a reconnect, or it
-  // stays flat for ever after a headset is unplugged and plugged back in.
-  onMicChange((next) => {
-    if (ctx) attach(next)
-  })
+  if (!watchingAnalyser) {
+    watchingAnalyser = true
+    onMicChange(attach)
+  }
+  const s = await getMicSoon()
+  if (!analyser) attach(s)
 }
 
 function attach(s: MediaStream): void {
-  if (!ctx) return
-  const src = ctx.createMediaStreamSource(s)
+  ctx ??= new AudioContext()
+  void ctx.resume()
+  source?.disconnect()
+  source = ctx.createMediaStreamSource(s)
   analyser = ctx.createAnalyser()
   analyser.fftSize = 512
   analyser.smoothingTimeConstant = 0.75
-  src.connect(analyser)
+  source.connect(analyser)
   buf = new Uint8Array(analyser.frequencyBinCount)
 }
 

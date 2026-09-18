@@ -1,193 +1,186 @@
 # J.A.R.V.I.S.
 
-A browser voice assistant with an Iron Man holographic interface. Say
-**"Hey Jarvis"**, he wakes, listens, and does real things through your tools —
-searches the web, generates images, drives your phone, reads your mail. The face
-is a web page (React + Vite + Three.js + custom GLSL). The brain is Claude Code,
-run headless as a library.
+A Windows desktop voice assistant with an Iron Man holographic interface. Say
+**"Hey Jarvis"**, he wakes, listens, answers, and does things on your PC - tells
+the time, opens any installed application, opens web pages and searches, shows
+his own diagnostics.
 
-**The only subscription you need is Claude Code.** No API keys, no OpenAI
-account, no cloud bill — the brain runs on your existing Claude Code login, and
-the heavy work (the model itself) runs on Anthropic's servers, so even a low-end
-laptop only has to draw the interface. **ElevenLabs is an optional add-on** that
-gives JARVIS a much better voice and sharper hearing; without it he speaks and
-listens through the browser's own speech, and everything still works.
+**JARVIS does not require Claude.** Everything runs on your machine: a
+deterministic command router, JARVIS-owned tools, and a local language model
+served by [Ollama](https://ollama.com) - `granite4:3b` as the everyday brain and
+`qwen3.5:4b` as the local fallback. No cloud account, no API key, no login and no
+internet connection is needed for JARVIS to work. **ElevenLabs is an optional
+add-on** for a better voice; without it he speaks and listens through the
+browser's own speech.
+
+> This fork started from [adewaskar/jarvis](https://github.com/adewaskar/jarvis),
+> whose brain was Claude Code run headless. That runtime dependency has been
+> removed on purpose. Claude Code was used to *build* this version; it plays no
+> part in running it.
 
 ---
 
 ## Requirements
 
-**In one line:** a Claude Code subscription, plus two free things every computer
-can have — Node.js and Chrome. That's the whole list.
+- **Windows 10/11** (the primary platform; the scripts are Windows PowerShell 5.1
+  compatible).
+- **Node.js 20.19+ or 22.12+** - <https://nodejs.org>. `scripts\jarvis.ps1` finds a
+  suitable one (PATH, Volta, nvm-for-windows, Program Files) even if the default
+  `node` on PATH is older.
+- **Google Chrome or Microsoft Edge**, in a **real browser window** - not an
+  editor's embedded preview pane, which blocks the microphone. WebGL is required.
+- **Ollama** - <https://ollama.com>, running on `http://127.0.0.1:11434`, with:
 
-- **Claude Code, installed and logged in** — this is the only account you need.
-  Install it with the official method — `npm install -g @anthropic-ai/claude-code`,
-  or the platform installer at <https://docs.claude.com/en/docs/claude-code> —
-  then run `claude` once and complete login. The bridge reuses that login. **No
-  API key**, and usage is billed to your existing Claude account.
-- **Node.js 20 or newer** — free, one installer from <https://nodejs.org>. This
-  is a Node web app, so it is the one unavoidable tool.
-- **Google Chrome or Microsoft Edge**, in a **real browser window** — not an
-  embedded preview pane. Preview panes (including the one inside editors and
-  Claude Code) block microphone access, so the page loads and looks right but
-  never hears you. JARVIS also needs WebGL, which these browsers provide.
-- **Optional: an ElevenLabs API key** — a good add-on, not a requirement. It
-  gives a better voice and sharper transcription; the free tier is plenty for a
-  demo. Without it, everything runs on the browser's own speech.
+  ```powershell
+  ollama pull granite4:3b
+  ollama pull qwen3.5:4b
+  ```
 
-Run `npm run setup` after cloning and it checks all of this for you, in plain
-language.
+- **Optional: an ElevenLabs API key** for the ElevenLabs voice (and Scribe
+  transcription, if your key has the `speech_to_text` permission).
+
+Check everything at once:
+
+```powershell
+npm ci
+npm run setup
+```
+
+`setup` checks the Node version, dependencies, that Ollama is reachable, that
+both models are installed, the ElevenLabs configuration, and whether JARVIS is
+running - in plain language, changing nothing.
 
 ---
 
-## Quick start
+## Start, stop, restart
 
-First, install, then start it:
-
-```bash
-npm install
-npm start          # runs the brain and the face together
+```powershell
+npm start                                                    # bridge + interface, one terminal
+powershell -ExecutionPolicy Bypass -File scripts\jarvis.ps1 -Open   # same, finds Node 20+, opens Chrome/Edge
 ```
 
-Then open the URL it prints (http://localhost:5173) in **Chrome**, click **INITIALISE**, and say **“Hey Jarvis”**.
+Open <http://localhost:5173> in Chrome or Edge, click **INITIALISE**, allow the
+microphone, and say **"Hey Jarvis"**.
 
-Prefer two terminals? Run them separately instead:
-
-```bash
-npm install
+```powershell
+npm run stop        # or: powershell -ExecutionPolicy Bypass -File scripts\stop.ps1
+npm run restart     # or: powershell -ExecutionPolicy Bypass -File scripts\restart.ps1
 ```
 
-Terminal 1 — the brain:
+You can also say **"restart Jarvis"** (the launcher starts a fresh bridge; the
+interface reconnects) or **"stop Jarvis"**.
 
-```bash
-npm run bridge
-```
-
-Terminal 2 — the face:
-
-```bash
-npm run dev
-```
-
-Then open the app in a **real Chrome or Edge window**:
-
-```bash
-open http://localhost:5173
-```
-
-Click **INITIALISE**, allow the microphone when asked, and say **"Hey Jarvis"**.
-
-> It has to be a real browser window. Embedded preview panes block the
-> microphone, so JARVIS will look perfectly alive and simply never respond.
+`scripts\install-startup.ps1` / `scripts\uninstall-startup.ps1` add or remove a
+log-on task.
 
 ---
 
 ## How it works
 
-JARVIS is two processes. The browser is the face and the voice; the bridge is
-the brain and the hands.
-
 ```
-  ┌─ browser (the face) ───────────────┐        ┌─ bridge (the brain) ─────────────┐
-  │  "Hey Jarvis" wake word            │        │  Node · bridge/server.mjs        │
-  │  local VAD  →  speech to text      │   ws   │  Claude Agent SDK                │
-  │  reactor UI (Three.js + GLSL)      │◄─────► │   = Claude Code, headless        │
-  │  text to speech                    │  8787  │  spawns your MCP servers         │
-  │  heads-up display                  │        │  permission gate (decideTool)    │
-  └────────────────────────────────────┘        └──────────────────────────────────┘
+  browser (the face)                        bridge (the brain and hands)
+  -----------------------------------      ---------------------------------------------
+  "Hey Jarvis" wake word                   bridge/server.mjs  (localhost:8787 only)
+  VAD -> speech to text                ws    intent router (bridge/router.mjs)
+  reactor UI (Three.js + GLSL)       <---->     obvious request -> JARVIS tool, no model
+  text to speech, barge-in                    local brain (bridge/brain/)
+  diagnostics (D), self-test (T)                 Ollama: granite4:3b -> qwen3.5:4b
+                                              tools (bridge/tools.mjs) - JARVIS executes
+                                              application catalogue (bridge/apps/)
 ```
 
-Everything you see and hear happens in the browser. The bridge is a single Node
-process (`bridge/server.mjs`) that runs the **Claude Agent SDK**
-(`@anthropic-ai/claude-agent-sdk`) — this spawns the real `claude` CLI as a child
-process, so **the brain literally is Claude Code, headless.** They talk over a
-WebSocket (plus a few HTTP endpoints) on `ws://localhost:8787`.
+1. **Deterministic first.** "What time is it", "what's the date", "open
+   Spotify", "search Google for X", "open example.com", "show diagnostics",
+   "restart Jarvis" - each is recognised by a small parser and run directly. No
+   model is called, so these work with Ollama stopped and no internet.
+2. **Local brain for the rest.** Conversation and ambiguous requests go to
+   `granite4:3b`, streamed so speech starts on the first finished sentence.
+   Granite may choose a tool (e.g. "I need to do some sums" -> open Calculator).
+   If granite fails before saying anything, `qwen3.5:4b` answers (reasoning off:
+   `think: false`). Ollama `keep_alive` (30 minutes) keeps granite loaded.
+3. **JARVIS owns the tools.** A model only *selects* a tool. JARVIS checks the
+   tool name, the arguments against a schema, and the permission, then runs its
+   own implementation. There is no shell tool and no path argument anywhere.
+4. **If the local brain is down** (Ollama stopped, model missing, timeout,
+   malformed reply), JARVIS says *"My local AI brain is unavailable right now."*
+   and keeps running; time, date and applications still work.
 
-**Why a bridge at all?** A browser tab cannot spawn the local stdio MCP servers —
-`higgsfield`, `elevenlabs`, `android`, `playwright`, `exa`, `serper`, and the
-rest. The bridge can. And because it is the Agent SDK, it authenticates off your
-existing Claude Code login: no API key, billed to that same Claude account.
+### Opening applications
 
-**The model.** `claude-opus-5` at effort `medium` by default. Override with the
-`JARVIS_MODEL` and `JARVIS_EFFORT` environment variables. On startup the bridge
-prints its choice, e.g. `[jarvis] model claude-opus-5 · effort medium`.
+"Jarvis, open *anything*" works for any application Windows lists as installed.
+The catalogue is built from:
 
-### The voice pipeline
+- the current-user and all-users **Start Menu** shortcuts,
+- registered **App Paths** (HKCU and HKLM),
+- **Start apps**, including packaged/UWP apps (Calculator, Settings, Spotify
+  from the Store, Terminal...),
+- a few Windows built-ins as a fallback.
 
-The loop is designed so that nothing silently dies and barge-in feels natural.
+It is cached in `.jarvis\app-catalog.json`, refreshed daily in the background,
+and rescanned once when a name is not found. Nothing scans the drive for `.exe`
+files - a program in Downloads is not an installed application.
 
-- **Detection is local.** An energy-based voice-activity detector
-  (`src/lib/vad.ts`) decides when you are speaking. It is instant, cannot quietly
-  fail, and is what makes **barge-in** work — speak while JARVIS is talking and he
-  stops.
-- **Transcription has two tiers, chosen automatically at boot.** The browser asks
-  the bridge `/health` and picks the best available:
-  - **ElevenLabs key present** → ElevenLabs Scribe, via the bridge `/stt` endpoint.
-  - **Nothing configured** → the browser's own `SpeechRecognition` (Chrome/Edge),
-    guarded by a heartbeat so it recovers when Chrome throttles it.
-- **Speaking** uses the **ElevenLabs voice when a key is present**, and the
-  browser's `speechSynthesis` otherwise. If a cloud call fails it falls back to
-  the browser voice, and if the OS voice itself is broken it latches over to the
-  cloud voice.
+Names resolve by exact name, then aliases, then a strong word match, then a
+cautious fuzzy match. "VS Code", "Code" and "Visual Studio Code" all open Visual
+Studio Code; "Chrome"/"Google Chrome" and "Word"/"Microsoft Word" are
+consistent. **If several apps match, JARVIS asks** ("Visual Studio Code or
+Visual Studio Installer?") and you can answer "the first one". A weak fuzzy
+match is only ever a suggestion, never a launch.
 
-So it works with no keys and auto-upgrades when a key appears — there is no flag
-to set. Capability detection lives in `src/lib/capabilities.ts`, which probes the
-bridge's `GET /health` (returning `{ ok, tts, stt }`, both tracking the
-ElevenLabs key) once at boot and picks the engines.
+The model never supplies what is executed: it passes a *name*, and JARVIS
+launches the catalogue entry with no arguments and no shell. Opening PowerShell
+opens PowerShell; nothing can make it run a command.
+
+Your own aliases and portable (unregistered) apps live in `jarvis.apps.json`
+(git-ignored) and are only ever written by you:
+
+```powershell
+npm run app -- list [filter]                      # what JARVIS can open
+npm run app -- refresh                            # rescan now
+npm run app -- resolve "vs code"                  # what "open vs code" would open
+npm run app -- alias ide "Visual Studio Code"     # your own alias
+npm run app -- add mytool "D:\Tools\MyTool.exe"   # a portable app (absolute .exe/.lnk)
+npm run app -- aliases                            # list your aliases and portable apps
+npm run app -- remove mytool
+```
+
+### Web
+
+"Search Google for X" builds a search URL and opens it - no model needed.
+"Research the latest X and summarise it" needs live retrieval, which a local
+model does not have; JARVIS opens the search and says he cannot read live results
+yet rather than inventing them. `bridge/web.mjs` documents the
+`WebSearchProvider` extension point for real retrieval later.
+
+### Voice
+
+- **Wake:** "Hey Jarvis", matched in the transcript (or offline with a Picovoice
+  key).
+- **Microphone:** device selection (`VITE_JARVIS_MIC`), permission timeout,
+  recovery when the device disappears or changes, one shared open request so
+  streams never overlap.
+- **Speech to text:** ElevenLabs Scribe when the key is *permitted* to
+  transcribe; otherwise the browser's recogniser. A 401/403 from ElevenLabs is
+  remembered - JARVIS stops calling it and switches to browser recognition.
+- **Text to speech:** ElevenLabs when configured and permitted, otherwise the
+  browser voice; any failure falls back to the browser voice for that line.
+- **Barge-in:** start talking while he speaks and he stops, drops queued speech,
+  cancels the model request, and listens.
 
 ---
 
-## What JARVIS can do
+## Safety
 
-Beyond answering, JARVIS reaches every MCP server in your Claude Code
-configuration, and can drive his own interface.
+Read-only by default. JARVIS answers, looks things up, opens what you explicitly
+ask for, opens web pages and searches, and shows diagnostics. He does not delete
+files, send messages, install or uninstall software, buy anything or change
+accounts - no such tool exists. `npm run start:writes` / `npm run bridge:writes`
+still select the separate writes mode, but in this build no effectful tool is
+registered, and the model can never run a shell command in either mode.
 
-### Your tools
-
-Every server in your `~/.claude.json` is handed to the SDK explicitly. Depending
-on what you have installed, that is roughly:
-
-- **Web & search** — `exa`, `serper`, `serpapi`
-- **Images & video** — `higgsfield`, `openrouter-image`, `palmier-pro`
-- **Voice** — `elevenlabs`
-- **Your phone** — `android`
-- **The browser** — `playwright`
-
-A few things you can say:
-
-- *"What's happening in AI this week?"*
-- *"Generate an image of the Mark VII suit."*
-- *"Take a screenshot of my phone."*
-- *"Open my GitHub notifications."*
-
-> **Note on account connectors.** Servers you added through your **claude.ai
-> account** are not stored on disk, so the bridge cannot see them — it works from
-> the servers in `~/.claude.json` (about 14), not the claude.ai ones.
-
-### JARVIS controls the interface
-
-He drives the UI through MCP tools the bridge exposes:
-
-- `ui_theme` — accent, background, per-phase colours
-- `ui_reactor` — colour, scale, intensity, spin, and style (`ring` | `sphere` | `wire`), visibility
-- `ui_orbit` — put images in orbit around the reactor
-- `ui_chrome` — show or hide rails, transcript, badges
-- `ui_effect` — `glitch` | `pulse` | `scan` | `shake` | `flash`
-- `ui_screen` — clear
-- `ui_reset` — back to defaults
-
-So *"make it red, hide the systems list, put that render in orbit"* is a spoken
-command.
-
-### The heads-up display
-
-JARVIS authors panels with a `display` tool against a fixed `.hud-*` design
-system. The browser sanitises the markup (DOMPurify, a class allowlist and a
-strict CSP) before rendering. Rich media works — images, `<video>`, and
-YouTube/Vimeo embeds. Remote images and video are fetched **server-side** through
-the bridge (`/img` and `/media`, both SSRF-guarded), so hotlink-blocked news
-thumbnails still appear and the page never beacons your IP to a host the model
-chose.
+The bridge listens on 127.0.0.1 only and accepts WebSocket connections only from
+local dev origins. Secrets stay in `.env.local` (git-ignored), are never logged
+and never sent to the page. The global `~/.claude.json` is never read or written.
 
 ---
 
@@ -198,118 +191,83 @@ chose.
 | **"Hey Jarvis"** | Wake him |
 | **Space** | Talk without the wake word |
 | Just speak | Interrupt him mid-sentence (barge-in) |
+| **D** / "show diagnostics" | Live diagnostics panel |
+| **T** | One-line audio self-test |
 | **V** | Cycle the browser voice |
 | **Escape** | Stand down |
-| **D** | Live diagnostics panel |
-| **T** | One-line audio self-test |
 
----
-
-## The boot sequence
-
-Power-up plays a four-beat Iron Man start-up (`src/ui/Boot.tsx`): an
-"INITIATING SYSTEM" status bar with a segmented progress bar and boot log; then
-concentric reticle rings resolving into "J.A.R.V.I.S"; then a suit schematic;
-then the triangular arc reactor lighting up — with a start-up sound under it
-(`public/audio/boot-music.mp3`).
+The diagnostics panel shows the measured state of the voice (wake, microphone,
+STT/TTS provider, barge-in, errors), the brain (Ollama endpoint, granite and qwen
+health, last model, last latency, *cloud required: No*, *Claude runtime: None*),
+applications (catalogue size, last request, how it resolved, launch result),
+tools (last tool, result, safe/writes mode) and the process (bridge PID, port,
+run-file ownership, uptime).
 
 ---
 
 ## Configuration
 
-Everything is optional in bridge mode. Frontend settings live in `.env.local`
-(copy `.env.example`); bridge settings are environment variables.
-
-### Bridge
+Everything is optional. Put overrides in `.env.local` (see `.env.example`); a real
+environment variable wins over the file.
 
 | Variable | Default | Effect |
 |---|---|---|
-| `JARVIS_BRIDGE_PORT` | `8787` | Port for the WebSocket + HTTP endpoints |
-| `JARVIS_MODEL` | `claude-opus-5` | Model to run |
-| `JARVIS_EFFORT` | `medium` | Reasoning effort |
-| `JARVIS_ALLOW_WRITES` | off | `1` allows effectful tools (see below) |
-| `JARVIS_ALLOWED_ORIGINS` | local dev | Extra WebSocket origins to accept |
-| `JARVIS_ALLOW_NO_ORIGIN` | off | Accept connections with no `Origin` header |
-| `JARVIS_FILE_ROOTS` | — | Roots the `/file` endpoint may serve from |
-| `JARVIS_VOICE_ID` | — | ElevenLabs voice id |
-| `ELEVENLABS_API_KEY` | — | Optional; enables the ElevenLabs voice + Scribe |
-
-### Frontend (`.env.local`)
-
-| Variable | Effect |
-|---|---|
-| `VITE_BACKEND` | `bridge` (default) or `direct` |
-| `VITE_BRIDGE_URL` | Where to reach the bridge |
-| `VITE_TTS_ENGINE` | `system` or `kokoro` |
-| `VITE_KOKORO_VOICE` | Voice for the Kokoro engine |
-| `VITE_USE_ELEVENLABS` | Force the ElevenLabs voice on |
-| `VITE_ANTHROPIC_API_KEY` | Direct mode only |
-
-### Adding an ElevenLabs key
-
-You do not have to touch a flag. Either:
-
-- Set `ELEVENLABS_API_KEY` on the bridge before starting it, **or**
-- Add the key to your `elevenlabs` MCP server's env in `~/.claude.json` — the
-  bridge reads it from there too.
-
-Either way, `/health` starts reporting the capability, the browser picks it up on
-the next boot, and both the voice and transcription upgrade automatically.
+| `JARVIS_BRAIN_PROVIDER` | `ollama` | The brain provider |
+| `JARVIS_OLLAMA_URL` | `http://127.0.0.1:11434` | Ollama endpoint |
+| `JARVIS_LOCAL_MODEL` | `granite4:3b` | Primary model |
+| `JARVIS_LOCAL_FALLBACK_MODEL` | `qwen3.5:4b` | Fallback model |
+| `JARVIS_MODEL_KEEP_ALIVE` | `30m` | How long Ollama keeps the model loaded |
+| `JARVIS_OLLAMA_CONNECT_TIMEOUT_S` | `3` | Health-check timeout |
+| `JARVIS_OLLAMA_RESPONSE_TIMEOUT_S` | `20` | Warm first-token / stall timeout |
+| `JARVIS_OLLAMA_LOAD_TIMEOUT_S` | `60` | Timeout when the model may need loading |
+| `JARVIS_MAX_RESPONSE_TOKENS` | `256` | Longest answer |
+| `JARVIS_SEARCH_ENGINE` | `google` | `google`, `bing` or `duckduckgo` |
+| `JARVIS_APPS_FILE` | `jarvis.apps.json` | Your aliases and portable apps |
+| `JARVIS_BRIDGE_PORT` | `8787` | Bridge port |
+| `JARVIS_ALLOW_WRITES` | off | Separate writes mode (prefer `npm run start:writes`) |
+| `ELEVENLABS_API_KEY` | - | Optional ElevenLabs voice |
+| `JARVIS_VOICE_ID` | George | ElevenLabs voice id |
+| `VITE_JARVIS_MIC` | system default | Microphone: index or part of the name |
+| `VITE_TTS_ENGINE` | `system` | `system` or `kokoro` |
+| `VITE_USE_ELEVENLABS` | `false` | Prefer ElevenLabs voice in the browser |
 
 ---
 
-## Enabling actions
+## Testing
 
-The tool gate starts **read-only**. Search, generation and lookups run freely;
-anything effectful — send, tap, delete, install, pay — is denied. Voice is a poor
-interface for a confirmation dialog, so the decision is made ahead of time in
-`decideTool()` in `bridge/server.mjs`, not at the moment of use. The bridge sets
-`settingSources: []`, which makes its own gate the only authority — filesystem
-settings and any global `bypassPermissions` cannot override it.
-
-To allow effectful tools (phone, browser driving, sending), run the bridge this
-way instead:
-
-```bash
-npm run bridge:writes
+```powershell
+npm test               # unit, integration, lifecycle, PowerShell parse, isolation
+npm run typecheck
+npm run lint
+npm run build
+npm run e2e:offline    # deterministic + offline end-to-end (no Ollama needed)
+npm run e2e            # + real granite answer, tool call, qwen fallback (needs Ollama)
 ```
 
-> Read `decideTool()` before you do. *"Hey Jarvis, clean up my downloads folder"*
-> means something rather different with writes enabled.
+The end-to-end runs start their own bridges on spare ports with isolated run
+directories and **dry-run** application launches, so they never disturb a
+running JARVIS or open anything on screen. A provider error, quota message or
+"unavailable" sentence never counts as an AI answer.
 
 ---
 
 ## Troubleshooting
 
-**I can't hear him, or he can't hear me.** Press **D** for the diagnostics panel
-— it states plainly whether he is hearing you and whether he is producing sound.
-Press **T** for a one-line audio self-test.
-
-**No voice at all.** You must be in **Chrome or Edge**, in a **real browser
-window** (not an embedded preview), and you must have **allowed the microphone**.
-
-**Bridge not reachable.** Check that `npm run bridge` is still running in its
-terminal, and that nothing else is holding port `8787`.
-
----
-
-## Security
-
-All of this lives in `bridge/server.mjs`:
-
-- The WebSocket accepts only local dev origins (add more with
-  `JARVIS_ALLOWED_ORIGINS`).
-- `/file`, `/img` and `/media` validate the scheme, confine to allowed roots,
-  resolve the real path, and refuse private and loopback addresses (SSRF guard).
-- The tool gate (`decideTool`) is default-deny for effectful MCP tools.
-- A strict CSP in `index.html`; model-authored panel HTML is sanitised.
+- **He can't hear me / I can't hear him:** press **D**. Use Chrome or Edge in a
+  real window and allow the microphone. Press **T** for an audio self-test.
+- **"My local AI brain is unavailable right now":** start Ollama, then
+  `ollama list` should show `granite4:3b` and `qwen3.5:4b`. `npm run setup` says
+  which is missing.
+- **"JARVIS is already running":** it is - use `npm run stop` first. A stale PID
+  file from a crashed launcher is detected and replaced automatically.
+- **An app won't open:** `npm run app -- resolve "<name>"`, then
+  `npm run app -- refresh`, or register it with `npm run app -- add`.
 
 ---
 
 ## Credits & licence
 
-MIT.
-
-The boot sound and any tracks in `public/audio/` ship with the project for the
-demo. If you go on to monetise something built on this, clearing the rights to
-that audio is your responsibility.
+MIT. Interface and original design from
+[adewaskar/jarvis](https://github.com/adewaskar/jarvis). The boot sound and any
+tracks in `public/audio/` ship with the project for the demo; clearing rights
+for anything beyond that is your responsibility.

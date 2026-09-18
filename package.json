@@ -2,22 +2,28 @@
   "name": "jarvis",
   "private": true,
   "version": "0.0.0",
-  "description": "A browser voice assistant with an Iron Man holographic interface, driven by Claude Code through a small Node bridge.",
+  "description": "A Windows desktop voice assistant with an Iron Man holographic interface. Local-first: a deterministic router, JARVIS-owned tools and a local Ollama model (granite4:3b, qwen3.5:4b fallback). No Claude or cloud account required.",
   "license": "MIT",
   "type": "module",
   "engines": {
-    "node": ">=20"
+    "node": "^20.19.0 || >=22.12.0"
   },
   "scripts": {
     "start": "node scripts/start.mjs",
     "start:writes": "node scripts/start.mjs --writes",
+    "stop": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/stop.ps1",
+    "restart": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/restart.ps1",
     "dev": "vite",
     "build": "tsc -b && vite build",
+    "typecheck": "tsc -b",
     "lint": "oxlint",
     "test": "node --import tsx --test tests/*.test.mjs",
+    "e2e": "node scripts/e2e.mjs",
+    "e2e:offline": "node scripts/e2e.mjs --offline",
     "preview": "vite preview",
     "bridge": "node bridge/server.mjs",
     "bridge:writes": "node bridge/server.mjs --writes",
+    "app": "node scripts/apps.mjs",
     "diagnostics": "node scripts/diagnostics.mjs",
     "setup": "node scripts/diagnostics.mjs"
   },
@@ -25,8 +31,6 @@
     "node": "22.23.2"
   },
   "dependencies": {
-    "@anthropic-ai/claude-agent-sdk": "^0.3.220",
-    "@anthropic-ai/sdk": "^0.115.0",
     "@mediapipe/tasks-vision": "^1.0.1",
     "@picovoice/porcupine-web": "^4.0.1",
     "@picovoice/web-voice-processor": "^4.0.10",
@@ -40,7 +44,6 @@
     "react-dom": "^19.2.8",
     "three": "^0.185.1",
     "ws": "^8.21.1",
-    "zod": "^4.4.3",
     "zustand": "^5.0.14"
   },
   "devDependencies": {

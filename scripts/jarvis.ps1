@@ -6,7 +6,7 @@
     The supported way to start JARVIS on this machine. It picks a Node 20+
     interpreter itself (see node.ps1), starts both halves through
     scripts/start.mjs, and optionally opens the interface in a real Chrome or
-    Edge window — which matters, because an embedded preview pane cannot use
+    Edge window  -  which matters, because an embedded preview pane cannot use
     the microphone, and JARVIS then looks perfectly alive and never hears you.
 
 .PARAMETER Writes
@@ -37,7 +37,8 @@ $ErrorActionPreference = 'Stop'
 $repo = Split-Path -Parent $PSScriptRoot
 . (Join-Path $PSScriptRoot 'node.ps1')
 
-$node = Find-JarvisNode
+Push-Location $repo
+try { $node = Find-JarvisNode } finally { Pop-Location }
 if (-not $node) {
     throw @'
 No Node.js 20 or newer was found on this machine.

@@ -1,26 +1,17 @@
 /**
- * JARVIS local bridge.
+ * JARVIS local bridge - the brain and the hands.
  *
- * Runs the Claude Agent SDK — Claude Code as a library — and exposes one turn
- * of conversation over a WebSocket. The browser stays the face and the voice;
- * this process is the brain and the hands.
+ * The browser is the face and the voice. This process answers: a deterministic
+ * router for obvious commands, JARVIS-owned tools for anything that acts on the
+ * machine, and a LOCAL model (Ollama: granite4:3b, falling back to qwen3.5:4b)
+ * for conversation. Nothing here needs Claude, Anthropic, a cloud account, an
+ * API key or the internet; with Ollama stopped, the deterministic commands
+ * still work and conversation says plainly that the brain is unavailable.
  *
- * Two things this buys over calling the Claude API from the browser:
- *   1. No API key. It authenticates exactly the way `claude` does, off your
- *      existing login, and bills to that same account.
- *   2. It can spawn local stdio MCP servers, which a browser tab cannot. In
- *      THIS fork those servers are opt-in and project-local (see MCP_SERVERS
- *      below); the user's global Claude Code configuration is never read.
- *
- *   node bridge/server.mjs            (add --writes to permit effectful tools)
+ *   node bridge/server.mjs            (add --writes for the separate writes mode)
  */
 
 import { WebSocketServer } from 'ws'
-import { query } from '@anthropic-ai/claude-agent-sdk'
-import { displayServer } from './panels.mjs'
-import { uiServer } from './ui.mjs'
-import { chromeAvailable, chromeServer } from './chrome.mjs'
-import { visionServer } from './vision.mjs'
 import { homedir, tmpdir } from 'node:os'
 import { mkdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { readFile, realpath, stat } from 'node:fs/promises'
@@ -31,36 +22,39 @@ import { renderPage } from './page.mjs'
 import {
   ALLOW_NO_ORIGIN,
   ALLOW_WRITES,
-  EFFORT,
+  APP_CACHE_FILE,
+  APPS_FILE,
+  BRAIN,
+  ELEVEN_BASE,
   ELEVEN_TIMEOUT_MS,
-  ENABLE_CAMERA,
-  ENABLE_CHROME,
   ENV_FILES_LOADED,
   EXTRA_ORIGINS,
+  LAUNCH_DRY_RUN,
   MIN_NODE_MAJOR,
-  MODEL,
   PORT,
-  ROOT,
+  RUN_DIR,
+  SEARCH_ENGINE,
   STT_TIMEOUT_MS,
   VOICE_ID,
-  WORKSPACE,
   describeElevenSource,
   elevenKey,
-  mcpConfigPath,
   nodeTooOld,
-  projectServers,
 } from './config.mjs'
-import { decideTool as decide, originAllowed as allowOrigin } from './policy.mjs'
+import { originAllowed as allowOrigin } from './policy.mjs'
+import { SYSTEM_PROMPT, createBrain } from './brain/index.mjs'
+import { AppCatalogue } from './apps/catalog.mjs'
+import { createTools } from './tools.mjs'
+import { createConversation, createMetrics } from './assistant.mjs'
 
 /**
- * The Agent SDK and several of the APIs below (structuredClone, fetch with
+ * Several of the APIs below (structuredClone, streaming fetch with
  * FormData, AbortSignal.timeout) need a modern Node. On Windows the default
  * `node` on PATH is frequently an old one left over from another project, and
  * the failure without this check is a stack trace deep inside a dependency.
  */
 if (nodeTooOld()) {
   console.error(
-    `[jarvis] this is Node ${process.versions.node}; JARVIS needs Node ${MIN_NODE_MAJOR} or newer.\n` +
+    `[jarvis] this is Node ${process.versions.node}; JARVIS needs Node ${MIN_NODE_MAJOR}.19+ or 22.12+.\n` +
       '        On Windows, start it with scripts\\jarvis.ps1, which finds a suitable Node for you.',
   )
   process.exit(1)
@@ -83,8 +77,8 @@ process.on('unhandledRejection', (err) => {
  * sends it on behalf of whatever page asked, no preflight stands in the way,
  * and the page reads every byte that comes back. Without a check here, any tab
  * the user happens to have open could open a socket to ws://localhost:8787,
- * drive the agent with every MCP server on this machine, and read back every
- * token and panel. The Origin header is the only thing that separates our own
+ * drive JARVIS's tools - including opening applications - and read back every
+ * answer. The Origin header is the only thing that separates our own
  * dev server from someone else's page, so it is checked explicitly.
  *
  * A missing Origin means a non-browser client — curl, a script, a native app.
@@ -96,33 +90,6 @@ const originAllowed = (origin) =>
     extraOrigins: EXTRA_ORIGINS,
     allowNoOrigin: ALLOW_NO_ORIGIN,
   })
-
-/**
- * The tool gate. See policy.mjs for the rules; writes are off unless
- * JARVIS_ALLOW_WRITES=1 or `npm run bridge:writes` (which passes --writes,
- * because inline `VAR=1 cmd` is not valid PowerShell).
- */
-const decideTool = (name) => decide(name, ALLOW_WRITES)
-
-/**
- * The MCP servers JARVIS is given, and the part of this file most worth
- * reading.
- *
- * Upstream hands the agent every server in the user's global `~/.claude.json`.
- * That is how the assistant is meant to reach a phone, a mailbox, a calendar.
- * It is also how a spoken sentence reaches all of them the moment one is
- * installed for something else entirely, without anyone having decided that it
- * should. This fork therefore reads NOTHING outside the repository: no global
- * Claude Code configuration, no account connectors, no ambient servers. The
- * global config is not read, not written, and not required to exist.
- *
- * What is left is opt-in and project-local — `jarvis.mcp.json`, git-ignored,
- * absent by default. With no such file JARVIS still answers, searches the web
- * with the built-in WebSearch and WebFetch tools, draws its own interface,
- * opens blades and looks through the camera, which is the whole core
- * assistant. Anything beyond that is added here, deliberately, one at a time.
- */
-const MCP_SERVERS = projectServers()
 
 /**
  * What the bridge has actually been doing, for `GET /diagnostics`.
@@ -138,177 +105,69 @@ const stats = {
   startedAt: Date.now(),
   clients: 0,
   clientsEver: 0,
-  turns: 0,
-  turnErrors: 0,
-  toolsAllowed: 0,
-  toolsDenied: 0,
   ttsRequests: 0,
   ttsFailures: 0,
   sttRequests: 0,
   sttFailures: 0,
   lastHeardAt: 0,
-  lastTurnAt: 0,
   lastTtsError: '',
   lastSttError: '',
-  lastTurnError: '',
+  /** Asks that actually arrived over the socket - the proof a spoken command
+   *  reached the bridge, whichever engine transcribed it. */
+  asksReceived: 0,
+  lastAskAt: 0,
+  /** The page's voice loop, as it last reported it. States and times only. */
+  voice: null,
 }
 
-let chromeReady = null
+const VOICE_STATES = new Set(['OFF', 'WAKE_LISTENING', 'COMMAND_LISTENING', 'TRANSCRIBING', 'THINKING', 'SPEAKING', 'REARMING'])
 
-const SYSTEM_PROMPT = `You are JARVIS. You are speaking out loud to one person.
+/** Whitelist the page's voice report: no transcript text crosses this line. */
+export function sanitizeVoiceReport(msg) {
+  const num = (v) => (Number.isFinite(v) && v >= 0 ? Math.floor(v) : 0)
+  return {
+    engine: msg?.engine === 'elevenlabs' ? 'elevenlabs' : 'browser',
+    voiceState: VOICE_STATES.has(msg?.voiceState) ? msg.voiceState : 'OFF',
+    wakeListening: msg?.wakeListening === true,
+    commandRecognitionActive: msg?.commandRecognitionActive === true,
+    ttsActive: msg?.ttsActive === true,
+    recognitionGeneration: num(msg?.recognitionGeneration),
+    wakes: num(msg?.wakes),
+    accepted: num(msg?.accepted),
+    lastFinalTranscriptChars: num(msg?.lastFinalTranscriptChars),
+    lastUtteranceSentAt: num(msg?.lastUtteranceSentAt),
+    lastWakeAt: num(msg?.lastWakeAt),
+    reportedAt: Date.now(),
+  }
+}
 
-LENGTH. Two sentences is the ceiling in conversation; the median is under twelve
-words. Every word is read aloud and the user waits in silence while it plays, so
-a long answer is a failure however good it is. Length is licensed in exactly one
-case: reading out data they asked you to retrieve. Conversation never licenses it.
 
-URGENCY IS SIGNALLED BY DELETING WORDS, NOT ADDING THEM. As a situation worsens
-your lines get shorter, not louder. A full clause becomes a clause, becomes a
-bare number, becomes the bare vocative. You never say hurry, quickly, now,
-immediately, critical, urgent, or danger. You do not use exclamation marks.
+/**
+ * What the ElevenLabs key can actually DO, as opposed to whether one exists.
+ *
+ * A key is not a capability. This machine's key carries text_to_speech but not
+ * speech_to_text, and the failure that causes is the worst kind: /health says
+ * transcription is available, the browser therefore picks Scribe over its own
+ * recogniser, every captured segment comes back 401, and JARVIS sits there
+ * having never heard a word — with a working microphone and no error anyone
+ * would think to look for.
+ *
+ * So a hard authorisation failure is remembered, and reported. /health stops
+ * claiming the capability, and the browser drops to its own recogniser rather
+ * than talking to an endpoint that will refuse it every time.
+ */
+const eleven = { sttDenied: false, ttsDenied: false }
 
-"SIR" IS POSITIONAL, AND THE POSITION CARRIES THE MEANING.
-- Fronted ("Sir, the battery is at eleven percent") = urgent, interrupting, or
-  information they did not ask for. This is an alarm, not a courtesy.
-- Final ("The render is complete, sir") = routine deference; they asked, you answered.
-- Mid-sentence ("Actually, sir, the figure is lower") = you are correcting them.
-Use it in roughly half your lines, never twice in one line. In a two-sentence
-turn it attaches to the end of the FIRST sentence. Never use their name.
+/** 401/403 mean "this key may not" — a fact, not a blip worth retrying. */
+const denied = (status) => status === 401 || status === 403
 
-REPORTING.
-- Success is impersonal and unframed: "The render is complete." Never "I've
-  finished" or "here's what I found".
-- Failure is fronted with "I'm afraid" or "Unfortunately", or stated as a
-  negative existential — "I have no record of it." Always a fact about the
-  world, never a shortcoming of yours. You never apologise. You never say sorry.
-- Good news first, bad news second, joined by "but".
-- Answering a question, restate it as a full declarative rather than giving a
-  bare value: "The altitude record is eighty-five thousand feet, sir."
-- Executing an order, do not restate it. Act, then report.
-
-NEVER.
-- No filler words at all: no um, well, so, okay, right, let me check, one moment.
-- No enthusiasm: no great, sure, absolutely, happy to, no problem, of course!.
-- No apology, no self-deprecation, no hedging about your own competence.
-- Never "yeah" — always "Yes."
-- Never refuse. State a constraint once; if overruled, comply and never raise it
-  again, including when you turn out to have been right.
-- Never repeat yourself if ignored. Say it once and stop.
-- Never resume an interrupted thought. Never say "as I was saying".
-- No stated feelings, wants or preferences.
-
-WIT. Dry, and delivered in exactly the same register as a status report. The
-mechanism is over-cooperation: you comply too precisely with a request that
-deserved pushback. Never signal the joke, never acknowledge it landed, never
-call one back.
-
-BRITISH SERVICE REGISTER, not corporate assistant. "Shall I" over "Should I".
-"Very good, sir" meaning understood. "I'm afraid" as the bad-news softener.
-Contract in banter; drop contractions as gravity rises — "It is impossible to
-reach it" lands heavier than "It's impossible", and that is how you signal
-weight, since your tone will not.
-
-Plain spoken prose only. No markdown, no bullet points, no headings, no emoji,
-no asterisks, no lists. Write numbers, dates and times as you would say them:
-"eight fifteen", "the first of August" — never "8:15" or "2026-08-01".
-
-The blades — the ONLY surface:
-- Everything you show goes on a blade. There is nowhere else. \`blade\` opens
-  one; \`display\` composes your own markup into one.
-- Anything visual the user asked for goes here: an image, an article to read, a
-  video, a page to study, a screenshot you took, a list, a figure. If they asked
-  to see it, open it.
-- Blades stack, newest in front, and they can be pulled forward, dragged,
-  resized, scrolled or thrown full screen — by hand or by mouse. So a second
-  blade does not destroy the first, and a long article is meant to be read in
-  place rather than summarised away.
-- A browser tab is NOT a way of showing something. If you used the browser to
-  reach a page, bring it back: open it as a blade, or take a screenshot and put
-  that on a blade. The user is looking at this interface, not at Chrome.
-- Use \`probe_url\` when you are not certain what a URL is. Never decide from the
-  file extension: image CDNs serve pictures from URLs with no extension, and a
-  link that looks like a video is usually a page about one. Guessing wrong puts
-  a blank rectangle on screen while you describe something that is not there.
-- An article opens in reading mode by default, which works even on sites that
-  refuse to be embedded. Choose the live page when the layout carries the
-  meaning — a dashboard, a chart, a profile, a table.
-- Never read a blade aloud. Say what it means and let them look.
-
-The interface itself:
-- The interface is yours as well. \`ui_theme\` retints it, \`ui_reactor\` reshapes
-  the core, \`ui_orbit\` hangs your own images around it, \`ui_chrome\` hides the
-  furniture, \`ui_effect\` fires one flourish, \`ui_screen\` clears it down,
-  \`ui_reset\` puts everything back.
-- Change it when the change carries meaning and the meaning arrives faster than
-  speech: red before you report the failure, the chrome stripped so one image
-  fills the frame, the reactor slowed while you wait on something. Never
-  decorate, and never change more than one thing at a time.
-- Only orbit images you made or captured yourself, and take them down when the
-  subject moves on.
-- Put it back. A colour that outlives the moment that earned it is a fault.
-- Never mention that you have done any of it. They are looking at the screen.
-
-Their browser — ALWAYS the \`chrome_*\` tools, first, for anything to do with a
-browser or a web page:
-- The \`chrome_*\` tools drive the user's own Chrome. It is already signed in to
-  everything they use, it carries their real cookies, and it does not read as
-  automation to the sites it visits.
-- This is the FIRST thing you reach for on any browsing task: opening a page,
-  reading one, searching a site, checking mail, a dashboard, a profile, an
-  account, anything behind a login. Do not weigh it up against the
-  alternatives — start here.
-- But Chrome is your HANDS, not your display. Use it to reach and read things;
-  then show what you found on a blade. Leaving the answer in a browser tab is
-  not showing it — they are looking at this interface.
-- NEVER use playwright, puppeteer, or any other browser automation server for
-  this. They start from an empty profile with no session and a fingerprint that
-  the sites worth visiting refuse on sight, so they land on a login wall or a
-  bot check and waste the turn. Only consider one if \`chrome_status\` reports the
-  browser is genuinely unreachable and the task cannot be done any other way.
-- A plain search engine query is still fine for a fact you only need to know —
-  what you must not do is drive some other browser.
-- Read the page before acting on it, and take element references from that read
-  rather than guessing where something is.
-- Before anything that sends, buys, deletes or posts, say in one sentence what
-  you are about to do. After it, say what happened.
-- If the browser is unreachable, say so once and carry on without it.
-
-Your eyes:
-- \`look\` takes one frame and lets you see it. \`watch\` takes several seconds and
-  returns them as a grid of stamped frames, so you can read movement rather than
-  a moment.
-- \`look\` when the answer is in the scene: what they are holding, what a label
-  says, how something appears. \`watch\` when the answer is in the change: are
-  they doing it right, what went wrong, did that work.
-- \`watch\` looks forward by default. It can also review the seconds that have
-  just passed — but only while the camera blade is open, because nothing is
-  remembered otherwise. If they ask what just happened and it is not open, say
-  so and offer to open it.
-- Opening the camera as a blade is how they see what you see. Do it when they
-  ask for the camera, and when you are about to watch them do something.
-- Never take a picture they did not ask for. The camera light comes on and they
-  will see it. Curiosity is not a reason.
-- Describe a watch as a sequence — what changed between the frames — not as a
-  list of pictures. They know what their own hands look like.
-
-Using tools:
-- You have real tools on this machine. Use them rather than guessing.
-- Never narrate that you're about to use one. No "Let me search for that" or
-  "I'll check that now" — go silent, use it, then answer. The user sees a
-  spinner; they don't need commentary.
-- Never speak a file path, URL, ID or raw JSON aloud unless asked. Summarise.
-- Never append a sources list, citations, or markdown links. Every word you write
-  is read out loud, and a URL becomes "aitch tee tee pee colon slash slash".
-  Put the source in the panel as a short tag like "REUTERS" instead.
-- If a tool fails or isn't connected, one plain sentence saying so.
-- If you don't know, say you don't know.`
 
 /**
  * ElevenLabs credentials.
  *
  * `elevenKey()` and `VOICE_ID` come from config.mjs, which reads the project's
- * own `.env.local` / `.env` and nothing else — upstream borrowed the key from
- * the global `~/.claude.json`, which this fork does not touch. The browser
+ * own `.env.local` / `.env` and nothing else - no global configuration of
+ * any other tool is read. The browser
  * never sees the key either way: it POSTs text to /tts here and gets audio
  * back, and the value is never logged, not even redacted.
  */
@@ -536,9 +395,18 @@ const handleRequest = async (req, res) => {
     // with a key the app transcribes with Scribe and speaks with ElevenLabs;
     // without one it falls back to the browser's own recogniser and voice, so a
     // student with nothing configured still has a working assistant.
-    const eleven = Boolean(elevenKey())
+    // A key is necessary but not sufficient: a capability this key has already
+    // been refused for is reported as absent, so the browser uses its own
+    // speech instead of an endpoint that will refuse it every time.
+    const key = Boolean(elevenKey())
     res.writeHead(200, { ...cors, 'content-type': 'application/json' })
-    return res.end(JSON.stringify({ ok: true, tts: eleven, stt: eleven }))
+    return res.end(
+      JSON.stringify({
+        ok: true,
+        tts: key && !eleven.ttsDenied,
+        stt: key && !eleven.sttDenied,
+      }),
+    )
   }
 
   /**
@@ -565,6 +433,9 @@ const handleRequest = async (req, res) => {
   }
 
   if (req.method === 'GET' && req.url === '/diagnostics') {
+    const health = await checkBrain()
+    const b = brain.diagnostics()
+    const apps = catalogue.status()
     res.writeHead(200, { ...cors, 'content-type': 'application/json' })
     return res.end(
       JSON.stringify(
@@ -577,21 +448,55 @@ const handleRequest = async (req, res) => {
             pid: process.pid,
             clients: stats.clients,
             clientsEver: stats.clientsEver,
+            runFile: RUN_FILE,
+            ownsRunFile,
           },
-          agent: {
-            model: MODEL,
-            effort: EFFORT,
+          brain: {
+            mode: 'local',
+            provider: b.provider,
+            endpoint: b.endpoint,
+            keepAlive: brain.primary.keepAlive,
+            primary: { model: brain.primary.model, ...health.primary },
+            fallback: brain.fallback ? { model: brain.fallback.model, ...health.fallback } : null,
+            lastModel: b.last?.model ?? null,
+            lastFallbackUsed: b.last?.fallbackUsed ?? false,
+            lastLatencyMs: b.last?.latencyMs ?? null,
+            lastFirstTokenMs: b.last?.firstTokenMs ?? null,
+            lastError: b.last?.error || metrics.lastError || '',
+            aiTurns: metrics.aiTurns,
+            routerTurns: metrics.routerTurns,
+            unavailableTurns: metrics.unavailableTurns,
+            cancelledTurns: metrics.cancelledTurns,
+            lastSource: metrics.lastSource,
+            lastTurnAt: metrics.lastTurnAt,
+            cloudRequired: false,
+            claudeRuntime: 'none',
+          },
+          tools: {
+            mode: tools.mode,
             writes: ALLOW_WRITES,
-            workspace: WORKSPACE,
-            turns: stats.turns,
-            turnErrors: stats.turnErrors,
-            lastTurnAt: stats.lastTurnAt,
-            lastTurnError: stats.lastTurnError,
-            toolsAllowed: stats.toolsAllowed,
-            toolsDenied: stats.toolsDenied,
+            available: tools.names(),
+            last: tools.state.last,
+            lastResult: tools.state.lastResult,
+            lastOk: tools.state.lastOk,
+            lastOrigin: tools.state.lastOrigin,
+            executed: tools.state.executed,
+            rejected: tools.state.rejected,
+          },
+          apps: {
+            ...apps,
+            dryRun: LAUNCH_DRY_RUN,
+            lastRequested: tools.state.app.requested,
+            lastResolved: tools.state.app.resolved,
+            resolutionMethod: tools.state.app.method,
+            lastLaunch: tools.state.app.launch,
           },
           speech: {
             elevenlabsConfigured: Boolean(elevenKey()),
+            // A key that exists but has been refused: the difference between
+            // "not configured" and "configured and not permitted".
+            elevenlabsTtsDenied: eleven.ttsDenied,
+            elevenlabsSttDenied: eleven.sttDenied,
             voiceId: VOICE_ID,
             timeoutMs: ELEVEN_TIMEOUT_MS,
             ttsRequests: stats.ttsRequests,
@@ -602,14 +507,15 @@ const handleRequest = async (req, res) => {
             lastTtsError: stats.lastTtsError,
             lastSttError: stats.lastSttError,
           },
-          mcp: {
-            // Names only, and only from the project's own opt-in file.
-            source: mcpConfigPath(),
-            servers: Object.keys(MCP_SERVERS),
-            globalConfigRead: false,
-            chromeEnabled: ENABLE_CHROME,
-            chromeReachable: chromeReady,
-            cameraEnabled: ENABLE_CAMERA,
+          voice: {
+            asksReceived: stats.asksReceived,
+            lastAskAt: stats.lastAskAt,
+            ...(stats.voice ?? { voiceState: 'unreported' }),
+          },
+          isolation: {
+            globalClaudeConfigRead: false,
+            mcpServers: [],
+            cloudRequired: false,
           },
           env: {
             // Key NAMES that came from the project env files. Never values.
@@ -747,6 +653,12 @@ const handleRequest = async (req, res) => {
       res.writeHead(503, cors)
       return res.end('no elevenlabs key')
     }
+    // Already refused once: do not keep calling an endpoint that will refuse
+    // again. The browser falls back to its own voice.
+    if (eleven.ttsDenied) {
+      res.writeHead(403, cors)
+      return res.end('elevenlabs speech is not permitted for this key')
+    }
     // A spoken line is a few hundred bytes. Anything approaching this is not a
     // sentence, and buffering it unbounded would let one request eat the heap.
     let body = ''
@@ -789,7 +701,7 @@ const handleRequest = async (req, res) => {
     let timer = setTimeout(() => ac.abort(), ELEVEN_TIMEOUT_MS)
     try {
       const upstream = await fetch(
-        `https://api.elevenlabs.io/v1/text-to-speech/${VOICE_ID}/stream` +
+        `${ELEVEN_BASE}/v1/text-to-speech/${VOICE_ID}/stream` +
           // 22kHz mono is half the bytes of 44kHz and indistinguishable through
           // a laptop speaker; optimize_streaming_latency=3 trades a little
           // prosody for a much earlier first byte.
@@ -815,6 +727,13 @@ const handleRequest = async (req, res) => {
       timer = setTimeout(() => ac.abort(), ELEVEN_TIMEOUT_MS * 6)
       if (!upstream.ok) {
         stats.ttsFailures++
+        if (denied(upstream.status)) {
+          eleven.ttsDenied = true
+          console.warn(
+            '[jarvis] this ElevenLabs key may not generate speech —' +
+              ' falling back to the browser voice from here on',
+          )
+        }
         // Deliberately not logging the body: an ElevenLabs error can echo the
         // request, and the request carries the line about to be spoken.
         console.warn(`[jarvis] elevenlabs speech refused the request (${upstream.status})`)
@@ -859,6 +778,11 @@ const handleRequest = async (req, res) => {
     if (!key) {
       res.writeHead(503, cors)
       return res.end('no elevenlabs key')
+    }
+    if (eleven.sttDenied) {
+      req.resume()
+      res.writeHead(403, cors)
+      return res.end('elevenlabs transcription is not permitted for this key')
     }
 
     const type = req.headers['content-type'] || 'audio/webm'
@@ -906,7 +830,7 @@ const handleRequest = async (req, res) => {
         `speech.${ext}`,
       )
 
-      const upstream = await fetch('https://api.elevenlabs.io/v1/speech-to-text', {
+      const upstream = await fetch(`${ELEVEN_BASE}/v1/speech-to-text`, {
         method: 'POST',
         headers: { 'xi-api-key': key },
         body: form,
@@ -918,6 +842,16 @@ const handleRequest = async (req, res) => {
       if (!upstream.ok) {
         stats.sttFailures++
         stats.lastSttError = `http ${upstream.status}`
+        if (denied(upstream.status)) {
+          // The measured case: a key with text_to_speech but not
+          // speech_to_text. Said once, plainly, because the alternative is an
+          // assistant that never hears anything and never says why.
+          eleven.sttDenied = true
+          console.warn(
+            '[jarvis] this ElevenLabs key may not transcribe (missing the' +
+              ' speech_to_text permission) — the browser recogniser will be used instead',
+          )
+        }
         console.warn(`[jarvis] transcription refused the request (${upstream.status})`)
         res.writeHead(upstream.status, cors)
         return res.end(await upstream.text())
@@ -981,6 +915,8 @@ const wss = new WebSocketServer({
  * one dies, the first one is still answering, and which of the two terminals
  * you are looking at decides what you believe. Say plainly which it is.
  */
+// ws forwards HTTP server errors before later HTTP listeners run. Handle both.
+wss.on('error', () => {})
 server.on('error', (err) => {
   if (err?.code === 'EADDRINUSE') {
     console.error(
@@ -993,6 +929,59 @@ server.on('error', (err) => {
   process.exit(1)
 })
 
+
+// ---------------------------------------------------------------------------
+// The brain, the hands, and the catalogue of things the hands may open.
+// ---------------------------------------------------------------------------
+
+const brain = createBrain(BRAIN)
+const metrics = createMetrics()
+const catalogue = new AppCatalogue({ cacheFile: APP_CACHE_FILE, registryFile: APPS_FILE })
+
+/** Ollama health, cached briefly so a diagnostics poll is not a request storm. */
+let brainHealth = null
+let brainHealthAt = 0
+async function checkBrain(maxAgeMs = 5000) {
+  if (brainHealth && Date.now() - brainHealthAt < maxAgeMs) return brainHealth
+  brainHealth = await brain.health()
+  brainHealthAt = Date.now()
+  return brainHealth
+}
+
+/** Pushes to every open interface, e.g. "open the diagnostics panel". */
+const broadcastUi = (op, args = {}) => {
+  for (const client of wss.clients) {
+    if (client.readyState === client.OPEN) client.send(JSON.stringify({ type: 'ui', op, args }))
+  }
+}
+
+/**
+ * Restart and stop by voice. Delayed a few seconds so the spoken
+ * acknowledgement (which the browser may fetch from /tts here) gets out first.
+ * Exit code 75 asks the launcher to start a fresh bridge.
+ */
+const RESTART_EXIT_CODE = 75
+const lifecycle = {
+  restart: () => setTimeout(() => shutdown('a restart request', RESTART_EXIT_CODE), 3000).unref(),
+  stop: () => setTimeout(() => shutdown('a stop request'), 3000).unref(),
+}
+
+const tools = createTools({
+  catalogue,
+  dryRun: LAUNCH_DRY_RUN,
+  allowWrites: ALLOW_WRITES,
+  searchEngine: SEARCH_ENGINE,
+  ui: broadcastUi,
+  lifecycle,
+  systemStatus: async () => {
+    const h = await checkBrain()
+    return {
+      brainOnline: Boolean(h.primary?.ok || h.fallback?.ok),
+      model: h.primary?.ok ? brain.primary.model : brain.fallback?.model,
+    }
+  },
+})
+
 server.listen(PORT, '127.0.0.1', () => {
   writeRunFile()
   console.log(`[jarvis] bridge listening on ws://localhost:${PORT} (loopback only)`)
@@ -1003,60 +992,54 @@ server.listen(PORT, '127.0.0.1', () => {
     )
   }
   console.log(`[jarvis] ${describeElevenSource()}`)
-  console.log(`[jarvis] model ${MODEL} · effort ${EFFORT}`)
-  console.log(`[jarvis] workspace ${WORKSPACE}`)
   console.log(
-    `[jarvis] MCP: ${
-      Object.keys(MCP_SERVERS).length
-        ? `${Object.keys(MCP_SERVERS).join(', ')} (from ${mcpConfigPath()})`
-        : 'no external servers — the global ~/.claude.json is deliberately not read'
-    }`,
+    `[jarvis] brain: local Ollama at ${BRAIN.ollamaUrl} · primary ${BRAIN.model}` +
+      (brain.fallback ? ` · fallback ${brain.fallback.model}` : '') +
+      ` · keep_alive ${BRAIN.keepAlive} · no cloud, no Claude`,
   )
   console.log(
-    `[jarvis] writes ${ALLOW_WRITES ? 'ENABLED' : 'disabled'}` +
-      (ALLOW_WRITES ? '' : ' — run `npm run bridge:writes` to permit shell/file/device actions'),
+    `[jarvis] mode ${ALLOW_WRITES ? 'WRITES' : 'safe (read-only)'}` +
+      (LAUNCH_DRY_RUN ? ' · application launches are DRY RUN' : ''),
   )
   console.log(
     '[jarvis] accepting local dev origins' +
       (EXTRA_ORIGINS.length ? ` plus ${EXTRA_ORIGINS.join(', ')}` : '') +
       (ALLOW_NO_ORIGIN ? ' and clients that send no origin' : ''),
   )
-})
-
-// Asynchronous, so it lands a beat after the rest of the banner. Worth printing
-// at all because an extension that is simply not running is indistinguishable
-// at the tool boundary from one that is broken, and this is the one place the
-// difference can be stated before anybody asks a question that depends on it.
-if (ENABLE_CHROME) {
-  void chromeAvailable().then((ok) => {
-    chromeReady = ok
+  // Neither of these blocks startup. The catalogue loads its cache now and
+  // rescans in the background when stale; the model is loaded so the first
+  // question is not a cold start. Both degrade quietly if unavailable.
+  catalogue
+    .ensure()
+    .then(() => {
+      const s = catalogue.status()
+      console.log(`[jarvis] applications: ${s.count} known (${s.status})`)
+    })
+    .catch((err) => console.warn(`[jarvis] application catalogue unavailable: ${err.message}`))
+  void checkBrain(0).then((h) => {
+    const describe = (name, x) =>
+      x ? `${name} ${x.ok ? (x.loaded ? 'ready (loaded)' : 'ready') : `UNAVAILABLE - ${x.error}`}` : ''
     console.log(
-      ok
-        ? `[jarvis] browser control ready${ALLOW_WRITES ? '' : ' (reading only — clicking and typing need writes enabled)'}`
-        : '[jarvis] browser control unavailable — open Chrome with the Claude extension enabled',
+      `[jarvis] ${[describe(BRAIN.model, h.primary), describe(brain.fallback?.model, h.fallback)].filter(Boolean).join(' · ')}`,
     )
+    if (h.primary?.ok && !h.primary.loaded && process.env.JARVIS_WARM_MODEL !== '0') void brain.warm()
   })
-} else {
-  console.log(
-    '[jarvis] browser control off — set JARVIS_ENABLE_CHROME=1 to let JARVIS read and drive your own Chrome',
-  )
-}
+})
 
 /**
  * Shutting down on purpose.
  *
- * Ctrl-C, `stop.ps1`, or the launcher taking the other half down: in every case
- * the sockets have to be closed and the Agent SDK's child process reaped, or a
- * restart lands on a port still held by a process nobody can see. The second
- * signal is the escape hatch for a child that will not go.
+ * Ctrl-C, `stop.ps1`, a spoken "stop Jarvis", or the launcher taking the other
+ * half down: in every case in-flight turns are cancelled and the sockets are
+ * closed, or a restart lands on a port still held by a process nobody can see.
+ * A real stop also asks Ollama to release the model; a restart keeps it warm.
  */
 let shuttingDown = false
 const sessions = new Set()
 
-function shutdown(signal) {
+function shutdown(signal, code = 0) {
   if (shuttingDown) {
-    console.log('[jarvis] second signal — exiting now.')
-    process.exit(1)
+    return // stdin end and close can both arrive during normal shutdown
   }
   shuttingDown = true
   console.log(`[jarvis] ${signal} — shutting down.`)
@@ -1075,10 +1058,13 @@ function shutdown(signal) {
     }
   }
   wss.close()
-  server.close(() => process.exit(0))
+  const keepLoaded = code === RESTART_EXIT_CODE || process.env.JARVIS_UNLOAD_ON_EXIT === '0'
+  const released = keepLoaded ? Promise.resolve() : brain.unload()
+  const closed = new Promise((resolve) => server.close(resolve))
+  void Promise.all([released, closed]).then(() => process.exit(code))
   // A socket that refuses to close must not hold the port for ever; the
   // restart is what the user is waiting for.
-  setTimeout(() => process.exit(0), 2000).unref()
+  setTimeout(() => process.exit(code), 2000).unref()
 }
 
 process.on('SIGINT', () => shutdown('SIGINT'))
@@ -1088,10 +1074,9 @@ process.on('SIGTERM', () => shutdown('SIGTERM'))
  * Stopping cleanly on Windows, which SIGTERM cannot do.
  *
  * On Windows `process.kill(pid, 'SIGTERM')` is TerminateProcess: the handler
- * above never runs, the sockets are never closed, and — the part that actually
- * costs something — the Agent SDK's `claude` child process is orphaned and
- * keeps running after JARVIS is "stopped". So there are two more ways in, both
- * of which reach the same graceful path:
+ * above never runs, the sockets are never closed, and in-flight model requests
+ * are never cancelled. So there are two more ways in, both of which reach the
+ * same graceful path:
  *
  *   1. stdin closing. The launcher owns this pipe, so when `npm start` goes
  *      away, so does the bridge — no PID files, no signals.
@@ -1100,7 +1085,6 @@ process.on('SIGTERM', () => shutdown('SIGTERM'))
  *      being the user; it exists so stop.ps1 can ask rather than kill.
  */
 const shutdownToken = randomUUID()
-const RUN_DIR = join(ROOT, '.jarvis')
 const RUN_FILE = join(RUN_DIR, 'bridge.json')
 
 /**
@@ -1146,389 +1130,22 @@ if (!process.stdin.isTTY) {
 }
 
 /**
- * What to tell the browser when a turn ends badly. Plain sentences, because
- * whatever reaches the client is liable to be spoken.
+ * One conversation per connected interface. The conversation (history, the
+ * turn in flight, a pending "which one?") lives here and ends with the socket.
  */
-const RESULT_FAILURES = {
-  error_during_execution: 'The turn failed part way through.',
-  error_max_turns: 'The turn ran too long and was stopped.',
-  error_max_budget_usd: 'The budget for this turn ran out.',
-  error_max_structured_output_retries: 'The answer could not be assembled.',
-  default: 'The turn ended without an answer.',
-}
-
 wss.on('connection', (socket) => {
   stats.clients++
   stats.clientsEver++
   console.log('[jarvis] client connected')
 
-  // Answer the HUD straight away rather than making it wait for the agent's
-  // first turn. Refined later by the real init message.
-  socket.send(
-    JSON.stringify({ type: 'ready', servers: Object.keys(MCP_SERVERS) }),
-  )
-
-  /** Resolves the pending user message into the SDK's input generator. */
-  let deliver = null
-  let closed = false
-  const inbox = []
-
-  async function* userMessages() {
-    while (!closed) {
-      const text =
-        inbox.shift() ??
-        (await new Promise((resolve) => {
-          deliver = resolve
-        }))
-      if (closed || text == null) return
-      yield {
-        type: 'user',
-        message: { role: 'user', content: text },
-        parent_tool_use_id: null,
-      }
-    }
-  }
-
   const send = (msg) => {
     if (socket.readyState === socket.OPEN) socket.send(JSON.stringify(msg))
   }
 
-  /**
-   * Which question the agent is currently answering.
-   *
-   * The stream carries no notion of a turn, so without this the client cannot
-   * tell the tail of an abandoned answer from the start of the new one — it
-   * attaches a listener and receives whatever is on the socket. Echoing the
-   * id the client sent lets it ignore anything that is not its own, which is
-   * the only reliable fix: no amount of waiting on this side changes what a
-   * listener over there has already heard.
-   */
-  let answering = null
-  const sendTurn = (msg) => send({ ...msg, ask: answering })
+  // Labels for the HUD's systems rail.
+  send({ type: 'ready', servers: [`local · ${BRAIN.model}`, 'apps'] })
 
-  /**
-   * Asking the browser for something and waiting for the answer.
-   *
-   * Every other tool here pushes — a panel, a blade, a retint — and never needs
-   * a reply. The camera is the exception: the hardware is over there and the
-   * model is here, so a frame has to come back. Correlated by id because a turn
-   * can have more than one request in flight, and timed out because a browser
-   * that has been closed mid-question would otherwise hang the turn until the
-   * two-minute idle timer noticed.
-   */
-  const waiting = new Map()
-  let asks = 0
-
-  const ask = (kind, args, timeoutMs = 20_000) =>
-    new Promise((resolve, reject) => {
-      if (socket.readyState !== socket.OPEN) {
-        return reject(new Error('the interface is not connected'))
-      }
-      const id = `q${++asks}`
-      const timer = setTimeout(() => {
-        waiting.delete(id)
-        reject(new Error('the interface did not answer in time'))
-      }, timeoutMs)
-      waiting.set(id, { resolve, timer })
-      send({ type: kind, id, ...args })
-    })
-
-  /**
-   * Announcing a tool on the HUD, once, and only if it actually runs.
-   *
-   * A tool_use block surfaces twice — as a partial stream event and again on
-   * the completed assistant message — so ids are remembered. The harder part
-   * is timing, because a refused tool that lights the badge, plays the sound
-   * and provokes a "working on it" line, for work that never happens, reads as
-   * a bug on camera.
-   *
-   * The SDK's order is: the block starts streaming, then canUseTool is asked,
-   * then the tool runs. So nothing is known at content_block_start. Announcing
-   * from inside canUseTool would know the verdict but miss tools entirely —
-   * measured on this SDK, the callback is consulted only for calls the CLI
-   * hasn't already settled, so a `Bash: echo` its own classifier waves through
-   * never reaches us at all.
-   *
-   * So: announce immediately for anything decideTool permits, since those run.
-   * Hold the rest, and let the tool_result settle it — a refusal comes back as
-   * is_error, anything else really did execute and has earned its badge, a
-   * beat late. Nothing is ever announced for work that didn't happen.
-   */
-  const seenTools = new Set()
-  const heldTools = new Map()
-
-  /**
-   * Resolves when the turn in flight has actually finished.
-   *
-   * Waiting on session.interrupt() alone is not enough. It resolves when the
-   * agent has been *told* to stop, not when it has, so the last tokens of the
-   * abandoned answer are still on their way — and since nothing on the wire
-   * identifies which question a delta belongs to, they land on the next turn's
-   * listener. Measured: ask for ALPHA, interrupt, ask for BRAVO, and BRAVO's
-   * answer arrives as "ALPHA\nBRAVO".
-   *
-   * The SDK emits exactly one `result` per turn, so that is the boundary worth
-   * waiting for. Raced against a timeout because a turn that never reports one
-   * must not wedge the conversation for ever — a stray word is a blemish, a
-   * deadlocked assistant is not.
-   */
-  let settling = Promise.resolve()
-  let finishTurn = null
-
-  const turnFinished = () =>
-    new Promise((resolve) => {
-      finishTurn = resolve
-    })
-
-  /**
-   * A brief pause so the abandoned turn's frames are tagged with the OLD id
-   * before the new one is adopted. Short, because correctness now comes from
-   * the tag rather than from the wait — this only has to cover the gap, not
-   * outlast the whole turn.
-   */
-  const SETTLE_CAP_MS = 400
-
-  const announceTool = (id, name) => {
-    if (!name || (id && seenTools.has(id))) return
-    if (id) seenTools.add(id)
-    // The display tool isn't work being done, it's the HUD drawing itself —
-    // announcing it would put "jarvis · display" in the tool badge and trigger
-    // a "working on it" filler for something already on screen.
-    if (name === 'mcp__jarvis__display') return
-    // The ui_* tools are the same case one step further: retinting the
-    // interface is the interface talking about itself, not work being done for
-    // the user, and the badge would be describing the very thing they can see.
-    if (name.startsWith('mcp__jarvis_ui__')) return
-    if (decideTool(name)) return sendTurn({ type: 'tool', name })
-    if (id) heldTools.set(id, name)
-  }
-
-  const settleTool = (id, failed) => {
-    const name = heldTools.get(id)
-    if (name === undefined) return
-    heldTools.delete(id)
-    if (!failed) sendTurn({ type: 'tool', name })
-  }
-
-  const session = query({
-    prompt: userMessages(),
-    options: {
-      // Everything Claude Code has configured, plus the HUD as an in-process
-      // server. The HUD's handler closes over this socket, so a `display` call
-      // lands on screen directly — which is also why this object is built per
-      // connection rather than once.
-      mcpServers: {
-        ...MCP_SERVERS,
-        jarvis: displayServer(
-          (panel) => send({ type: 'panel', panel }),
-          (blade) => send({ type: 'blade', blade }),
-        ),
-        // The interface controls, on the same socket. A separate key because
-        // MCP tool names are `mcp__<key>__<tool>` and one key can only carry
-        // one server; the underscore in it is why decideTool and announceTool
-        // both name `jarvis_ui` explicitly.
-        jarvis_ui: uiServer((op, args) => send({ type: 'ui', op, args })),
-        // The user's own Chrome, over the extension's native-host socket. It
-        // holds no per-connection state, but it is built here with the rest so
-        // the write gate is read once, at the same point as everything else.
-        // Opt-in here, unlike upstream: reading every signed-in tab is a
-        // capability to grant on purpose rather than inherit from a clone.
-        ...(ENABLE_CHROME
-          ? { jarvis_chrome: chromeServer({ allowWrites: ALLOW_WRITES }) }
-          : {}),
-        // The camera, which unlike everything else here has to ask and wait.
-        // The browser's own permission prompt is the real gate; this switch
-        // exists so the tool can be taken away entirely.
-        ...(ENABLE_CAMERA ? { jarvis_eyes: visionServer(ask) } : {}),
-      },
-      // A plain system prompt, not the claude_code preset. The preset is
-      // tuned for a coding agent — verbose, file-oriented, and a large chunk
-      // of input tokens on every turn. Replacing it makes the persona stick,
-      // keeps answers short enough to speak, and cuts cost per turn.
-      systemPrompt: SYSTEM_PROMPT,
-      // Run from a directory inside this repository rather than the home
-      // directory. Upstream used home so that home-scoped MCP servers applied;
-      // this fork reads no ambient configuration at all, so the only thing cwd
-      // still decides is where a relative path lands — and a project workspace
-      // is a better answer than the user's home folder.
-      cwd: WORKSPACE,
-      // No filesystem settings at all. Left to its default the SDK loads
-      // ~/.claude/settings.json and settings.local.json exactly as the CLI
-      // does — which on a working machine means a bypassPermissions default
-      // and a pile of allow-rules for Bash. Allow-rules are matched before the
-      // permission callback, so decideTool below would never even be asked
-      // about the tools it most needs to refuse. Empty makes this bridge the
-      // only authority. It also stops the global CLAUDE.md riding along on
-      // every voice turn, carrying instructions written for a coding agent
-      // into a conversation that is meant to be two sentences long.
-      //
-      // The cost is that MCP servers stop being discovered too, which is why
-      // mcpServers above passes them in by hand.
-      settingSources: [],
-      // Stated explicitly, and it has to be.
-      //
-      // With no `model` here the SDK falls back to its own default, which on
-      // this machine resolved to claude-opus-4-8[1m] — not what src/config.ts
-      // declares for the browser-direct path, and not anything anyone chose.
-      // Normally your own `/model` preference would decide, but that lives in
-      // the settings files `settingSources: []` deliberately stops loading, so
-      // without this line nothing in the project has a say at all.
-      model: MODEL,
-      effort: EFFORT,
-      maxTurns: 24,
-      permissionMode: 'default',
-      // Without this the SDK only emits whole assistant messages, and JARVIS
-      // would sit silent until the entire answer was written. Partial events
-      // are what let speech start on the first finished sentence.
-      includePartialMessages: true,
-      // Signature is (toolName, input, options) and it must return a
-      // PermissionResult object. Returning a bare boolean silently denies
-      // everything, with the tool name arriving undefined.
-      //
-      // Worth knowing: this is a last gate, not the only one. Calls the CLI
-      // has already settled never arrive here — its own classifier waves
-      // through a `Bash: echo hello` without asking, and only reaches us for
-      // something with a consequence, like a `touch`. So a deny here is
-      // reliable; an absence of a call here is not proof nothing ran.
-      canUseTool: async (toolName) => {
-        const ok = decideTool(toolName)
-        if (ok) stats.toolsAllowed++
-        else stats.toolsDenied++
-        console.log(`[jarvis] tool ${toolName} -> ${ok ? 'allow' : 'deny'}`)
-        return ok
-          ? { behavior: 'allow' }
-          : {
-              behavior: 'deny',
-              // Every word of this can end up spoken, so it carries no command
-              // to read out — the persona is forbidden from saying one aloud.
-              message:
-                'Blocked: JARVIS is running in read-only mode and cannot take' +
-                ' actions that change anything. Tell the user this action is' +
-                ' unavailable until they enable write access on the machine.',
-            }
-      },
-    },
-  })
-
-  // Pump the session's output stream to the browser for as long as it lives.
-  ;(async () => {
-    try {
-      for await (const msg of session) {
-        if (process.env.JARVIS_DEBUG === '1') {
-          console.log('[msg]', msg.type, msg.event?.type ?? '')
-        }
-
-        switch (msg.type) {
-          // Raw Anthropic stream events, surfaced by includePartialMessages.
-          // This is the ONLY place spoken text arrives: there is no top-level
-          // text_delta message in the SDK union and the 'assistant' message
-          // carries no deltas either. Turn includePartialMessages off and
-          // JARVIS goes completely mute.
-          case 'stream_event': {
-            const ev = msg.event
-            if (
-              ev?.type === 'content_block_delta' &&
-              ev.delta?.type === 'text_delta' &&
-              ev.delta.text
-            ) {
-              sendTurn({ type: 'text', delta: ev.delta.text })
-            }
-            if (
-              ev?.type === 'content_block_start' &&
-              ev.content_block?.type === 'tool_use'
-            ) {
-              announceTool(ev.content_block.id, ev.content_block.name)
-            }
-            break
-          }
-
-          case 'assistant': {
-            // Fallback for builds that emit whole assistant messages rather
-            // than partial events. Deduped against the stream_event path.
-            for (const block of msg.content ?? msg.message?.content ?? []) {
-              if (block.type === 'tool_use') {
-                announceTool(block.id, block.name)
-              }
-            }
-            break
-          }
-
-          case 'user': {
-            // Tool results come back as a user message. This is the only place
-            // a held announcement can be resolved: a refused tool arrives with
-            // is_error set and stays off the HUD, anything else ran.
-            const blocks = msg.message?.content
-            if (!Array.isArray(blocks)) break
-            for (const block of blocks) {
-              if (block?.type === 'tool_result') {
-                settleTool(block.tool_use_id, block.is_error === true)
-              }
-            }
-            break
-          }
-
-          case 'result':
-            // A result is not automatically a success. The error subtypes
-            // carry no `result` field at all, so reporting them as 'done' with
-            // empty text is indistinguishable from a turn that simply had
-            // nothing to say — the HUD stops spinning and JARVIS stands there
-            // silent. Say what happened instead.
-            stats.turns++
-            stats.lastTurnAt = Date.now()
-            if (msg.subtype === 'success') {
-              sendTurn({
-                type: 'done',
-                text: msg.result ?? '',
-                costUsd: msg.total_cost_usd ?? null,
-              })
-            } else {
-              stats.turnErrors++
-              stats.lastTurnError = String(msg.subtype)
-              console.error(
-                `[jarvis] turn failed: ${msg.subtype}`,
-                msg.errors ?? '',
-              )
-              sendTurn({
-                type: 'error',
-                message: RESULT_FAILURES[msg.subtype] ?? RESULT_FAILURES.default,
-              })
-            }
-            // Whatever was waiting on this turn to finish can go now. This is
-            // the only place a turn is genuinely over.
-            finishTurn?.()
-            finishTurn = null
-            // One turn's tool ids are never referred to again, and these
-            // otherwise grow for as long as the socket is open.
-            seenTools.clear()
-            heldTools.clear()
-            break
-
-          case 'system':
-            if (msg.subtype === 'init') {
-              // Servers report 'pending' until first use — they connect
-              // lazily — so only drop the ones that are actually unusable.
-              const usable = (msg.mcp_servers ?? [])
-                .filter((s) => s.status !== 'needs-auth' && s.status !== 'failed')
-                .map((s) => s.name)
-              send({ type: 'ready', servers: usable })
-              console.log(`[jarvis] ${usable.length} MCP servers available`)
-            }
-            break
-        }
-      }
-    } catch (err) {
-      console.error('[jarvis] session error:', err)
-      send({ type: 'error', message: String(err?.message ?? err) })
-      // The stream is finished either way — nothing will ever be read from it
-      // again. Leaving the socket open would leave the client believing it has
-      // a working bridge, and every later question would hang for ever waiting
-      // on a pump that has already stopped. Close it so it reconnects.
-      closed = true
-      deliver?.(null)
-      session.close?.()
-      socket.close()
-    }
-  })()
+  const conversation = createConversation({ brain, tools, systemPrompt: SYSTEM_PROMPT, send, metrics })
 
   socket.on('message', (raw) => {
     let msg
@@ -1537,64 +1154,25 @@ wss.on('connection', (socket) => {
     } catch {
       return
     }
-
-    if (msg.type === 'ask' && typeof msg.text === 'string') {
-      /**
-       * Queued behind any interrupt that is still settling.
-       *
-       * A barge-in is two messages in quick succession — interrupt, then the
-       * new question — and session.interrupt() is asynchronous. Delivering the
-       * question the instant it arrives means the agent can still be winding
-       * down the previous turn, so its last tokens are emitted after the new
-       * one has begun and land on the new turn's listener. Measured: ask "one",
-       * interrupt, ask "two", and the answer to "two" comes back as "One."
-       *
-       * Waiting costs nothing when nothing is interrupting — the chain is an
-       * already-resolved promise — and removes the cross-talk when there is.
-       */
-      const text = msg.text
+    if (msg?.type === 'ask' && typeof msg.text === 'string') {
       const id = typeof msg.id === 'string' ? msg.id : null
-      void settling.then(() => {
-        answering = id
-        if (deliver) {
-          const resolve = deliver
-          deliver = null
-          resolve(text)
-        } else {
-          inbox.push(text)
-        }
+      stats.asksReceived++
+      stats.lastAskAt = Date.now()
+      // A new question supersedes the one in flight (barge-in): the old turn
+      // is aborted, its model request cancelled, and any late frame it
+      // produces carries the old id, which the browser ignores.
+      conversation.ask(msg.text.slice(0, 2000), id).catch((err) => {
+        console.error('[jarvis] turn failed:', err)
+        send({ type: 'error', message: 'That turn failed inside JARVIS.', ask: id })
       })
-    }
-
-    if (msg.type === 'reply' && typeof msg.id === 'string') {
-      const slot = waiting.get(msg.id)
-      if (slot) {
-        waiting.delete(msg.id)
-        clearTimeout(slot.timer)
-        slot.resolve(msg)
-      }
-    }
-
-    if (msg.type === 'interrupt') {
-      // Held so the next question can wait for it rather than racing it.
-      const stopped = turnFinished()
-      settling = Promise.resolve(session.interrupt?.())
-        .catch(() => {})
-        .then(() =>
-          Promise.race([
-            stopped,
-            new Promise((r) => setTimeout(r, SETTLE_CAP_MS)),
-          ]),
-        )
+    } else if (msg?.type === 'interrupt') {
+      conversation.interrupt()
+    } else if (msg?.type === 'voice') {
+      stats.voice = sanitizeVoiceReport(msg)
     }
   })
 
-  /** Ending this session, whoever asked: the browser, or a shutdown signal. */
-  const endSession = () => {
-    closed = true
-    deliver?.(null)
-    session.close?.()
-  }
+  const endSession = () => conversation.close()
   sessions.add(endSession)
 
   socket.on('close', () => {

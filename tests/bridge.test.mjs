@@ -7,9 +7,11 @@
  * refused origin, a missing key reported as a crash instead of a 503, a
  * shutdown that leaves the port held.
  *
- * It deliberately does NOT open the agent WebSocket: that spawns Claude Code
- * and spends real tokens. The socket handshake is exercised through its
- * rejection path, which is the half that is security-relevant.
+ * Ollama is pointed at a closed port for the whole run, so every turn here
+ * proves what JARVIS does WITHOUT its model: deterministic commands still
+ * answer, conversation says plainly that the brain is unavailable, and the
+ * process stays up. The socket handshake is also exercised through its
+ * rejection paths, which are the security-relevant half.
  */
 
 import test from 'node:test'
@@ -22,6 +24,7 @@ import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
+const RUN_DIR = mkdtempSync(join(tmpdir(), 'jarvis-run-'))
 const PORT = 8799
 const BASE = `http://127.0.0.1:${PORT}`
 const ALLOWED = 'http://localhost:5173'
@@ -51,12 +54,17 @@ test.before(async () => {
     env: {
       ...process.env,
       JARVIS_BRIDGE_PORT: String(PORT),
+      JARVIS_RUN_DIR: RUN_DIR,
       // No key: this run must exercise the keyless fallback path, whatever the
       // developer happens to have in their own .env.
       ELEVENLABS_API_KEY: '',
-      // A scratch workspace, so the test never writes inside the repository.
-      JARVIS_WORKSPACE: mkdtempSync(join(tmpdir(), 'jarvis-ws-')),
-      JARVIS_MCP_CONFIG: join(mkdtempSync(join(tmpdir(), 'jarvis-mcp-')), 'absent.json'),
+      // Ollama deliberately unreachable: every assertion here must hold with
+      // no model at all. Launches are dry runs; user app settings are scratch.
+      JARVIS_OLLAMA_URL: 'http://127.0.0.1:9',
+      JARVIS_LAUNCH_DRY_RUN: '1',
+      JARVIS_WARM_MODEL: '0',
+      JARVIS_UNLOAD_ON_EXIT: '0',
+      JARVIS_APPS_FILE: join(RUN_DIR, 'apps.json'),
     },
   })
   bridge.stdout.on('data', (d) => (output += d))
@@ -80,23 +88,74 @@ test('/health reports the keyless fallback rather than failing', async () => {
 test('the banner names what it loaded, and never a secret', () => {
   assert.match(output, /bridge listening on ws:\/\/localhost:8799/)
   assert.match(output, /no ElevenLabs key/)
-  assert.match(output, /no external servers/)
-  assert.match(output, /writes disabled/)
+  assert.match(output, /local Ollama .* primary granite4:3b .* fallback qwen3\.5:4b/)
+  assert.match(output, /no cloud, no Claude/)
+  assert.match(output, /mode safe \(read-only\)/)
   assert.ok(!/ELEVENLABS_API_KEY=\S/.test(output))
 })
 
-test('/diagnostics states the isolation and the tool gate', async () => {
+test('/diagnostics states the local brain, its health, and the isolation', async () => {
   const res = await fetch(`${BASE}/diagnostics`, { headers: { origin: ALLOWED } })
   assert.equal(res.status, 200)
   const d = await res.json()
-  assert.equal(d.mcp.globalConfigRead, false)
-  assert.deepEqual(d.mcp.servers, [])
-  assert.equal(d.agent.writes, false)
+  assert.equal(d.isolation.globalClaudeConfigRead, false)
+  assert.deepEqual(d.isolation.mcpServers, [])
+  assert.equal(d.brain.mode, 'local')
+  assert.equal(d.brain.provider, 'ollama')
+  assert.equal(d.brain.primary.model, 'granite4:3b')
+  assert.equal(d.brain.fallback.model, 'qwen3.5:4b')
+  // Ollama is down in this run, and the panel must say so rather than go green.
+  assert.equal(d.brain.primary.ok, false)
+  assert.equal(d.brain.primary.reachable, false)
+  assert.equal(d.brain.cloudRequired, false)
+  assert.equal(d.brain.claudeRuntime, 'none')
+  assert.equal(d.tools.writes, false)
+  assert.equal(d.tools.mode, 'safe')
+  assert.equal(d.bridge.ownsRunFile, true)
+  assert.ok('count' in d.apps && 'lastLaunch' in d.apps)
   assert.equal(d.speech.elevenlabsConfigured, false)
   assert.equal(d.bridge.port, PORT)
   assert.ok(d.bridge.uptimeSeconds >= 0)
   // Nothing private, even in the shape of the payload.
   assert.ok(!JSON.stringify(d).toLowerCase().includes('api_key'))
+})
+
+/** One WebSocket turn, the way the page asks. */
+async function askOnce(text) {
+  const { WebSocket } = await import('ws')
+  const ws = new WebSocket(`ws://127.0.0.1:${PORT}/`, { headers: { origin: ALLOWED } })
+  await new Promise((res, rej) => {
+    ws.once('open', res)
+    ws.once('error', rej)
+  })
+  const done = await new Promise((res) => {
+    ws.on('message', (raw) => {
+      const m = JSON.parse(raw.toString())
+      if (m.ask === 't' && (m.type === 'done' || m.type === 'error')) res(m)
+    })
+    ws.send(JSON.stringify({ type: 'ask', id: 't', text }))
+  })
+  ws.close()
+  return done
+}
+
+test('with Ollama stopped, time and apps still work and conversation says why it cannot', async () => {
+  const time = await askOnce('What time is it?')
+  assert.equal(time.source, 'router')
+  assert.equal(time.tool, 'get_time')
+  const app = await askOnce('Open Calculator')
+  assert.equal(app.source, 'router')
+  assert.equal(app.tool, 'open_application')
+  const chat = await askOnce('Tell me a joke')
+  assert.equal(chat.type, 'done')
+  assert.equal(chat.source, 'unavailable')
+  assert.equal(chat.text, 'My local AI brain is unavailable right now.')
+  // Still alive afterwards.
+  assert.equal((await fetch(`${BASE}/health`)).status, 200)
+  const d = await (await fetch(`${BASE}/diagnostics`)).json()
+  assert.equal(d.brain.aiTurns, 0)
+  assert.ok(d.brain.unavailableTurns >= 1)
+  assert.match(d.brain.lastError, /offline/)
 })
 
 test('a page from somewhere else is refused outright', async () => {
@@ -209,7 +268,7 @@ test('the media proxy refuses a private address', async () => {
 test('a second bridge on the same port refuses to start, and says why', async () => {
   const second = spawn(process.execPath, ['bridge/server.mjs'], {
     cwd: ROOT,
-    env: { ...process.env, JARVIS_BRIDGE_PORT: String(PORT) },
+    env: { ...process.env, JARVIS_BRIDGE_PORT: String(PORT), JARVIS_RUN_DIR: RUN_DIR },
   })
   let text = ''
   second.stdout.on('data', (d) => (text += d))
@@ -232,8 +291,8 @@ test('a shutdown request without the token is refused', async () => {
 test('the token lets it shut down cleanly and frees the port', async () => {
   // This is the path stop.ps1 uses, and it exists because on Windows a
   // SIGTERM is TerminateProcess: no handler runs, the sockets are never
-  // closed, and the agent's own `claude` child process is orphaned.
-  const run = JSON.parse(readFileSync(join(ROOT, '.jarvis', 'bridge.json'), 'utf8'))
+  // closed, and in-flight turns are never cancelled.
+  const run = JSON.parse(readFileSync(join(RUN_DIR, 'bridge.json'), 'utf8'))
   assert.equal(run.port, PORT)
   assert.ok(run.token)
 

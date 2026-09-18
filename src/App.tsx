@@ -5,7 +5,8 @@ import { Boot } from './ui/Boot'
 import { Ignition } from './ui/Ignition'
 import { Diagnostics } from './ui/Diagnostics'
 import { useStore } from './store'
-import { startVoice, type Voice, type VoiceMode } from './lib/voice'
+import { reportVoice } from './lib/bridge'
+import { diag as voiceDiag, startVoice, VOICE_BARGE_IN, type Voice, type VoiceMode } from './lib/voice'
 import { createSpeaker, cycleVoice, currentVoiceName } from './lib/tts'
 import * as sfx from './lib/sfx'
 import * as music from './lib/music'
@@ -26,12 +27,9 @@ import {
   watchUi,
   watchConnection,
   connectedLabels,
-  usingBridge,
-  type Msg,
 } from './lib/brain'
 import { startAnalyser, micLevel } from './lib/audio'
 import { probeCapabilities } from './lib/capabilities'
-import { env } from './config'
 
 /**
  * The conversation.
@@ -50,10 +48,8 @@ import { env } from './config'
  *  people say his name and *then* think about what they wanted. */
 const AWAIT_SPEECH_MS = 14000
 
-/** After an answer, how long the mic stays open for a follow-up before he
- *  drops back to standby. Long enough that you don't have to say the name
- *  again to continue a thought. */
-const FOLLOW_UP_MS = 11000
+/** Phases in which he owns the floor. Half-duplex: nothing heard then is a turn. */
+const BUSY = new Set(['thinking', 'tooling', 'speaking'])
 
 /** crypto.randomUUID needs a secure context, which a LAN address over plain
  *  http is not. Not worth failing a whole turn over an id. */
@@ -72,7 +68,6 @@ const LEADING_NAME = new RegExp(`^(?:hey|hi|ok|okay|yo)?\\s*${NAME}\\b[\\s,.:!?-
 export default function App() {
   const store = useStore
   const phase = useStore((s) => s.phase)
-  const history = useRef<Msg[]>([])
   const speaker = useRef<ReturnType<typeof createSpeaker> | null>(null)
   const voice = useRef<Voice | null>(null)
 
@@ -85,6 +80,7 @@ export default function App() {
   const booting = useRef(false)
   const idleTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const voicePoll = useRef<ReturnType<typeof setInterval> | null>(null)
+  const voiceReport = useRef<ReturnType<typeof setInterval> | null>(null)
 
   // -- helpers --------------------------------------------------------------
 
@@ -136,6 +132,7 @@ export default function App() {
     s.setCaption('')
     s.pushTurn({ id: newId(), role: 'user', text: said })
     s.setPhase('thinking')
+    voiceDiag.lastUtteranceSentAt = Date.now()
 
     const spk = createSpeaker()
     speaker.current = spk
@@ -147,7 +144,7 @@ export default function App() {
     let filled = false
 
     try {
-      const { text } = await ask(said, history.current, {
+      await ask(said, {
         onText: (delta) => {
           if (stale()) return
           if (!started) {
@@ -184,16 +181,6 @@ export default function App() {
 
       if (stale()) return
 
-      // The bridge keeps conversation state in its own session, so history is
-      // only threaded through on the direct path.
-      if (!usingBridge) {
-        history.current.push({ role: 'user', content: said })
-        history.current.push({ role: 'assistant', content: text || '…' })
-        if (history.current.length > 16) {
-          history.current = history.current.slice(-16)
-        }
-      }
-
       await spk.end()
       if (stale()) return
       sfx.play('done')
@@ -211,9 +198,10 @@ export default function App() {
         music.duck(false)
         store.getState().setActiveTool(null)
         music.working(false)
-        // Stay open. Having to say his name again to add one more sentence is
-        // the difference between a conversation and a vending machine.
-        listen(FOLLOW_UP_MS)
+        // Back to the wake word, and only once he has finished speaking. The
+        // open follow-up window kept the command recogniser listening to the
+        // tail of his own answer; the voice loop re-arms after a short guard.
+        goDormant()
       }
     }
   }
@@ -239,6 +227,7 @@ export default function App() {
   const onWake = (trailing: string) => {
     const phase = store.getState().phase
     if (phase === 'offline' || phase === 'boot') return
+    if (!VOICE_BARGE_IN && BUSY.has(phase)) return
 
     store.getState().setError(null)
     sfx.play('wake')
@@ -289,9 +278,19 @@ export default function App() {
     store.getState().setPhase('listening')
   }
 
+  /** The voice loop's speech-start. Half-duplex, it never interrupts him —
+   *  the keyboard (Space, Escape) is the way to cut him off. */
+  const onVoiceSpeechStart = () => {
+    if (!VOICE_BARGE_IN && BUSY.has(store.getState().phase)) return
+    onSpeechStart()
+  }
+
   const onUtterance = (text: string) => {
     const phase = store.getState().phase
     if (phase === 'offline' || phase === 'boot' || phase === 'dormant') return
+    // One command, one ask: anything arriving while a turn is in flight is
+    // either his own voice or a stale recogniser result.
+    if (!VOICE_BARGE_IN && BUSY.has(phase)) return
 
     // People keep using his name as a vocative once they're already talking to
     // him. Strip it rather than sending "jarvis" to the model as a question.
@@ -445,6 +444,9 @@ export default function App() {
         case 'screen':
           s.clearScreen(a.what ?? 'all')
           break
+        case 'diagnostics':
+          window.dispatchEvent(new CustomEvent('jarvis:diagnostics', { detail: a }))
+          break
         default:
           console.warn('[jarvis] unknown ui op:', op, args)
       }
@@ -462,12 +464,6 @@ export default function App() {
       }
     })
     const warming = warm().catch((err: Error) => s.setError(err.message))
-
-    if (!usingBridge && !env.anthropicKey) {
-      s.setError(
-        'No Anthropic API key — copy .env.example to .env.local and set VITE_ANTHROPIC_API_KEY.',
-      )
-    }
 
     // Pull the neural voice down during the boot sequence so the first
     // "Hey Jarvis" isn't waiting on an 86MB download. Deliberately not awaited
@@ -518,11 +514,13 @@ export default function App() {
     voice.current = await startVoice({
       mode,
       onWake,
-      onSpeechStart,
+      onSpeechStart: onVoiceSpeechStart,
       onPartial,
       onUtterance,
       onError: onVoiceError,
     })
+    // So the bridge's /diagnostics can tell "never heard" from "never sent".
+    voiceReport.current = setInterval(() => reportVoice(voiceDiag), 1000)
 
     store.getState().setPhase('dormant')
   }
@@ -687,6 +685,7 @@ export default function App() {
       window.removeEventListener('keydown', onKey)
       clearIdle()
       if (voicePoll.current) clearInterval(voicePoll.current)
+      if (voiceReport.current) clearInterval(voiceReport.current)
       voice.current?.stop()
       speaker.current?.cancel()
       // The camera must not outlive the page that turned it on.
