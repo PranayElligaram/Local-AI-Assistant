@@ -47,3 +47,6 @@ public/mediapipe/
 
 # Local Claude Code backup files
 .claude/*.bak
+
+# Local Claude Code skills
+.claude/skills/
