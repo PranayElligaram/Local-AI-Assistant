@@ -44,6 +44,7 @@ const fragment = /* glsl */ `
   uniform float uSpeak;
   uniform float uEnergy;
   uniform float uTime;
+  uniform float uSpin;
 
   varying vec2 vUv;
 
@@ -219,7 +220,48 @@ const fragment = /* glsl */ `
     }
     float voice = (rip * (0.35 + uLevel * 1.1) + core * uLevel * 0.22) * uSpeak;
 
+    // -- inner instrumentation ---------------------------------------------
+    // Machined geometry inside the core disc so the centre reads as a contained
+    // mechanism even at rest. Everything is hairline-thin and low-gain; the
+    // nucleus is a small lens, not a ball. uSpin is its own accumulator, so
+    // state changes alter the rate of rotation without jumping the angle.
+    float breathe = 0.5 + 0.5 * sin(uTime * 0.85);
+    float busy = clamp(uThink + uListen * 0.35 + uSpeak * 0.3, 0.0, 1.0);
+
+    float nucleus = exp(-pow(r / 0.042, 2.0)) * (0.20 + breathe * 0.10 + uLevel * 0.40)
+                  + band(r, 0.072, 0.0035) * (0.26 + breathe * 0.10);
+
+    // 8 radial spokes bridging the nucleus to the first bracket ring.
+    float sp = (fract((a - uSpin * 0.3) / TAU * 8.0) - 0.5) * TAU / 8.0 * r;
+    float spokes = (1.0 - smoothstep(0.0012, 0.0035, abs(sp)))
+                 * smoothstep(0.085, 0.095, r) * smoothstep(0.145, 0.135, r);
+
+    // Three long bracket arcs, counter-rotating.
+    float s2 = fract((a - uSpin * 1.6) / TAU * 3.0);
+    float brackets = band(r, 0.155, 0.003) * smoothstep(0.0, 0.03, s2) * smoothstep(0.62, 0.55, s2);
+
+    // Segmented calibration ring, turning the other way.
+    float s1 = fract((a + uSpin) / TAU * 24.0);
+    float segs = band(r, 0.205, 0.0045) * smoothstep(0.0, 0.04, s1) * smoothstep(0.78, 0.70, s1);
+
+    // A single mote orbiting between the rings with a fading trace.
+    float oa = mod(a - uSpin * 2.4 + TAU * 8.0, TAU);
+    float orbit = band(r, 0.248, 0.0028) * smoothstep(1.4, 0.0, oa) * step(oa, 1.4);
+
+    // Graduated scale: 72 ticks, a long one every sixth.
+    float ta = (a + uSpin * 0.45) / TAU * 72.0;
+    float major = step(mod(floor(ta), 6.0), 0.5);
+    float tickA = 1.0 - smoothstep(0.10, 0.20, abs(fract(ta) - 0.5));
+    float tlen = mix(0.006, 0.013, major);
+    float ticks = tickA * (1.0 - smoothstep(tlen - 0.002, tlen, abs(r - 0.298))) * mix(0.7, 1.0, major);
+
+    float instr = (nucleus * kGlow
+                 + (spokes * 0.16 + brackets * 0.34 + segs * 0.28 + ticks * 0.24) * kLines
+                 + orbit * (0.30 + uThink * 0.5))
+                * (0.75 + busy * 0.7 + breathe * 0.12);
+
     float v = (outer + wall + edge + coreEdge) * kOutline
+            + instr
             + dust * kDust
             + radar
             + lines * kLines
@@ -230,7 +272,7 @@ const fragment = /* glsl */ `
 
     // The moving highlights run hot; the body of the ring keeps its hue.
     vec3 col = mix(uColor, uHot,
-      clamp(edge * 1.1 + radar * 0.6 + pulse * 0.5 + dust * 0.3 + traces + voice * 0.8 + bars * 0.6, 0.0, 1.0));
+      clamp(edge * 1.1 + nucleus * 0.7 + orbit * 0.6 + radar * 0.6 + pulse * 0.5 + dust * 0.3 + traces + voice * 0.8 + bars * 0.6, 0.0, 1.0));
 
     // Radial reveal on power-up: the ring assembles from the centre outward.
     v *= smoothstep(0.0, 0.35, uOpen - r * 0.45);
@@ -283,6 +325,7 @@ export function Core({ drive }: { drive: Drive }) {
       uSpeak: { value: 0 },
       uEnergy: { value: 0.35 },
       uTime: { value: 0 },
+      uSpin: { value: 0 },
     }),
     [],
   )
@@ -318,6 +361,9 @@ export function Core({ drive }: { drive: Drive }) {
     // State motion runs on its own clock so a reduced-motion user still sees
     // which state it is, just slower.
     u.uTime.value += dt * (drive.calm ? 0.3 : 1)
+    // Inner instrumentation: a slow idle drift that quickens while processing.
+    const w = drive.w
+    u.uSpin.value += dt * (0.06 + w.think * 0.9 + w.listen * 0.12 + w.speak * 0.08) * r.spin * (drive.calm ? 0.3 : 1)
     u.uStyle.value = r.style
     ;(u.uColor.value as THREE.Color).lerp(r.color, Math.min(1, dt * 2.5))
   })
