@@ -93,3 +93,29 @@ export function openUrl(url, { dryRun = false, spawnFn = spawn } = {}) {
     })
   })
 }
+
+/**
+ * Sign out of Windows. Fixed: no argument reaches the command line, so this
+ * can only ever end the current session - never run anything else.
+ */
+export function signOutCommand() {
+  return [`${WINDIR}\\System32\\shutdown.exe`, ['/l']]
+}
+
+export function signOut({ dryRun = false, spawnFn = spawn } = {}) {
+  const [file, args] = signOutCommand()
+  if (dryRun) return Promise.resolve({ ok: true, dryRun: true, command: [file, ...args] })
+  return new Promise((resolve) => {
+    let child
+    try {
+      child = spawnFn(file, args, { detached: true, stdio: 'ignore', shell: false, windowsHide: true })
+    } catch (err) {
+      return resolve({ ok: false, error: err.message })
+    }
+    child.once('error', (err) => resolve({ ok: false, error: err.message }))
+    child.once('spawn', () => {
+      child.unref()
+      resolve({ ok: true })
+    })
+  })
+}

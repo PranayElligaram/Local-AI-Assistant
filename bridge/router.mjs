@@ -47,6 +47,11 @@ const DATE =
   /^(?:what(?:'s| is)? (?:the |today's )?date(?: today)?|what date is it(?: today)?|what(?:'s| is) today(?:'s date)?|what day is (?:it|today)(?: today)?|which day is it|tell me the date|today's date|(?:the )?date(?: today)?)$/
 const DIAGNOSTICS = /^(?:(?:show|open|display|run|bring up|pull up)(?: me)? (?:the )?(?:system )?diagnostics(?: panel)?|(?:system )?diagnostics)$/
 const STATUS = /^(?:(?:system|systems) status|status report|how are (?:your|the) systems|(?:give me a |run a )?systems? check)$/
+const GOOD_MORNING = /^(?:good morning|morning)$/
+const START_TODAY = /^(?:start (?:today|the day|my day)|start my daily routine)$/
+const GOOD_NIGHT = /^good night$/
+const CONFIRM_GOOD_NIGHT = /^(?:confirm good night|good night confirmed)$/
+const CANCEL_GOOD_NIGHT = /^(?:cancel good night|cancel (?:the )?sign ?out|don'?t sign (?:me )?out)$/
 const RESTART = /^(?:restart|reboot|reload) (?:jarvis|yourself|the assistant)$/
 const STOP = /^(?:(?:stop|shut down|shutdown|quit|exit|close|turn off) (?:jarvis|yourself|the assistant)|jarvis (?:shut down|shutdown|stop))$/
 const REFRESH_APPS = /^(?:refresh|rescan|reload|update) (?:the |my )?(?:app|apps|application|applications|programs)(?: list| catalogue| catalog)?$/
@@ -113,11 +118,16 @@ export function route(text) {
   const s = normalizeUtterance(original)
   if (!s) return null
 
+  const named = normalizeUtterance(original, { keepName: true })
+  if (GOOD_MORNING.test(s)) return { tool: 'good_morning', args: {} }
+  if (START_TODAY.test(s)) return { tool: 'start_today', args: {} }
+  if (GOOD_NIGHT.test(s)) return { tool: 'good_night', args: {} }
+  if (CONFIRM_GOOD_NIGHT.test(s)) return { tool: 'confirm_good_night', args: {} }
+  if (CANCEL_GOOD_NIGHT.test(s)) return { tool: 'cancel_good_night', args: {} }
   if (TIME.test(s)) return { tool: 'get_time', args: {} }
   if (DATE.test(s)) return { tool: 'get_date', args: {} }
   if (DIAGNOSTICS.test(s)) return { tool: 'show_diagnostics', args: {} }
   if (STATUS.test(s)) return { tool: 'get_system_status', args: {} }
-  const named = normalizeUtterance(original, { keepName: true })
   if (RESTART.test(named)) return { tool: 'restart_jarvis', args: {} }
   if (STOP.test(named)) return { tool: 'stop_jarvis', args: {} }
   if (REFRESH_APPS.test(s)) return { tool: 'refresh_applications', args: {} }

@@ -12,7 +12,8 @@
  */
 
 import os from 'node:os'
-import { launchApp, openUrl } from './apps/launch.mjs'
+import { launchApp, openUrl, signOut } from './apps/launch.mjs'
+import { knownSite } from './router.mjs'
 import { searchUrl } from './web.mjs'
 
 /** Minimal JSON-schema check: exactly what the tool schemas below use. */
@@ -63,6 +64,17 @@ export function safeUrl(raw) {
   return url.href
 }
 
+/**
+ * "Start today": opened in order. Targets are names in the trusted site
+ * table, looked up rather than composed; add safe sites here.
+ */
+export const DAILY_START_ROUTINE = [
+  { type: 'url', target: 'google calendar' },
+  { type: 'url', target: 'gmail' },
+]
+/** How long "Good night" waits for "confirm good night". */
+const SIGN_OUT_TTL_MS = 2 * 60 * 1000
+
 const spokenTime = (d) => d.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit', hour12: true })
 const spokenDate = (d) =>
   d.toLocaleDateString(undefined, { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' })
@@ -77,7 +89,7 @@ const spokenDate = (d) =>
  * @param {{ restart: () => void, stop: () => void }} [deps.lifecycle]
  * @param {() => Promise<object>} [deps.systemStatus]
  * @param {() => Date} [deps.now]
- * @param {object} [deps.launcher]      { launchApp, openUrl } - injectable for tests
+ * @param {object} [deps.launcher]      { launchApp, openUrl, signOut } - injectable for tests
  */
 export function createTools(deps) {
   const {
@@ -89,7 +101,8 @@ export function createTools(deps) {
     lifecycle = { restart() {}, stop() {} },
     systemStatus = async () => ({}),
     now = () => new Date(),
-    launcher = { launchApp, openUrl },
+    launcher = { launchApp, openUrl, signOut },
+    routine = DAILY_START_ROUTINE,
   } = deps
 
   const state = {
@@ -102,6 +115,8 @@ export function createTools(deps) {
     lastRejection: '',
     app: { requested: '', resolved: '', method: '', launch: '' },
   }
+  // When "Good night" was said; sign-out needs a confirmation after it.
+  let signOutPendingAt = 0
 
   const openInBrowser = async (href, say) => {
     const r = await launcher.openUrl(href, { dryRun })
@@ -266,6 +281,72 @@ export function createTools(deps) {
         return s.error
           ? { ok: false, say: "I couldn't rescan the applications.", data: s }
           : { ok: true, say: `I know ${s.count} applications now.`, data: s }
+      },
+    },
+    {
+      name: 'good_morning',
+      description: 'Greet the user.',
+      parameters: { type: 'object', properties: {}, required: [] },
+      permission: 'safe',
+      model: false,
+      run: async () => ({ ok: true, say: `Good morning. It's ${spokenDate(now())}. JARVIS is online and ready.` }),
+    },
+    {
+      name: 'start_today',
+      description: 'Open the daily workspace.',
+      parameters: { type: 'object', properties: {}, required: [] },
+      permission: 'safe',
+      model: false,
+      run: async () => {
+        const opened = []
+        const failed = []
+        for (const item of routine) {
+          const href = item.type === 'url' ? knownSite(item.target) : null
+          const r = href ? await launcher.openUrl(href, { dryRun }).catch((err) => ({ ok: false, error: err.message })) : { ok: false }
+          ;(r.ok ? opened : failed).push(item.target)
+        }
+        return failed.length
+          ? { ok: false, say: `The daily routine finished with an issue: I couldn't open ${listOf(failed)}.`, data: { opened, failed } }
+          : { ok: true, say: 'Your daily workspace is ready.', data: { opened, failed } }
+      },
+    },
+    {
+      name: 'good_night',
+      description: 'Ask to sign out of Windows; nothing happens until confirmed.',
+      parameters: { type: 'object', properties: {}, required: [] },
+      permission: 'lifecycle',
+      model: false,
+      run: async () => {
+        signOutPendingAt = Date.now()
+        return { ok: true, say: "Good night. Say 'confirm good night' to sign out of Windows." }
+      },
+    },
+    {
+      name: 'confirm_good_night',
+      description: 'Sign out of Windows, after good_night.',
+      parameters: { type: 'object', properties: {}, required: [] },
+      permission: 'lifecycle',
+      model: false,
+      run: async () => {
+        const pending = signOutPendingAt && Date.now() - signOutPendingAt < SIGN_OUT_TTL_MS
+        signOutPendingAt = 0
+        if (!pending) return { ok: false, say: "Say 'good night' first if you want to sign out." }
+        const r = await launcher.signOut({ dryRun })
+        return r.ok
+          ? { ok: true, say: 'Signing out. Good night.', data: { dryRun: Boolean(r.dryRun) } }
+          : { ok: false, say: "I couldn't sign out.", data: { error: r.error } }
+      },
+    },
+    {
+      name: 'cancel_good_night',
+      description: 'Cancel a pending sign-out.',
+      parameters: { type: 'object', properties: {}, required: [] },
+      permission: 'safe',
+      model: false,
+      run: async () => {
+        const had = Boolean(signOutPendingAt)
+        signOutPendingAt = 0
+        return { ok: true, say: had ? "Sign-out cancelled. I'll stay on." : 'There was no sign-out to cancel.' }
       },
     },
     {
