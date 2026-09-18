@@ -221,15 +221,18 @@ const fragment = /* glsl */ `
     float voice = (rip * (0.35 + uLevel * 1.1) + core * uLevel * 0.22) * uSpeak;
 
     // -- inner instrumentation ---------------------------------------------
-    // Machined geometry inside the core disc so the centre reads as a contained
+    // which is why they look high next to the ring's own terms.
     // mechanism even at rest. Everything is hairline-thin and low-gain; the
     // nucleus is a small lens, not a ball. uSpin is its own accumulator, so
+    // Output is col*v with alpha v under AdditiveBlending (SrcAlpha, One), so
+    // on screen a term lands as v squared: these gains are pitched for that,
+    // which is why they look high next to the ring's own terms.
     // state changes alter the rate of rotation without jumping the angle.
     float breathe = 0.5 + 0.5 * sin(uTime * 0.85);
     float busy = clamp(uThink + uListen * 0.35 + uSpeak * 0.3, 0.0, 1.0);
 
-    float nucleus = exp(-pow(r / 0.042, 2.0)) * (0.20 + breathe * 0.10 + uLevel * 0.40)
-                  + band(r, 0.072, 0.0035) * (0.26 + breathe * 0.10);
+    float nucleus = exp(-pow(r / 0.042, 2.0)) * (0.75 + breathe * 0.25 + uLevel * 0.60)
+                  + band(r, 0.072, 0.0035) * (0.70 + breathe * 0.20);
 
     // 8 radial spokes bridging the nucleus to the first bracket ring.
     float sp = (fract((a - uSpin * 0.3) / TAU * 8.0) - 0.5) * TAU / 8.0 * r;
@@ -256,8 +259,8 @@ const fragment = /* glsl */ `
     float ticks = tickA * (1.0 - smoothstep(tlen - 0.002, tlen, abs(r - 0.298))) * mix(0.7, 1.0, major);
 
     float instr = (nucleus * kGlow
-                 + (spokes * 0.16 + brackets * 0.34 + segs * 0.28 + ticks * 0.24) * kLines
-                 + orbit * (0.30 + uThink * 0.5))
+                 + (spokes * 0.50 + brackets * 0.95 + segs * 0.85 + ticks * 0.80) * kLines
+                 + orbit * (0.90 + uThink * 0.6))
                 * (0.75 + busy * 0.7 + breathe * 0.12);
 
     float v = (outer + wall + edge + coreEdge) * kOutline
