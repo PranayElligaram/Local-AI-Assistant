@@ -39,6 +39,7 @@ function fakeBrain(...scripts) {
 function setup(brain) {
   const frames = []
   const launched = []
+  const opened = []
   const apps = { spotify: 'Spotify', 'visual studio code': 'Visual Studio Code', calculator: 'Calculator' }
   const catalogue = {
     async resolve(name) {
@@ -47,10 +48,10 @@ function setup(brain) {
       return hit ? { status: 'found', app: { name: hit, type: 'startapp', target: hit }, method: 'exact' } : { status: 'not_found' }
     },
   }
-  const tools = createTools({ catalogue, launcher: { launchApp: async (e) => (launched.push(e.name), { ok: true }), openUrl: async () => ({ ok: true }) } })
+  const tools = createTools({ catalogue, launcher: { launchApp: async (e) => (launched.push(e.name), { ok: true }), openUrl: async (u) => (opened.push(u), { ok: true }) } })
   const convo = createConversation({ brain, tools, systemPrompt: 'SYSTEM', send: (f) => frames.push(f) })
   const done = () => frames.filter((f) => f.type === 'done')
-  return { convo, frames, done, launched, tools }
+  return { convo, frames, done, launched, opened, tools }
 }
 
 test('deterministic commands never touch the model', async () => {
@@ -66,6 +67,17 @@ test('deterministic commands never touch the model', async () => {
     ['router', 'open_application', 'a3'],
   ])
   assert.deepEqual(launched, ['Spotify'])
+})
+
+test('known websites open at their trusted URL without touching the model', async () => {
+  const brain = fakeBrain()
+  const { convo, done, opened } = setup(brain)
+  await convo.ask('Open YouTube in Google', 's1')
+  await convo.ask('Open Gmail in Chrome', 's2')
+  await convo.ask('Open Calendar', 's3')
+  assert.equal(brain.calls, 0)
+  assert.deepEqual(done().map((d) => [d.source, d.tool]), [['router', 'open_url'], ['router', 'open_url'], ['router', 'open_url']])
+  assert.deepEqual(opened.map(String), ['https://www.youtube.com/', 'https://mail.google.com/', 'https://calendar.google.com/'])
 })
 
 test('conversation streams from the local model, tagged with the ask id', async () => {

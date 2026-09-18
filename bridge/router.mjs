@@ -64,6 +64,36 @@ const RESEARCH = /^(?:research|find out about|summari[sz]e the latest(?: on)?|wh
 const spokenDomain = (s) => s.replace(/\s+dot\s+/g, '.').replace(/\s+slash\s+/g, '/').replace(/\s+/g, '')
 const DOMAIN = /^(?:https?:\/\/)?(?:[a-z0-9-]+\.)+[a-z]{2,}(?:[/:?#]\S*)?$/i
 
+/**
+ * Websites JARVIS opens by name. A fixed, trusted table: the URL is looked up,
+ * never composed, so an unknown name can't become an invented address.
+ */
+const KNOWN_SITES = {
+  youtube: 'https://www.youtube.com',
+  gmail: 'https://mail.google.com',
+  'google drive': 'https://drive.google.com',
+  'google calendar': 'https://calendar.google.com',
+  'google maps': 'https://maps.google.com',
+  github: 'https://github.com',
+  reddit: 'https://www.reddit.com',
+}
+const SITE_ALIASES = {
+  'you tube': 'youtube',
+  'google mail': 'gmail',
+  drive: 'google drive',
+  calendar: 'google calendar',
+  maps: 'google maps',
+  'git hub': 'github',
+}
+/** "... in Google", "... in Chrome", "... in the browser" name where, not what. */
+const IN_BROWSER = /\s+(?:in|on|using|with) (?:the |my )?(?:google chrome|google|chrome|(?:web )?browser)$/
+
+/** The trusted URL for a spoken site name, or null. */
+export function knownSite(name) {
+  const key = String(name ?? '').toLowerCase().replace(IN_BROWSER, '').replace(/^(?:the|my)\s+/, '').replace(/\s+(?:website|site|app)$/, '').trim()
+  return KNOWN_SITES[SITE_ALIASES[key] ?? key] ?? null
+}
+
 function cleanAppName(raw) {
   return raw
     .replace(/^(?:the|my|a|an|up)\s+/, '')
@@ -99,6 +129,11 @@ export function route(text) {
     m = re.exec(s)
     if (m && m[1]) return { tool: 'search_web', args: { query: tail(original, m[1]) } }
   }
+
+  // "open YouTube" / "open Gmail in Chrome" / "go to Google Drive"
+  m = /^(?:go to|visit|browse to|navigate to) (.+)$/.exec(s) ?? OPEN.exec(s)
+  const site = m && knownSite(cleanAppName(m[1]))
+  if (site) return { tool: 'open_url', args: { url: site } }
 
   // "go to example.com" / "open example dot com"
   m = /^(?:go to|visit|browse to|navigate to|open) (.+)$/.exec(s)

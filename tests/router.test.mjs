@@ -5,7 +5,7 @@
 
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { normalizeUtterance, pickChoice, route } from '../bridge/router.mjs'
+import { knownSite, normalizeUtterance, pickChoice, route } from '../bridge/router.mjs'
 
 const tool = (text) => route(text)?.tool ?? null
 
@@ -46,6 +46,36 @@ test('URLs and spoken domains open in the browser', () => {
   assert.deepEqual(route('Open https://example.com'), { tool: 'open_url', args: { url: 'https://example.com' } })
   assert.deepEqual(route('go to example dot com'), { tool: 'open_url', args: { url: 'example.com' } })
   assert.equal(tool('visit bbc.co.uk'), 'open_url')
+})
+
+test('known websites open at their exact trusted URL, whatever browser is named', () => {
+  const cases = {
+    'Open YouTube': 'https://www.youtube.com',
+    'Open YouTube in Google': 'https://www.youtube.com',
+    'Open YouTube in Chrome': 'https://www.youtube.com',
+    'Open Gmail in Chrome': 'https://mail.google.com',
+    'Open Gmail in Google Chrome': 'https://mail.google.com',
+    'Open Google Drive': 'https://drive.google.com',
+    'open drive in the browser': 'https://drive.google.com',
+    'Open Calendar': 'https://calendar.google.com',
+    'Open Google Calendar': 'https://calendar.google.com',
+    'Open Google Maps': 'https://maps.google.com',
+    'open maps in browser': 'https://maps.google.com',
+    'Open GitHub': 'https://github.com',
+    'Hey Jarvis, open Reddit please': 'https://www.reddit.com',
+    'go to youtube': 'https://www.youtube.com',
+  }
+  for (const [s, url] of Object.entries(cases)) assert.deepEqual(route(s), { tool: 'open_url', args: { url } }, s)
+  assert.equal(knownSite('calendar'), 'https://calendar.google.com')
+  assert.equal(knownSite('YouTube in Chrome'), 'https://www.youtube.com')
+})
+
+test('unknown site names are never turned into invented URLs', () => {
+  assert.equal(knownSite('netflix'), null)
+  assert.equal(knownSite('chrome'), null)
+  assert.deepEqual(route('Open Netflix in Chrome'), { tool: 'open_application', args: { name: 'Netflix in Chrome' } })
+  assert.equal(route('go to my bank'), null)
+  assert.deepEqual(route('Launch Chrome'), { tool: 'open_application', args: { name: 'Chrome' } })
 })
 
 test('JARVIS lifecycle and diagnostics are deterministic', () => {
