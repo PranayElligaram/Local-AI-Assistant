@@ -1,4 +1,5 @@
 import { useStore } from '../store'
+import { BRACKETS, SCALE } from './dial'
 
 /**
  * The start gate.
@@ -38,17 +39,26 @@ export function Ignition({ onStart }: { onStart: () => void }) {
   if (phase !== 'offline') return null
 
   return (
-    <button className="ignition" onClick={onStart}>
-      {/*
-        Spun by CSS rather than framer. As a motion element with
-        `repeat: Infinity` it was one of the things keeping the exit from ever
-        finishing — AnimatePresence waits for a leaving subtree's animations,
-        and an infinite one never ends.
-      */}
-      <span className="ignition-ring" />
-      <span className="ignition-label">
-        <span className="ignition-word">INITIALISE</span>
-        <span className="ignition-sub">click, or clap, to power up</span>
+    <button className="ignition" onClick={onStart} aria-label="Initialise JARVIS" aria-describedby="ignition-note">
+      {/* The dial at rest: the same instrument the live HUD draws, unlit.
+          Spun by CSS rather than framer — an infinite framer animation was one
+          of the things that kept an old exit from ever finishing. */}
+      <span className="ignition-dial" aria-hidden="true">
+        <svg viewBox="-500 -500 1000 1000">
+          <g className="ignition-scale">
+            <path d={SCALE.minor} />
+            <path className="ignition-major" d={SCALE.major} />
+          </g>
+          <circle r="330" />
+          <path d={BRACKETS} />
+        </svg>
+      </span>
+      <span className="ignition-core">
+        <span className="ignition-word">Initialise</span>
+        <span className="ignition-sub">Click, press Space, or clap</span>
+      </span>
+      <span className="ignition-note" id="ignition-note">
+        JARVIS will ask to use your microphone. Until you say “Hey Jarvis”, it only listens for its name.
       </span>
     </button>
   )

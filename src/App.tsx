@@ -1,4 +1,5 @@
 import { useEffect, useRef } from 'react'
+import { MotionConfig } from 'framer-motion'
 import { Scene } from './scene/Scene'
 import { Hud } from './ui/Hud'
 import { Boot } from './ui/Boot'
@@ -14,7 +15,7 @@ import * as hands from './lib/hands'
 import { listenForClap } from './lib/clap'
 import * as camera from './lib/camera'
 import * as kokoro from './lib/kokoro'
-import { TTS_ENGINE } from './config'
+import { BRIDGE_HTTP_URL, TTS_ENGINE } from './config'
 import { forTool, attention } from './lib/fillers'
 import {
   ask,
@@ -47,6 +48,23 @@ import { probeCapabilities } from './lib/capabilities'
 /** How long to wait for someone to start speaking after he wakes. Generous:
  *  people say his name and *then* think about what they wanted. */
 const AWAIT_SPEECH_MS = 14000
+
+/** The shortest the start-up sequence runs. Long enough to read as a system
+ *  coming online, short enough not to feel like a loading screen; the real
+ *  checks run underneath it and usually finish first. */
+const BOOT_MIN_MS = 4200
+
+/** Whether the local model answers, for the boot check. Read-only and bounded:
+ *  a slow bridge marks the step as a warning rather than holding boot up. */
+async function brainReady(): Promise<boolean> {
+  try {
+    const res = await fetch(`${BRIDGE_HTTP_URL}/diagnostics`, { signal: AbortSignal.timeout(3000) })
+    const d = (await res.json()) as { brain?: { primary?: { ok?: boolean }; fallback?: { ok?: boolean } | null } }
+    return Boolean(d.brain?.primary?.ok || d.brain?.fallback?.ok)
+  } catch {
+    return false
+  }
+}
 
 /** Phases in which he owns the floor. Half-duplex: nothing heard then is a turn. */
 const BUSY = new Set(['thinking', 'tooling', 'speaking'])
@@ -81,6 +99,7 @@ export default function App() {
   const idleTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const voicePoll = useRef<ReturnType<typeof setInterval> | null>(null)
   const voiceReport = useRef<ReturnType<typeof setInterval> | null>(null)
+  const voiceWatch = useRef<ReturnType<typeof setInterval> | null>(null)
 
   // -- helpers --------------------------------------------------------------
 
@@ -358,6 +377,7 @@ export default function App() {
     music.playBoot()
     music.startAmbient()
 
+    for (const k of ['bridge', 'brain', 'mic', 'voice', 'wake'] as const) s.setBootStep(k, 'wait')
     s.setPhase('boot')
 
     watchServers((servers) => store.getState().setConnected(servers))
@@ -463,7 +483,19 @@ export default function App() {
           .setError('Bridge reconnected. The previous conversation was not kept.')
       }
     })
-    const warming = warm().catch((err: Error) => s.setError(err.message))
+    s.setBootStep('bridge', 'run')
+    s.setBootStep('brain', 'run')
+    const warming = warm()
+      .then(() => {
+        store.getState().setBootStep('bridge', 'ok')
+        return brainReady()
+      })
+      .then((ok) => store.getState().setBootStep('brain', ok ? 'ok' : 'warn'))
+      .catch((err: Error) => {
+        store.getState().setBootStep('bridge', 'warn')
+        store.getState().setBootStep('brain', 'warn')
+        s.setError(err.message)
+      })
 
     // Pull the neural voice down during the boot sequence so the first
     // "Hey Jarvis" isn't waiting on an 86MB download. Deliberately not awaited
@@ -483,12 +515,9 @@ export default function App() {
       }, 200)
     }
 
-    // Long enough for the four-beat start-up sequence in Boot.tsx to play —
-    // status bar, rings, suit schematic, reactor power-up — before the live
-    // interface takes over. Kept a touch under the boot cue so the music is
-    // still rising as the reactor lands.
-    await new Promise((r) => setTimeout(r, 9200)) // boot sequence
-    await warming
+    // The start-up sequence in Boot.tsx runs for at least BOOT_MIN_MS while
+    // the bridge and the local model warm underneath it.
+    await Promise.all([new Promise((r) => setTimeout(r, BOOT_MIN_MS)), warming])
     store.getState().setConnected(connectedLabels())
     store.getState().setVoice(currentVoiceName())
 
@@ -496,9 +525,12 @@ export default function App() {
     // getUserMedia stream; speech recognition does not, and gets its own. So a
     // failure here costs the animation and nothing else — saying "voice input
     // is unavailable" was both alarming and untrue.
+    store.getState().setBootStep('mic', 'run')
     try {
       await startAnalyser()
+      store.getState().setBootStep('mic', 'ok')
     } catch {
+      store.getState().setBootStep('mic', 'warn')
       console.warn(
         '[jarvis] no microphone stream — the reactor will not pulse with your ' +
           'voice. Speech recognition is unaffected.',
@@ -508,7 +540,10 @@ export default function App() {
     // Ask the bridge which speech engines exist before the loop starts, so the
     // first turn already uses ElevenLabs when a key is present and the browser
     // fallback when it is not — no flag, no reload.
+    store.getState().setBootStep('voice', 'run')
     await probeCapabilities()
+    store.getState().setBootStep('voice', 'ok')
+    store.getState().setBootStep('wake', 'run')
 
     // One voice loop, started once, running until the page closes.
     voice.current = await startVoice({
@@ -521,6 +556,14 @@ export default function App() {
     })
     // So the bridge's /diagnostics can tell "never heard" from "never sent".
     voiceReport.current = setInterval(() => reportVoice(voiceDiag), 1000)
+    // The HUD needs to know whether the microphone is really open (the greeting
+    // and the re-arm window close it while the phase says 'listening'). Mirrored
+    // only on change, so this costs nothing between transitions.
+    voiceWatch.current = setInterval(() => {
+      const v = voiceDiag.voiceState
+      if (v !== store.getState().voiceState) store.getState().setVoiceState(v)
+    }, 100)
+    store.getState().setBootStep('wake', 'ok')
 
     store.getState().setPhase('dormant')
   }
@@ -686,6 +729,7 @@ export default function App() {
       clearIdle()
       if (voicePoll.current) clearInterval(voicePoll.current)
       if (voiceReport.current) clearInterval(voiceReport.current)
+      if (voiceWatch.current) clearInterval(voiceWatch.current)
       voice.current?.stop()
       speaker.current?.cancel()
       // The camera must not outlive the page that turned it on.
@@ -695,12 +739,13 @@ export default function App() {
   }, [])
 
   return (
-    <>
+    // reducedMotion="user": every framer animation honours the OS setting.
+    <MotionConfig reducedMotion="user">
       <Scene />
       <Hud />
       <Boot />
       <Diagnostics />
       <Ignition onStart={() => void powerOn()} />
-    </>
+    </MotionConfig>
   )
 }

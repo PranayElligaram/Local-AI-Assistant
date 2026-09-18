@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useStore } from '../store'
 import { isConnected } from '../lib/bridge'
 import { caps, engineLabel } from '../lib/capabilities'
@@ -37,6 +37,14 @@ type VoiceDiag = {
   accepted: number
   restarts: number
   idleMs: number
+  voiceState: string
+  wakeListening: boolean
+  commandRecognitionActive: boolean
+  ttsActive: boolean
+  recognitionGeneration: number
+  lastWakeAt: number
+  lastUtteranceSentAt: number
+  engine: string
 }
 
 type MicDiag = {
@@ -99,12 +107,33 @@ const health = (m?: { model: string; ok: boolean; reachable: boolean; loaded: bo
 
 const ago = (t: number) => (t ? `${((Date.now() - t) / 1000).toFixed(1)}s ago` : '—')
 
+/** A reading. Faults are marked with a glyph as well as colour. */
 function Row({ k, v, bad }: { k: string; v: string; bad?: boolean }) {
   return (
-    <div className="diag-row">
-      <span className="diag-k">{k}</span>
-      <span className={bad ? 'diag-v diag-bad' : 'diag-v'}>{v}</span>
+    <div className="diag-row" data-bad={bad || undefined}>
+      <dt className="diag-k">{k}</dt>
+      <dd className="diag-v">
+        {bad && <span className="diag-flag" aria-label="fault">✕ </span>}
+        {v}
+      </dd>
     </div>
+  )
+}
+
+function Section({ title, children }: { title: string; children: React.ReactNode }) {
+  return (
+    <section className="diag-sec">
+      <h3 className="diag-sec-title">{title}</h3>
+      <dl className="diag-rows">{children}</dl>
+    </section>
+  )
+}
+
+function Verdict({ ok, yes, no }: { ok: boolean; yes: string; no: string }) {
+  return (
+    <li className="diag-verdict-item" data-ok={ok}>
+      <span aria-hidden="true">{ok ? '✓' : '✕'}</span> {ok ? yes : no}
+    </li>
   )
 }
 
@@ -114,6 +143,7 @@ export function Diagnostics() {
   const [bridgeDiag, setBridgeDiag] = useState<BridgeDiag | null>(null)
   const [bridgeErr, setBridgeErr] = useState('')
   const phase = useStore((s) => s.phase)
+  const panel = useRef<HTMLElement>(null)
 
   // "Show diagnostics", spoken, arrives as a bridge ui op.
   useEffect(() => {
@@ -164,6 +194,15 @@ export function Diagnostics() {
     return () => clearInterval(id)
   }, [open])
 
+  // Focus moves into the panel when it opens so it can be scrolled from the
+  // keyboard, and goes back where it was when it closes.
+  useEffect(() => {
+    if (!open) return
+    const before = document.activeElement as HTMLElement | null
+    panel.current?.focus()
+    return () => before?.focus?.()
+  }, [open])
+
   if (!open) return null
 
   const w = window as unknown as Record<string, unknown>
@@ -185,117 +224,136 @@ export function Diagnostics() {
   const ttsProvider = caps().tts && USE_ELEVENLABS ? 'ElevenLabs (browser fallback)' : TTS_ENGINE === 'kokoro' ? 'Kokoro (in browser)' : 'browser speech'
 
   return (
-    <div className="diag" aria-live="polite">
-      <div className="diag-head">DIAGNOSTICS · D to close</div>
+    <aside
+      ref={panel}
+      className="diag"
+      role="dialog"
+      aria-modal="false"
+      aria-labelledby="diag-title"
+      tabIndex={-1}
+    >
+      <header className="diag-head">
+        <h2 id="diag-title">Diagnostics</h2>
+        <button type="button" className="diag-close" onClick={() => setOpen(false)}>
+          Close <kbd>D</kbd>
+        </button>
+      </header>
 
-      <div className="diag-verdict">
-        <span className={earsOk ? 'diag-ok' : 'diag-bad'}>
-          {earsOk ? '● hearing you' : '● not hearing you'}
-        </span>
-        <span className={mouthOk ? 'diag-ok' : 'diag-bad'}>
-          {mouthOk ? '● speaking' : '● no sound produced'}
-        </span>
-        <span className={bridgeOk ? 'diag-ok' : 'diag-bad'}>
-          {bridgeOk ? '● bridge connected' : '● bridge unreachable'}
-        </span>
-        <span className={brainOk ? 'diag-ok' : 'diag-bad'}>
-          {brainOk ? '● local brain online' : '● local brain unavailable'}
-        </span>
-      </div>
+      <ul className="diag-verdict" aria-label="Summary">
+        <Verdict ok={earsOk} yes="Hearing you" no="Not hearing you" />
+        <Verdict ok={mouthOk} yes="Speaking" no="No sound produced yet" />
+        <Verdict ok={bridgeOk} yes="Bridge connected" no="Bridge unreachable" />
+        <Verdict ok={brainOk} yes="Local brain online" no="Local brain unavailable" />
+      </ul>
 
-      {/* The microphone comes first because every other reading below is
-          meaningless if no audio is arriving, and "which device is this
-          actually listening to" is the question that used to take an
-          afternoon. */}
-      <div className="diag-sec">MICROPHONE</div>
-      <Row k="device" v={m.open ? m.label || 'default device' : 'NOT OPEN'} bad={!m.open} />
-      <Row k="chosen by" v={String(m.reason ?? '—')} />
-      <Row k="preference" v={m.preference ? m.preference : '— (system default)'} />
-      {m.fallback ? <Row k="fallback" v={m.fallback} bad /> : null}
-      <Row k="inputs seen" v={String(m.devices ?? 0)} bad={(m.devices ?? 0) === 0} />
-      <Row
-        k="recoveries"
-        v={m.lostAt ? `${m.recoveries ?? 0} (last loss ${ago(m.lostAt)})` : String(m.recoveries ?? 0)}
-        bad={(m.recoveries ?? 0) > 0}
-      />
-      <Row k="error" v={m.lastError || '—'} bad={Boolean(m.lastError)} />
+      <Section title="Microphone">
+        <Row k="device" v={m.open ? m.label || 'default device' : 'NOT OPEN'} bad={!m.open} />
+        <Row k="chosen by" v={String(m.reason ?? '—')} />
+        <Row k="preference" v={m.preference ? m.preference : '— (system default)'} />
+        {m.fallback ? <Row k="fallback" v={m.fallback} bad /> : null}
+        <Row k="inputs seen" v={String(m.devices ?? 0)} bad={(m.devices ?? 0) === 0} />
+        <Row
+          k="recoveries"
+          v={m.lostAt ? `${m.recoveries ?? 0} (last loss ${ago(m.lostAt)})` : String(m.recoveries ?? 0)}
+          bad={(m.recoveries ?? 0) > 0}
+        />
+        <Row k="error" v={m.lastError || '—'} bad={Boolean(m.lastError)} />
+      </Section>
 
-      <div className="diag-sec">BRAIN</div>
-      {bridgeErr ? <Row k="bridge" v={`unreachable · ${bridgeErr}`} bad /> : null}
-      <Row k="mode" v={b ? `${b.mode === 'local' ? 'Local' : b.mode} · ${b.provider}` : '—'} />
-      <Row k="primary" v={health(b?.primary)} bad={Boolean(b) && !b?.primary?.ok} />
-      <Row k="fallback" v={health(b?.fallback)} bad={Boolean(b?.fallback) && !b?.fallback?.ok} />
-      <Row k="last model" v={b?.lastModel ? `${b.lastModel}${b.lastFallbackUsed ? ' (fallback)' : ''}` : '—'} />
-      <Row
-        k="last latency"
-        v={b?.lastLatencyMs != null ? `${b.lastLatencyMs} ms (first words ${b.lastFirstTokenMs ?? '—'} ms)` : '—'}
-      />
-      <Row k="last source" v={b?.lastSource || '—'} />
-      <Row k="brain error" v={b?.lastError || '—'} bad={Boolean(b?.lastError)} />
-      <Row k="endpoint" v={b?.endpoint ?? '—'} />
-      <Row k="cloud required" v={b ? (b.cloudRequired ? 'YES' : 'No') : '—'} bad={Boolean(b?.cloudRequired)} />
-      <Row k="Claude runtime" v={b ? (b.claudeRuntime === 'none' ? 'None' : b.claudeRuntime) : '—'} />
+      <Section title="Local AI">
+        {bridgeErr ? <Row k="bridge" v={`unreachable · ${bridgeErr}`} bad /> : null}
+        <Row k="mode" v={b ? `${b.mode === 'local' ? 'Local' : b.mode} · ${b.provider}` : '—'} />
+        <Row k="primary" v={health(b?.primary)} bad={Boolean(b) && !b?.primary?.ok} />
+        <Row k="fallback" v={health(b?.fallback)} bad={Boolean(b?.fallback) && !b?.fallback?.ok} />
+        <Row k="last model" v={b?.lastModel ? `${b.lastModel}${b.lastFallbackUsed ? ' (fallback)' : ''}` : '—'} />
+        <Row
+          k="last latency"
+          v={b?.lastLatencyMs != null ? `${b.lastLatencyMs} ms (first words ${b.lastFirstTokenMs ?? '—'} ms)` : '—'}
+        />
+        <Row k="last source" v={b?.lastSource || '—'} />
+        <Row k="brain error" v={b?.lastError || '—'} bad={Boolean(b?.lastError)} />
+        <Row k="endpoint" v={b?.endpoint ?? '—'} />
+        <Row k="cloud required" v={b ? (b.cloudRequired ? 'YES' : 'No') : '—'} bad={Boolean(b?.cloudRequired)} />
+        <Row k="Claude runtime" v={b ? (b.claudeRuntime === 'none' ? 'None' : b.claudeRuntime) : '—'} />
+      </Section>
 
-      <div className="diag-sec">APPLICATIONS</div>
-      <Row k="catalogue" v={apps ? `${apps.status} · ${apps.count} apps${apps.dryRun ? ' · DRY RUN' : ''}` : '—'} bad={apps?.status === 'error' || apps?.count === 0} />
-      <Row k="last requested" v={apps?.lastRequested || '—'} />
-      <Row k="resolved to" v={apps?.lastResolved || '—'} />
-      <Row k="method" v={apps?.resolutionMethod || '—'} />
-      <Row k="launch" v={apps?.lastLaunch || '—'} bad={Boolean(apps?.lastLaunch?.startsWith('failed'))} />
+      <Section title="Applications">
+        <Row k="catalogue" v={apps ? `${apps.status} · ${apps.count} apps${apps.dryRun ? ' · DRY RUN' : ''}` : '—'} bad={apps?.status === 'error' || apps?.count === 0} />
+        <Row k="last requested" v={apps?.lastRequested || '—'} />
+        <Row k="resolved to" v={apps?.lastResolved || '—'} />
+        <Row k="method" v={apps?.resolutionMethod || '—'} />
+        <Row k="launch" v={apps?.lastLaunch || '—'} bad={Boolean(apps?.lastLaunch?.startsWith('failed'))} />
+      </Section>
 
-      <div className="diag-sec">TOOLS</div>
-      <Row k="mode" v={tl ? (tl.mode === 'safe' ? 'safe (read-only)' : 'WRITES enabled') : '—'} />
-      <Row k="last tool" v={tl?.last || '—'} />
-      <Row k="last result" v={tl?.lastResult || '—'} bad={Boolean(tl?.lastResult?.startsWith('rejected'))} />
-      <Row k="executed / rejected" v={tl ? `${tl.executed} / ${tl.rejected}` : '—'} />
+      <Section title="Tools">
+        <Row k="mode" v={tl ? (tl.mode === 'safe' ? 'safe (read-only)' : 'WRITES enabled') : '—'} />
+        <Row k="last tool" v={tl?.last || '—'} />
+        <Row k="last result" v={tl?.lastResult || '—'} bad={Boolean(tl?.lastResult?.startsWith('rejected'))} />
+        <Row k="executed / rejected" v={tl ? `${tl.executed} / ${tl.rejected}` : '—'} />
+      </Section>
 
-      <div className="diag-sec">PROCESS</div>
-      <Row k="socket" v={bridgeOk ? `connected · ${BRIDGE_WS_URL}` : `DOWN · ${BRIDGE_WS_URL}`} bad={!bridgeOk} />
-      <Row k="bridge" v={proc ? `pid ${proc.pid} · port ${proc.port} · up ${proc.uptimeSeconds}s` : '—'} />
-      <Row k="run file" v={proc ? (proc.ownsRunFile ? 'owned by this bridge' : 'NOT owned') : '—'} bad={Boolean(proc) && !proc?.ownsRunFile} />
-      <Row k="UI" v={window.location.origin} />
+      <Section title="Process">
+        <Row k="socket" v={bridgeOk ? `connected · ${BRIDGE_WS_URL}` : `DOWN · ${BRIDGE_WS_URL}`} bad={!bridgeOk} />
+        <Row k="bridge" v={proc ? `pid ${proc.pid} · port ${proc.port} · up ${proc.uptimeSeconds}s` : '—'} />
+        <Row k="run file" v={proc ? (proc.ownsRunFile ? 'owned by this bridge' : 'NOT owned') : '—'} bad={Boolean(proc) && !proc?.ownsRunFile} />
+        <Row k="UI" v={window.location.origin} />
+      </Section>
 
-      <div className="diag-sec">VOICE</div>
-      <Row k="wake" v={WAKE_ENGINE === 'porcupine' ? '"Hey Jarvis" · porcupine (offline)' : '"Hey Jarvis" · transcript match'} />
-      <Row k="speech stack" v={engineLabel()} />
-      <Row k="STT" v={sttProvider} />
-      <Row k="TTS" v={ttsProvider} />
-      <Row
-        k="ElevenLabs"
-        v={
-          bridgeDiag?.speech
-            ? !bridgeDiag.speech.elevenlabsConfigured
-              ? 'not configured'
-              : `configured${bridgeDiag.speech.elevenlabsSttDenied ? ' · STT denied' : ''}${bridgeDiag.speech.elevenlabsTtsDenied ? ' · TTS denied' : ''}`
-            : '—'
-        }
-      />
-      <Row k="barge-in" v={v.mode === 'guard' ? 'armed (speaking/thinking)' : 'idle'} />
+      <Section title="Voice">
+        <Row k="wake" v={WAKE_ENGINE === 'porcupine' ? '"Hey Jarvis" · porcupine (offline)' : '"Hey Jarvis" · transcript match'} />
+        <Row k="speech stack" v={engineLabel()} />
+        <Row k="STT" v={sttProvider} />
+        <Row k="TTS" v={ttsProvider} />
+        <Row
+          k="ElevenLabs"
+          v={
+            bridgeDiag?.speech
+              ? !bridgeDiag.speech.elevenlabsConfigured
+                ? 'not configured'
+                : `configured${bridgeDiag.speech.elevenlabsSttDenied ? ' · STT denied' : ''}${bridgeDiag.speech.elevenlabsTtsDenied ? ' · TTS denied' : ''}`
+              : '—'
+          }
+        />
+        <Row k="guard" v={v.mode === 'guard' ? 'active — mic paused while JARVIS has the floor' : 'idle'} />
+      </Section>
 
-      <div className="diag-sec">LISTENING</div>
-      <Row k="recogniser" v={v.running ? 'running' : 'STOPPED'} bad={!v.running} />
-      <Row k="sessions" v={String(v.sessions ?? 0)} />
-      <Row
-        k="silent for"
-        v={`${((v.idleMs ?? 0) / 1000).toFixed(1)}s`}
-        bad={(v.idleMs ?? 0) > 15000}
-      />
-      <Row k="forced restarts" v={String(v.restarts ?? 0)} bad={(v.restarts ?? 0) > 0} />
-      <Row k="mode" v={`${v.mode ?? '—'} (phase ${phase})`} />
-      <Row k="accepted" v={String(v.accepted ?? 0)} bad={(v.accepted ?? 0) === 0} />
-      <Row k="wakes" v={String(v.wakes ?? 0)} />
-      <Row k="last heard" v={v.heard ? `"${v.heard}" ${ago(v.heardAt ?? 0)}` : '— nothing yet'} bad={!v.heard} />
-      <Row k="last drop" v={v.dropped || '—'} bad={Boolean(v.dropped)} />
-      <Row k="error" v={v.lastError || '—'} bad={Boolean(v.lastError)} />
+      <Section title="Voice lifecycle">
+        <Row k="state" v={v.voiceState ?? '—'} />
+        <Row k="input engine" v={v.engine ?? '—'} />
+        <Row k="wake listening" v={v.wakeListening ? 'yes' : 'no'} />
+        <Row k="command mic" v={v.commandRecognitionActive ? 'open' : 'closed'} />
+        <Row k="TTS active" v={v.ttsActive ? 'yes (mic paused)' : 'no'} />
+        <Row k="generation" v={String(v.recognitionGeneration ?? 0)} />
+        <Row k="last wake" v={ago(v.lastWakeAt ?? 0)} />
+        <Row k="last command sent" v={ago(v.lastUtteranceSentAt ?? 0)} />
+      </Section>
 
-      <div className="diag-sec">SPEAKING · press T to test</div>
-      <Row k="engine" v={String(t.engine ?? 'system')} />
-      <Row k="voice" v={String(t.voice || '—')} />
-      <Row k="handed to OS" v={String(t.spoken ?? 0)} />
-      <Row k="actually spoke" v={String(t.started ?? 0)} bad={(t.started ?? 0) === 0} />
-      <Row k="failures" v={String(t.failures ?? 0)} bad={(t.failures ?? 0) > 0} />
-      <Row k="cloud rescues" v={String(t.rescued ?? 0)} />
-      <Row k="error" v={t.lastError || '—'} bad={Boolean(t.lastError)} />
-    </div>
+      <Section title="Listening">
+        <Row k="recogniser" v={v.running ? 'running' : 'STOPPED'} bad={!v.running} />
+        <Row k="sessions" v={String(v.sessions ?? 0)} />
+        <Row
+          k="silent for"
+          v={`${((v.idleMs ?? 0) / 1000).toFixed(1)}s`}
+          bad={(v.idleMs ?? 0) > 15000}
+        />
+        <Row k="forced restarts" v={String(v.restarts ?? 0)} bad={(v.restarts ?? 0) > 0} />
+        <Row k="mode" v={`${v.mode ?? '—'} (phase ${phase})`} />
+        <Row k="accepted" v={String(v.accepted ?? 0)} bad={(v.accepted ?? 0) === 0} />
+        <Row k="wakes" v={String(v.wakes ?? 0)} />
+        <Row k="last heard" v={v.heard ? `"${v.heard}" ${ago(v.heardAt ?? 0)}` : '— nothing yet'} bad={!v.heard} />
+        <Row k="last drop" v={v.dropped || '—'} bad={Boolean(v.dropped)} />
+        <Row k="error" v={v.lastError || '—'} bad={Boolean(v.lastError)} />
+      </Section>
+
+      <Section title="Speaking — press T to test">
+        <Row k="engine" v={String(t.engine ?? 'system')} />
+        <Row k="voice" v={String(t.voice || '—')} />
+        <Row k="handed to OS" v={String(t.spoken ?? 0)} />
+        <Row k="actually spoke" v={String(t.started ?? 0)} bad={(t.started ?? 0) === 0} />
+        <Row k="failures" v={String(t.failures ?? 0)} bad={(t.failures ?? 0) > 0} />
+        <Row k="cloud rescues" v={String(t.rescued ?? 0)} />
+        <Row k="error" v={t.lastError || '—'} bad={Boolean(t.lastError)} />
+      </Section>
+    </aside>
   )
 }

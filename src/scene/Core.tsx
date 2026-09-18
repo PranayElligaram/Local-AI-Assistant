@@ -2,6 +2,7 @@ import { useRef, useMemo } from 'react'
 import { useFrame, useThree } from '@react-three/fiber'
 import * as THREE from 'three'
 import type { Drive } from './Scene'
+import { reactorFrame } from '../ui/layout'
 
 /**
  * The reactor.
@@ -37,6 +38,12 @@ const fragment = /* glsl */ `
   uniform float uZoom;
   uniform float uIntensity;
   uniform float uStyle;
+  // State signatures, 0..1 and smoothed (see weightsFor in Scene.tsx).
+  uniform float uListen;
+  uniform float uThink;
+  uniform float uSpeak;
+  uniform float uEnergy;
+  uniform float uTime;
 
   varying vec2 vUv;
 
@@ -145,7 +152,7 @@ const fragment = /* glsl */ `
     // a visible radial seam, which reads as a rendering fault rather than as a
     // sweep — it was the one artefact in the whole ring.
     float wake = smoothstep(-2.6, -0.15, dA) * (1.0 - smoothstep(0.0, 0.22, dA));
-    float radar = wake * band(r, R - 0.02, 0.075) * (0.55 + uLevel * 0.45);
+    float radar = wake * band(r, R - 0.02, 0.075) * (0.32 + uLevel * 0.35);
 
     // -- concentric hairlines inside ---------------------------------------
     float lines =
@@ -179,24 +186,58 @@ const fragment = /* glsl */ `
     float bodyFill = wSphere * smoothstep(R + 0.02, R - 0.32, r)
                    * (0.10 + uLevel * 0.10);
 
+    // -- listening: input bars ----------------------------------------------
+    // A ring of fine radial bars just outside the rim, their length following
+    // the microphone. Quantised into 144 slots so it reads as an instrument
+    // scale rather than as a smear; each slot has its own flutter so the ring
+    // moves like a waveform instead of breathing as one.
+    float slots = 144.0;
+    float sa = (a + 3.14159265) / TAU * slots;
+    float si = floor(sa);
+    float slotMask = smoothstep(0.5, 0.28, abs(fract(sa) - 0.5));
+    float flutter = 0.35 + 0.65 * (sin(si * 12.9898 + uTime * (3.0 + mod(si, 7.0))) * 0.5 + 0.5);
+    float barLen = 0.010 + uLevel * 0.085 * flutter;
+    float r0 = R + 0.045;
+    float bars = slotMask * smoothstep(r0 - 0.004, r0, r) * (1.0 - smoothstep(r0 + barLen - 0.006, r0 + barLen, r));
+    bars *= uListen * (0.32 + uLevel * 0.55);
+
+    // -- thinking: processing traces ----------------------------------------
+    // Two short bright arcs orbiting inside the ring in opposite directions.
+    // The only fast motion in the whole reactor, so it reads as work.
+    float t1 = mod(a - uTime * 2.4 + TAU * 4.0, TAU);
+    float t2 = mod(-a - uTime * 1.6 + TAU * 4.0, TAU);
+    float arc1 = smoothstep(0.9, 0.0, t1) * step(t1, 0.9);
+    float arc2 = smoothstep(0.6, 0.0, t2) * step(t2, 0.6);
+    float traces = (arc1 * band(r, 0.655, 0.006) + arc2 * band(r, 0.515, 0.005)) * uThink * 1.4;
+
+    // -- speaking: output ripples -------------------------------------------
+    // Rings leaving the core as he talks, brighter with the output level.
+    float rip = 0.0;
+    for (int k = 0; k < 3; k++) {
+      float ph = fract(uTime * 0.55 + float(k) / 3.0);
+      rip += band(r, 0.08 + ph * 0.34, 0.010) * (1.0 - ph);
+    }
+    float voice = (rip * (0.35 + uLevel * 1.1) + core * uLevel * 0.22) * uSpeak;
+
     float v = (outer + wall + edge + coreEdge) * kOutline
             + dust * kDust
             + radar
             + lines * kLines
             + coreTex + pulse
             + bloom * kGlow
-            + bodyFill;
+            + bodyFill
+            + bars + traces + voice;
 
     // The moving highlights run hot; the body of the ring keeps its hue.
     vec3 col = mix(uColor, uHot,
-      clamp(edge * 1.3 + radar * 0.7 + pulse * 0.5 + dust * 0.4, 0.0, 1.0));
+      clamp(edge * 1.1 + radar * 0.6 + pulse * 0.5 + dust * 0.3 + traces + voice * 0.8 + bars * 0.6, 0.0, 1.0));
 
     // Radial reveal on power-up: the ring assembles from the centre outward.
     v *= smoothstep(0.0, 0.35, uOpen - r * 0.45);
 
     // Brightness authority for the whole orb, applied last so it scales the
     // finished image rather than any one term. 1.0 is the authored look.
-    v *= uIntensity;
+    v *= uIntensity * uEnergy;
 
     gl_FragColor = vec4(col * v, v);
   }
@@ -214,12 +255,13 @@ const RING_R = 0.74
  * scale that leaves a comfortable margin on a 16:9 monitor runs the ring off
  * both edges of a portrait window.
  */
-const FIT = 0.60
+const FIT = 0.46 // default only; the live value comes from ui/layout.ts
 
 export function Core({ drive }: { drive: Drive }) {
   const mat = useRef<THREE.ShaderMaterial>(null)
   const mesh = useRef<THREE.Mesh>(null)
   const viewport = useThree((s) => s.viewport)
+  const size = useThree((s) => s.size)
 
   const uniforms = useMemo(
     () => ({
@@ -236,6 +278,11 @@ export function Core({ drive }: { drive: Drive }) {
       // renders byte for byte as it did before they existed.
       uIntensity: { value: 1 },
       uStyle: { value: 0 },
+      uListen: { value: 0 },
+      uThink: { value: 0 },
+      uSpeak: { value: 0 },
+      uEnergy: { value: 0.35 },
+      uTime: { value: 0 },
     }),
     [],
   )
@@ -253,7 +300,9 @@ export function Core({ drive }: { drive: Drive }) {
     mesh.current.scale.setScalar(r.scale)
 
     const fit = Math.min(viewport.width, viewport.height)
-    u.uZoom.value = (RING_R * HALF) / (FIT * 0.5 * fit)
+    const px = Math.min(size.width, size.height)
+    const share = px > 0 ? reactorFrame(size.width, size.height).d / px : FIT
+    u.uZoom.value = (RING_R * HALF) / (share * 0.5 * fit)
     u.uLevel.value += (drive.level - u.uLevel.value) * Math.min(1, dt * 8)
     // Accumulated, not derived from elapsed time scaled by level — scaling the
     // clock would rewrite all the turbulence that has already happened, and the
@@ -262,6 +311,13 @@ export function Core({ drive }: { drive: Drive }) {
     u.uPhase.value += dt * (0.5 + u.uLevel.value * 0.7) * r.spin
     u.uOpen.value += (drive.open - u.uOpen.value) * Math.min(1, dt * 1.6)
     u.uIntensity.value = r.intensity
+    u.uListen.value = drive.w.listen
+    u.uThink.value = drive.w.think
+    u.uSpeak.value = drive.w.speak
+    u.uEnergy.value = drive.w.energy
+    // State motion runs on its own clock so a reduced-motion user still sees
+    // which state it is, just slower.
+    u.uTime.value += dt * (drive.calm ? 0.3 : 1)
     u.uStyle.value = r.style
     ;(u.uColor.value as THREE.Color).lerp(r.color, Math.min(1, dt * 2.5))
   })

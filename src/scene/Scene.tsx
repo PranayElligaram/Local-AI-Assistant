@@ -1,18 +1,34 @@
 import { useMemo } from 'react'
 import { Canvas, useFrame } from '@react-three/fiber'
-import {
-  EffectComposer,
-  Bloom,
-  ChromaticAberration,
-  Vignette,
-  Noise,
-} from '@react-three/postprocessing'
-import { BlendFunction } from 'postprocessing'
+import { EffectComposer, Bloom, Vignette } from '@react-three/postprocessing'
 import * as THREE from 'three'
 import { Core } from './Core'
 import { Particles } from './Particles'
 import { Orbits } from './Orbits'
 import { useStore, phaseColor, accentFor, type Phase } from '../store'
+import { deriveDisplay, type Display } from '../ui/hudState'
+import { reactorFrame, prefersReducedMotion } from '../ui/layout'
+
+/**
+ * How present each state's signature is in the reactor, 0..1, smoothed in
+ * Rig. Listening grows a ring of input bars, thinking sets processing traces
+ * orbiting inside, speaking ripples the core. `energy` is overall brightness:
+ * the reactor rests low and comes up to meet the user.
+ */
+type Weights = { listen: number; think: number; speak: number; energy: number }
+
+const weightsFor: Record<Display, Weights> = {
+  offline: { listen: 0, think: 0, speak: 0, energy: 0.35 },
+  boot: { listen: 0, think: 0.4, speak: 0, energy: 0.8 },
+  dormant: { listen: 0, think: 0, speak: 0, energy: 0.58 },
+  wake: { listen: 0.35, think: 0, speak: 0.4, energy: 1 },
+  listening: { listen: 1, think: 0, speak: 0, energy: 1 },
+  transcribing: { listen: 0.3, think: 0.6, speak: 0, energy: 0.95 },
+  thinking: { listen: 0, think: 1, speak: 0, energy: 0.9 },
+  working: { listen: 0, think: 1, speak: 0, energy: 0.95 },
+  speaking: { listen: 0, think: 0, speak: 1, energy: 1 },
+  rearming: { listen: 0, think: 0, speak: 0.2, energy: 0.7 },
+}
 
 /** Rings spin harder while JARVIS is working — reads as effort. */
 const spinFor: Record<Phase, number> = {
@@ -67,6 +83,10 @@ export type Drive = {
   amp: number
   /** 0..1 power-up reveal — the ring assembles outwards from the centre. */
   open: number
+  /** Smoothed state signatures; see weightsFor. */
+  w: Weights
+  /** prefers-reduced-motion: ambient drift stops, state motion slows. */
+  calm: boolean
   /**
    * The reactor slice of the ui state, already resolved and smoothed.
    *
@@ -114,6 +134,8 @@ function Rig() {
       spin: spinFor.offline,
       amp: AMP_CALM,
       open: 0,
+      w: { ...weightsFor.offline },
+      calm: false,
       reactor: {
         color: new THREE.Color(phaseColor.offline),
         scale: 1,
@@ -133,7 +155,9 @@ function Rig() {
 
   useFrame((state, dt) => {
     // Read imperatively rather than subscribing — see the note on Drive.
-    const { phase, level, ui } = useStore.getState()
+    const { phase, level, ui, voiceState } = useStore.getState()
+    const display = deriveDisplay(phase, voiceState)
+    drive.calm = prefersReducedMotion()
 
     // accentFor owns the accent -> palette -> phase resolution order. The scene
     // asking the store for the answer rather than working it out again is what
@@ -156,7 +180,14 @@ function Rig() {
     drive.reactor.style = STYLE_INDEX[r.style] ?? STYLE_INDEX.ring
     drive.reactor.visible = r.visible
 
-    drive.spin += (spinFor[phase] - drive.spin) * Math.min(1, dt * 2)
+    const goal = weightsFor[display]
+    const kw = Math.min(1, dt * 3)
+    drive.w.listen += (goal.listen - drive.w.listen) * kw
+    drive.w.think += (goal.think - drive.w.think) * kw
+    drive.w.speak += (goal.speak - drive.w.speak) * kw
+    drive.w.energy += (goal.energy - drive.w.energy) * kw
+
+    drive.spin += (spinFor[phase] * (drive.calm ? 0.2 : 1) - drive.spin) * Math.min(1, dt * 2)
     drive.amp = phase === 'dormant' || phase === 'offline' ? AMP_CALM : AMP_LIVE
     // Held shut until the reactor is powered on, so the ring builds itself out
     // of the centre on the ignition click rather than simply appearing.
@@ -166,14 +197,30 @@ function Rig() {
     const idle = phase === 'offline' ? 0.02 : phase === 'dormant' ? 0.05 : 0.12
     const breathe =
       (Math.sin(state.clock.elapsedTime * 0.9) * 0.5 + 0.5) * idle
-    const want = Math.max(level, breathe)
+    // Only the two states whose sound the reactor is meant to show get the
+    // level: the user while the mic is open, JARVIS while he speaks. Anything
+    // else is room noise arriving through a microphone that is paused, and a
+    // reactor pulsing to it would say the opposite of the readout under it.
+    const heard = display === 'listening' || display === 'speaking' ? level : 0
+    const want = Math.max(heard, breathe)
     drive.level += (want - drive.level) * Math.min(1, dt * 9)
 
-    // Slow drift on the camera keeps handheld-ish life in the shot.
+    // Slow drift on the camera gives the particle field parallax against the
+    // ring. Off under reduced motion.
     const t = state.clock.elapsedTime
-    state.camera.position.x = Math.sin(t * 0.13) * 0.35
-    state.camera.position.y = Math.cos(t * 0.17) * 0.22
+    state.camera.position.x = drive.calm ? 0 : Math.sin(t * 0.13) * 0.28
+    state.camera.position.y = drive.calm ? 0 : Math.cos(t * 0.17) * 0.18
     state.camera.lookAt(0, 0, 0)
+
+    // Lift the whole scene to the reactor's place in the layout by shifting
+    // the projection window, so the ring, its dust and anything in orbit move
+    // together and the vector instrument over it lines up (ui/layout.ts).
+    const { width: w, height: h } = state.size
+    const lift = Math.round(h / 2 - reactorFrame(w, h).y)
+    const cam = state.camera as THREE.PerspectiveCamera
+    if (cam.view?.offsetY !== lift || cam.view?.fullWidth !== w || cam.view?.fullHeight !== h) {
+      cam.setViewOffset(w, h, 0, lift, w, h)
+    }
   })
 
   // Nothing in here is lit: both the core and the dust are raw ShaderMaterials,
@@ -219,7 +266,7 @@ export function Scene() {
       <EffectComposer multisampling={0}>
         {/* Bloom is what turns additive lines into "hologram". */}
         <Bloom
-          intensity={1.15}
+          intensity={0.9}
           // A higher threshold keeps the mid-tones intact so the orb doesn't
           // flatten into a solid white disc.
           luminanceThreshold={0.22}
@@ -227,13 +274,10 @@ export function Scene() {
           mipmapBlur
           radius={0.72}
         />
-        <ChromaticAberration
-          offset={new THREE.Vector2(0.0009, 0.0012)}
-          radialModulation={false}
-          modulationOffset={0}
-        />
-        <Noise opacity={0.035} blendFunction={BlendFunction.OVERLAY} />
-        <Vignette eskil={false} offset={0.22} darkness={0.95} />
+        {/* No chromatic aberration or film grain: they blurred the fine
+            calibration work into the ring and read as a camera effect laid
+            over an instrument. */}
+        <Vignette eskil={false} offset={0.22} darkness={0.9} />
       </EffectComposer>
     </Canvas>
   )

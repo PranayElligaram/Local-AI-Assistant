@@ -8,7 +8,8 @@ import type { Drive } from './Scene'
  * pushed outward by loudness, so the whole cloud expands when JARVIS speaks.
  */
 
-const COUNT = 4000
+// Sparse on purpose: this is depth behind an instrument, not weather.
+const COUNT = 1400
 
 const vertex = /* glsl */ `
   uniform float uTime;
@@ -43,7 +44,7 @@ const vertex = /* glsl */ `
     // of the cloud at alpha zero while still shading and rasterising every one
     // of those points.
     vAlpha = smoothstep(-11.5, -2.5, mv.z)
-           * (0.30 + uLevel * 0.35)
+           * (0.16 + uLevel * 0.22)
            * (1.0 - aRadius * 0.55);
 
     // Perspective-correct sizing. The constant is tuned for the default 6-unit
@@ -96,19 +97,19 @@ export function Particles({ drive }: { drive: Drive }) {
     () => ({
       uTime: { value: 0 },
       uLevel: { value: 0 },
-      uSize: { value: 3.4 },
+      uSize: { value: 2.1 },
       uColor: { value: new THREE.Color('#00e5ff') },
       uIntensity: { value: 1 },
     }),
     [],
   )
 
-  useFrame((state, dt) => {
+  useFrame((_, dt) => {
     if (!mat.current || !pts.current) return
     const u = mat.current.uniforms
     pts.current.visible = drive.reactor.visible
     u.uIntensity.value = drive.reactor.intensity
-    u.uTime.value = state.clock.elapsedTime
+    u.uTime.value += dt * (drive.calm ? 0.15 : 1)
     u.uLevel.value += (drive.level - u.uLevel.value) * Math.min(1, dt * 6)
     ;(u.uColor.value as THREE.Color).lerp(drive.color, Math.min(1, dt * 3))
   })

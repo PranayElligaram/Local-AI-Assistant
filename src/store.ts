@@ -58,7 +58,13 @@ export type Turn = {
   text: string
   /** Tool names invoked while producing this turn, for the HUD readout. */
   tools?: string[]
+  /** When the turn began, ms since epoch. Stamped by pushTurn. */
+  at?: number
 }
+
+/** One line of the start-up check. Each is a real step in App's ignite(). */
+export type BootStepKey = 'bridge' | 'brain' | 'voice' | 'mic' | 'wake'
+export type BootStepState = 'wait' | 'run' | 'ok' | 'warn'
 
 /**
  * An image JARVIS has put into orbit around the reactor.
@@ -230,6 +236,14 @@ type State = {
   looking: string | null
   /** Transient status line during boot, e.g. the voice model download. */
   bootNote: string
+  /** Progress of the real start-up steps, shown by the boot sequence. */
+  bootSteps: Record<BootStepKey, BootStepState>
+  /**
+   * The voice loop's own state (voice.ts diag.voiceState), mirrored in only
+   * when it changes. The phase says what the conversation expects; this says
+   * whether the microphone is actually open — see ui/hudState.ts.
+   */
+  voiceState: string
   /** Cards currently on the display, newest last. */
   panels: Panel[]
   /** Blades currently open, newest last — which is also front-most. */
@@ -245,6 +259,8 @@ type State = {
   setGestures: (on: boolean) => void
   setLooking: (why: string | null) => void
   setBootNote: (n: string) => void
+  setBootStep: (k: BootStepKey, v: BootStepState) => void
+  setVoiceState: (v: string) => void
   pushPanel: (p: Panel) => void
   clearPanels: () => void
   pushBlade: (b: Blade) => void
@@ -286,12 +302,16 @@ export const useStore = create<State>((set) => ({
   focusedBlade: null,
   expandedBlade: null,
   bootNote: '',
+  bootSteps: { bridge: 'wait', brain: 'wait', voice: 'wait', mic: 'wait', wake: 'wait' },
+  voiceState: 'OFF',
   ui: defaultUi(),
 
   setVoice: (voice) => set({ voice }),
   setGestures: (gestures) => set({ gestures }),
   setLooking: (looking) => set({ looking }),
   setBootNote: (bootNote) => set({ bootNote }),
+  setBootStep: (k, v) => set((s) => ({ bootSteps: { ...s.bootSteps, [k]: v } })),
+  setVoiceState: (voiceState) => set({ voiceState }),
   // Three is as many as fits around the reactor without crowding it. Sticky
   // panels are exempt from the cull — the tool description promises they stay
   // until replaced, and a plain slice(-3) silently evicted them the moment a
@@ -352,7 +372,8 @@ export const useStore = create<State>((set) => ({
   setActiveTool: (activeTool) => set({ activeTool }),
   setError: (error) => set({ error }),
   setConnected: (connected) => set({ connected }),
-  pushTurn: (turn) => set((s) => ({ turns: [...s.turns.slice(-40), turn] })),
+  pushTurn: (turn) =>
+    set((s) => ({ turns: [...s.turns.slice(-40), { ...turn, at: turn.at ?? Date.now() }] })),
   appendToLastTurn: (text) =>
     set((s) => {
       const turns = [...s.turns]
@@ -415,16 +436,23 @@ export const useStore = create<State>((set) => ({
     }),
 }))
 
-/** Colour identity per phase — shared by the 3D scene and the 2D HUD. */
+/**
+ * Colour identity per phase — shared by the 3D scene and the 2D HUD.
+ *
+ * One cool family, not a hue per state. State is carried by the label, the
+ * microphone line and the reactor's motion; colour only shifts temperature and
+ * energy — dim steel at rest, arc cyan while listening, blue-white while he
+ * works, near-white while he speaks. Warm colours are kept for real faults.
+ */
 export const phaseColor: Record<Phase, string> = {
-  offline: '#0d4a4a',
-  boot: '#17b3b3',
-  dormant: '#12908f',
-  waking: '#5cf2ef',
-  listening: '#19d8d2',
-  thinking: '#f0a93c',
-  tooling: '#a97bff',
-  speaking: '#3ef2a8',
+  offline: '#1d4f66',
+  boot: '#4cc4ee',
+  dormant: '#3b8db0',
+  waking: '#8fe6ff',
+  listening: '#5fd3ff',
+  thinking: '#9db6ff',
+  tooling: '#9db6ff',
+  speaking: '#cdf3ff',
 }
 
 /**
