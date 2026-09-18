@@ -221,13 +221,13 @@ const fragment = /* glsl */ `
     float voice = (rip * (0.35 + uLevel * 1.1) + core * uLevel * 0.22) * uSpeak;
 
     // -- inner instrumentation ---------------------------------------------
-    // which is why they look high next to the ring's own terms.
-    // mechanism even at rest. Everything is hairline-thin and low-gain; the
-    // nucleus is a small lens, not a ball. uSpin is its own accumulator, so
+    // Machined geometry inside the core disc so the centre reads as a contained
+    // mechanism even at rest. Everything is hairline-thin; the nucleus is a
+    // small lens, not a ball. uSpin is its own accumulator, so state changes
+    // alter the rate of rotation without jumping the angle.
     // Output is col*v with alpha v under AdditiveBlending (SrcAlpha, One), so
     // on screen a term lands as v squared: these gains are pitched for that,
     // which is why they look high next to the ring's own terms.
-    // state changes alter the rate of rotation without jumping the angle.
     float breathe = 0.5 + 0.5 * sin(uTime * 0.85);
     float busy = clamp(uThink + uListen * 0.35 + uSpeak * 0.3, 0.0, 1.0);
 
