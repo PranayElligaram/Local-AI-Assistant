@@ -67,6 +67,10 @@ if (-not $ready) {
     exit 1
 }
 
+# The marker that makes this window - and only this window - the clap listener
+# (src/lib/surface.ts). A tab opened on the bare URL never listens.
+$surfaceUrl = $Url.TrimEnd('/') + '/?surface=jarvis'
+
 # Reuse before launching: a second logon, a restart or a second run of this
 # script must not stack up JARVIS windows.
 $snap = Get-Snapshot
@@ -82,7 +86,7 @@ if ($window) {
     # The user's own profile, so the microphone permission already granted to
     # this origin still applies. --app gives JARVIS its own top-level window,
     # never a tab in somebody's browsing window.
-    Start-Process -FilePath $browser -ArgumentList @("--app=$Url") | Out-Null
+    Start-Process -FilePath $browser -ArgumentList @("--app=$surfaceUrl") | Out-Null
     Write-Host "JARVIS interface opened in $(Split-Path -Leaf $browser)."
     $deadline = (Get-Date).AddSeconds(20)
     while (-not $window -and (Get-Date) -lt $deadline) {

@@ -13,6 +13,7 @@ import * as sfx from './lib/sfx'
 import * as music from './lib/music'
 import * as hands from './lib/hands'
 import { listenForClap, diag as clapDiag } from './lib/clap'
+import { isJarvisSurface, JARVIS_SURFACE, SURFACE_HEADER } from './lib/surface'
 import * as camera from './lib/camera'
 import * as kokoro from './lib/kokoro'
 import { BRIDGE_HTTP_URL, TTS_ENGINE } from './config'
@@ -72,7 +73,8 @@ async function reportReadiness(): Promise<void> {
   } catch {
     /* reported as false */
   }
-  const body = JSON.stringify({ clapListening: clapDiag.listening, audioState: clapDiag.audioState, micPermission, webgl })
+  const { listening: clapListening, audioState, claps, lastPeak, lastClapAfterArmMs, floorAtClap } = clapDiag
+  const body = JSON.stringify({ clapListening, audioState, micPermission, webgl, claps, lastPeak, lastClapAfterArmMs, floorAtClap })
   await fetch(`${BRIDGE_HTTP_URL}/readiness`, { method: 'POST', headers: { 'content-type': 'application/json' }, body }).catch(() => {})
 }
 
@@ -605,7 +607,9 @@ export default function App() {
    * about a feature nobody asked for would be worse than quietly doing without.
    */
   useEffect(() => {
-    if (phase !== 'offline') return
+    // Only the dedicated JARVIS window listens. A tab showing the same page is
+    // someone's browsing, and a second listener in the room is a false clap.
+    if (phase !== 'offline' || !isJarvisSurface()) return
     let live: { stop: () => void } | null = null
     let gone = false
     void listenForClap(() => {
@@ -613,7 +617,7 @@ export default function App() {
       void powerOn()
       // The clap also lays out the development workspace. Fire and forget:
       // the bridge owns what opens and where, and drops an overlapping request.
-      void fetch(`${BRIDGE_HTTP_URL}/workspace`, { method: 'POST' }).catch(() => {})
+      void fetch(`${BRIDGE_HTTP_URL}/workspace`, { method: 'POST', headers: { [SURFACE_HEADER]: JARVIS_SURFACE } }).catch(() => {})
     }, () => {
       if (!gone) void reportReadiness()
     }).then((l) => {

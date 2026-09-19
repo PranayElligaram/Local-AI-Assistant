@@ -18,6 +18,7 @@ import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { createTools } from '../bridge/tools.mjs'
 import { MONITOR_MAP, WORKSPACE } from '../bridge/workspace.mjs'
+import { JARVIS_SURFACE, SURFACE_HEADER, SURFACE_PARAM, isJarvisSurface } from '../src/lib/surface.ts'
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const read = (p) => readFileSync(join(ROOT, p), 'utf8')
@@ -51,7 +52,7 @@ test('logon starts JARVIS only: no Claude, no Git Bash, no Claude Code, no norma
   // The only browser the logon path starts is JARVIS's own --app window.
   const openUi = code('scripts/open-ui.ps1')
   const launches = openUi.match(/Start-Process[^\n]*/g) ?? []
-  assert.deepEqual(launches, ['Start-Process -FilePath $browser -ArgumentList @("--app=$Url") | Out-Null'])
+  assert.deepEqual(launches, ['Start-Process -FilePath $browser -ArgumentList @("--app=$surfaceUrl") | Out-Null'])
 })
 
 test('the dedicated window uses the normal profile: no temporary profile, no incognito', () => {
@@ -81,10 +82,10 @@ test('JARVIS is placed on monitor 1, by the same monitor ordering as the workspa
 test('the clap is the one trigger for the workspace, and it is the existing orchestrator', () => {
   const app = code('src/App.tsx')
   assert.equal(app.match(/\/workspace`/g)?.length, 1)
-  assert.match(app, /listenForClap\(\(\) => \{[\s\S]*?void powerOn\(\)[\s\S]*?\/workspace`, \{ method: 'POST' \}/)
+  assert.match(app, /listenForClap\(\(\) => \{[\s\S]*?void powerOn\(\)[\s\S]*?\/workspace`, \{ method: 'POST', headers: \{ \[SURFACE_HEADER\]: JARVIS_SURFACE \} \}/)
   const server = code('bridge/server.mjs')
   assert.equal(server.match(/workspace\.start\(/g)?.length, 1)
-  assert.match(server, /req\.url === '\/workspace'\) \{[\s\S]{0,80}workspace\.start\(\{ trigger: 'clap' \}\)/)
+  assert.match(server, /req\.url === '\/workspace'\) \{[\s\S]{0,600}workspace\.start\(\{ trigger: 'clap' \}\)/)
 })
 
 test('workspace targets are unchanged by the lifecycle work', () => {
@@ -115,4 +116,40 @@ test('the clap ignores the capture start-up transient, with sensitivity unchange
   for (const t of ['PEAK_OVER_FLOOR = 7', 'MIN_PEAK = 0.055', 'QUIET_BEFORE = 0.16', 'DECAY_TO = 0.35', 'DECAY_MS = 130', 'GIVE_UP_MS = 260', 'COOLDOWN_MS = 1200']) {
     assert.ok(clap.includes(`const ${t}`), t)
   }
+})
+
+// --- one clap listener: the dedicated JARVIS window --------------------------------
+
+test('the dedicated JARVIS surface is recognised; a plain tab is not', () => {
+  assert.equal(isJarvisSurface('?surface=jarvis'), true)
+  assert.equal(isJarvisSurface('?foo=1&surface=jarvis'), true)
+  for (const plain of ['', '?', '?surface=', '?surface=tab', '?surface=JARVIS', '?jarvis', '#surface=jarvis']) {
+    assert.equal(isJarvisSurface(plain), false, plain)
+  }
+})
+
+test('open-ui.ps1 opens the dedicated window with exactly the marker the page checks', () => {
+  const openUi = code('scripts/open-ui.ps1')
+  assert.equal(`${SURFACE_PARAM}=${JARVIS_SURFACE}`, 'surface=jarvis')
+  assert.ok(openUi.includes("$surfaceUrl = $Url.TrimEnd('/') + '/?surface=jarvis'"))
+  assert.ok(openUi.includes('--app=$surfaceUrl'))
+})
+
+test('only the dedicated surface starts the clap listener, and nothing else does', () => {
+  const app = code('src/App.tsx')
+  const gate = app.indexOf("if (phase !== 'offline' || !isJarvisSurface()) return")
+  const listen = app.indexOf('listenForClap(')
+  assert.ok(gate > 0 && listen > gate && listen - gate < 300, 'the surface check guards the one listener')
+  const calls = ['src/App.tsx', 'src/ui/Ignition.tsx', 'src/lib/voice.ts', 'src/lib/audio.ts'].map((f) => code(f).split('listenForClap(').length - 1)
+  assert.deepEqual(calls, [1, 0, 0, 0])
+})
+
+test('only the surface-marked window can start the workspace', () => {
+  assert.equal(SURFACE_HEADER, 'x-jarvis-surface')
+  const server = code('bridge/server.mjs')
+  const route = server.indexOf("req.url === '/workspace'")
+  const check = server.indexOf("if (req.headers['x-jarvis-surface'] !== 'jarvis') {", route)
+  const start = server.indexOf("workspace.start({ trigger: 'clap' })", route)
+  assert.ok(route > 0 && check > route && start > check, 'the header is checked before the workspace starts')
+  assert.ok(server.slice(check, start).includes('res.writeHead(403'))
 })

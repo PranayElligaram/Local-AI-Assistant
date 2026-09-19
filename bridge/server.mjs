@@ -105,7 +105,7 @@ const originAllowed = (origin) =>
 /** How this bridge was started: jarvis.ps1 -Source logon marks the logon task. */
 const START_SOURCE = process.env.JARVIS_START_SOURCE === 'logon' ? 'logon' : 'manual'
 /** The dormant interface, which has no WebSocket yet: see POST /readiness. */
-const page = { lastSeenAt: 0, readiness: null }
+const page = { lastSeenAt: 0, readiness: null, refusedWorkspace: 0 }
 
 const stats = {
   startedAt: Date.now(),
@@ -137,6 +137,7 @@ const VOICE_STATES = new Set(['OFF', 'WAKE_LISTENING', 'COMMAND_LISTENING', 'TRA
  */
 export function sanitizeReadiness(msg) {
   const pickOf = (v, allowed) => (allowed.includes(v) ? v : 'unknown')
+  const level = (v) => (Number.isFinite(v) && v >= 0 && v <= 1 ? Math.round(v * 10000) / 10000 : 0)
   const clapListening = msg?.clapListening === true
   const audioState = pickOf(msg?.audioState, ['running', 'suspended', 'closed'])
   return {
@@ -145,6 +146,11 @@ export function sanitizeReadiness(msg) {
     audioState,
     micPermission: pickOf(msg?.micPermission, ['granted', 'prompt', 'denied']),
     webgl: msg?.webgl === true,
+    // The last clap the page accepted, to tell a real one from a false trigger.
+    claps: Number.isSafeInteger(msg?.claps) && msg.claps >= 0 ? msg.claps : 0,
+    lastClapAfterArmMs: Number.isSafeInteger(msg?.lastClapAfterArmMs) && msg.lastClapAfterArmMs >= 0 ? msg.lastClapAfterArmMs : 0,
+    lastPeak: level(msg?.lastPeak),
+    floorAtClap: level(msg?.floorAtClap),
     reportedAt: Date.now(),
   }
 }
@@ -394,7 +400,7 @@ function corsFor(req) {
   const headers = { vary: 'origin' }
   if (origin) {
     headers['access-control-allow-origin'] = origin
-    headers['access-control-allow-headers'] = 'content-type'
+    headers['access-control-allow-headers'] = 'content-type, x-jarvis-surface'
   }
   return headers
 }
@@ -464,6 +470,14 @@ const handleRequest = async (req, res) => {
    * workspace.mjs, and a second clap while one is running is dropped there.
    */
   if (req.method === 'POST' && req.url === '/workspace') {
+    // Only the dedicated JARVIS window (?surface=jarvis) listens for claps and
+    // says so. Not a security boundary - the targets are fixed either way - but
+    // a stray listener anywhere else must not be able to start the workspace.
+    if (req.headers['x-jarvis-surface'] !== 'jarvis') {
+      page.refusedWorkspace++
+      res.writeHead(403, cors)
+      return res.end('only the JARVIS window starts the workspace')
+    }
     page.lastSeenAt = Date.now()
     const r = await workspace.start({ trigger: 'clap' })
     res.writeHead(r.suppressed ? 409 : 200, { ...cors, 'content-type': 'application/json' })
@@ -556,6 +570,7 @@ const handleRequest = async (req, res) => {
             runtimeReady: true,
             jarvisWindowReady: browser.jarvisDedicatedWindow,
             clapArmed: page.readiness?.clapArmed ?? false,
+            refusedWorkspaceRequests: page.refusedWorkspace,
             page: page.readiness,
           },
           workspace: workspace.diagnostics(),

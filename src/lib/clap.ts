@@ -56,6 +56,9 @@ export const diag = {
   rejected: '',
   /** The listener's AudioContext. Chrome may hold it 'suspended' until the user interacts; suspended hears nothing. */
   audioState: 'none' as AudioContextState | 'none',
+  /** For the last accepted clap: how long after arming, and the room floor it beat. */
+  lastClapAfterArmMs: 0,
+  floorAtClap: 0,
 }
 
 if (typeof window !== 'undefined') {
@@ -136,6 +139,8 @@ export async function listenForClap(onClap: () => void, onStateChange: () => voi
         lastClap = now
         diag.claps++
         diag.rejected = ''
+        diag.lastClapAfterArmMs = Math.round(now - armedAt)
+        diag.floorAtClap = floor
         onClap()
       } else if (now - candidate.at > GIVE_UP_MS) {
         // Still going. A voice, a chair, music — something with a body to it.

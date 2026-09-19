@@ -278,7 +278,7 @@ test('/readiness decides "armed" itself: a suspended audio context is not armed'
   await post({ clapListening: true, audioState: 'running', micPermission: 'granted', webgl: true, clapArmed: true, extra: 'x' })
   s = await startup()
   assert.equal(s.clapArmed, true)
-  assert.deepEqual(Object.keys(s.page).sort(), ['audioState', 'clapArmed', 'clapListening', 'micPermission', 'reportedAt', 'webgl'])
+  assert.deepEqual(Object.keys(s.page).sort(), ['audioState', 'clapArmed', 'clapListening', 'claps', 'floorAtClap', 'lastClapAfterArmMs', 'lastPeak', 'micPermission', 'reportedAt', 'webgl'])
 
   // The page's own claim is ignored; only the parts count.
   await post({ clapListening: false, audioState: 'running', clapArmed: true })
@@ -295,13 +295,17 @@ test('/diagnostics reports the start source, runtime and browser windows', async
 })
 
 test('POST /workspace runs the one orchestrator (a dry run here: nothing opens or moves)', { timeout: 60000 }, async () => {
-  const res = await fetch(`${BASE}/workspace`, { method: 'POST', headers: { origin: ALLOWED } })
+  const plain = await fetch(`${BASE}/workspace`, { method: 'POST', headers: { origin: ALLOWED } })
+  assert.equal(plain.status, 403, 'a page without the JARVIS surface marker cannot start it')
+  const res = await fetch(`${BASE}/workspace`, { method: 'POST', headers: { origin: ALLOWED, 'x-jarvis-surface': 'jarvis' } })
   const body = await res.json()
   assert.equal(res.status, 200)
   assert.deepEqual(Object.keys(body.components).sort(), ['chrome', 'claudeCode', 'claudeDesktop', 'jarvis'])
   for (const c of Object.values(body.components)) assert.ok(['reused', 'dry run'].includes(c.action), c.action)
   const d = await (await fetch(`${BASE}/diagnostics`)).json()
   assert.equal(d.workspace.lastTrigger, 'clap')
+  assert.equal(d.workspace.launches, 1)
+  assert.equal(d.startup.refusedWorkspaceRequests, 1)
 })
 
 test('a second bridge on the same port refuses to start, and says why', async () => {
