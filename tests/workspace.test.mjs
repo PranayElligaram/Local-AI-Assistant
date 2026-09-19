@@ -22,7 +22,8 @@ import {
   findGitBash,
 } from '../bridge/workspace.mjs'
 
-const IMPROMPTU = 'C:\\Users\\prana\\dev\\src\\Impromptu\\Website'
+const IMPROMPTU = 'C:\\Users\\prana\\dev\\src\\Impromptu'
+const WEBSITE_REPO = 'C:\\Users\\prana\\dev\\src\\Impromptu\\Website'
 const JARVIS_ROOT = resolve(import.meta.dirname, '..')
 
 const mon = (x, y, width, height, primary = false) => ({ x, y, width, height, primary, work: { x, y, width, height: height - 48 } })
@@ -109,6 +110,7 @@ test('with fewer than three monitors the missing ones fall back to the primary',
 
 test('the Claude Code terminal is Git Bash in Impromptu running exactly "claude"', () => {
   assert.equal(WORKSPACE.claudeCode.cwd, IMPROMPTU)
+  assert.notEqual(WORKSPACE.claudeCode.cwd, WEBSITE_REPO)
   assert.equal(WORKSPACE.claudeCode.command, 'claude')
   assert.notEqual(WORKSPACE.claudeCode.cwd.toLowerCase(), JARVIS_ROOT.toLowerCase())
   assert.ok(!WORKSPACE.claudeCode.cwd.toLowerCase().includes('jarvis'))

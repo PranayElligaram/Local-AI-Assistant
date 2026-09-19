@@ -3,7 +3,8 @@
  *
  *   monitor 1   the JARVIS interface
  *   monitor 2   the Claude desktop app
- *   monitor 3   Git Bash running Claude Code in the Impromptu website repo
+ *   monitor 3   Git Bash running Claude Code in the Impromptu workspace folder
+ *               (the parent of its repos; Claude picks the repo from the prompt)
  *
  * Everything that is started here is fixed, trusted configuration in this
  * file. Nothing reaches it from the model or from a spoken sentence: start()
@@ -31,7 +32,7 @@ const OPEN_UI_SCRIPT = join(ROOT, 'scripts', 'open-ui.ps1')
 export const WORKSPACE = Object.freeze({
   claudeDesktop: Object.freeze({ appName: 'Claude' }),
   claudeCode: Object.freeze({
-    cwd: 'C:\\Users\\prana\\dev\\src\\Impromptu\\Website',
+    cwd: 'C:\\Users\\prana\\dev\\src\\Impromptu',
     command: 'claude',
     title: 'Impromptu Claude Code',
     // mintty's window class. Unlike the title, a program running inside the
