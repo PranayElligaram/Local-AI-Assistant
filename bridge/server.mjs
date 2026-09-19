@@ -102,6 +102,11 @@ const originAllowed = (origin) =>
  * off a page. Nothing here holds a transcript, a key or a spoken line: only
  * counts, timestamps, and error CATEGORIES.
  */
+/** How this bridge was started: jarvis.ps1 -Source logon marks the logon task. */
+const START_SOURCE = process.env.JARVIS_START_SOURCE === 'logon' ? 'logon' : 'manual'
+/** The dormant interface, which has no WebSocket yet: see POST /readiness. */
+const page = { lastSeenAt: 0, readiness: null }
+
 const stats = {
   startedAt: Date.now(),
   clients: 0,
@@ -122,6 +127,27 @@ const stats = {
 }
 
 const VOICE_STATES = new Set(['OFF', 'WAKE_LISTENING', 'COMMAND_LISTENING', 'TRANSCRIBING', 'THINKING', 'SPEAKING', 'REARMING'])
+
+/**
+ * The dormant interface's own account of whether a clap would be heard. The
+ * WebSocket only opens on power-on, so this arrives over HTTP. "Armed" is
+ * decided here, from the parts, not taken from the page: the listener has to
+ * be running AND its audio context has to be running - Chrome can hold a
+ * context suspended until the user interacts, and a suspended one hears nothing.
+ */
+export function sanitizeReadiness(msg) {
+  const pickOf = (v, allowed) => (allowed.includes(v) ? v : 'unknown')
+  const clapListening = msg?.clapListening === true
+  const audioState = pickOf(msg?.audioState, ['running', 'suspended', 'closed'])
+  return {
+    clapArmed: clapListening && audioState === 'running',
+    clapListening,
+    audioState,
+    micPermission: pickOf(msg?.micPermission, ['granted', 'prompt', 'denied']),
+    webgl: msg?.webgl === true,
+    reportedAt: Date.now(),
+  }
+}
 
 /** Whitelist the page's voice report: no transcript text crosses this line. */
 export function sanitizeVoiceReport(msg) {
@@ -438,14 +464,37 @@ const handleRequest = async (req, res) => {
    * workspace.mjs, and a second clap while one is running is dropped there.
    */
   if (req.method === 'POST' && req.url === '/workspace') {
+    page.lastSeenAt = Date.now()
     const r = await workspace.start({ trigger: 'clap' })
     res.writeHead(r.suppressed ? 409 : 200, { ...cors, 'content-type': 'application/json' })
     return res.end(JSON.stringify({ ok: r.ok, suppressed: Boolean(r.suppressed), components: r.data ?? null }))
   }
 
+  if (req.method === 'POST' && req.url === '/readiness') {
+    let body = ''
+    for await (const chunk of req) {
+      body += chunk
+      if (body.length > 1024) {
+        req.destroy()
+        return
+      }
+    }
+    let msg = null
+    try {
+      msg = JSON.parse(body)
+    } catch {
+      /* an empty report is still a report: everything reads as not ready */
+    }
+    page.lastSeenAt = Date.now()
+    page.readiness = sanitizeReadiness(msg)
+    res.writeHead(204, cors)
+    return res.end()
+  }
+
   if (req.method === 'GET' && req.url === '/diagnostics') {
     const health = await checkBrain()
     const b = brain.diagnostics()
+    const browser = await workspace.inspectBrowsers()
     const apps = catalogue.status()
     res.writeHead(200, { ...cors, 'content-type': 'application/json' })
     return res.end(
@@ -502,7 +551,15 @@ const handleRequest = async (req, res) => {
             resolutionMethod: tools.state.app.method,
             lastLaunch: tools.state.app.launch,
           },
+          startup: {
+            source: START_SOURCE,
+            runtimeReady: true,
+            jarvisWindowReady: browser.jarvisDedicatedWindow,
+            clapArmed: page.readiness?.clapArmed ?? false,
+            page: page.readiness,
+          },
           workspace: workspace.diagnostics(),
+          browser,
           speech: {
             elevenlabsConfigured: Boolean(elevenKey()),
             // A key that exists but has been refused: the difference between
@@ -988,7 +1045,8 @@ const workspace = createWorkspace({
   dryRun: LAUNCH_DRY_RUN,
   launchers: defaultLaunchers({
     catalogue,
-    interfaceConnected: () => stats.clients > 0,
+    // A dormant interface has no socket yet, but it reports in over HTTP.
+    interfaceConnected: () => stats.clients > 0 || Date.now() - page.lastSeenAt < 5 * 60_000,
     env: Object.fromEntries(Object.entries(process.env).filter(([k]) => !projectKeys.has(k))),
   }),
 })

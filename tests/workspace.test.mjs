@@ -19,6 +19,7 @@ import {
   createWorkspace,
   defaultLaunchers,
   destination,
+  findChrome,
   findGitBash,
 } from '../bridge/workspace.mjs'
 
@@ -33,10 +34,14 @@ const PRIMARY = mon(0, 0, 1920, 1080, true)
 const RIGHT = mon(1920, 0, 1920, 1080)
 
 const WINDOWS = {
-  jarvis: { hwnd: 11, process: 'chrome', className: 'Chrome_WidgetWin_1', title: 'J.A.R.V.I.S. - Google Chrome' },
+  // The dedicated --app window: the page title and nothing else.
+  jarvis: { hwnd: 11, process: 'chrome', className: 'Chrome_WidgetWin_1', title: 'J.A.R.V.I.S.' },
   claudeDesktop: { hwnd: 22, process: 'claude', className: 'Chrome_WidgetWin_1', title: 'Claude' },
   claudeCode: { hwnd: 33, process: 'mintty', className: WORKSPACE.claudeCode.windowClass, title: 'Impromptu Claude Code' },
+  chrome: { hwnd: 44, process: 'chrome', className: 'Chrome_WidgetWin_1', title: 'New Tab - Google Chrome' },
 }
+// The same page in an ordinary tab: a browsing window, not JARVIS's own.
+const JARVIS_IN_A_TAB = { hwnd: 55, process: 'chrome', className: 'Chrome_WidgetWin_1', title: 'J.A.R.V.I.S. - Google Chrome' }
 
 function fakeDesktop({ monitors = [PRIMARY, RIGHT, LAPTOP], windows = [], placeFails = [] } = {}) {
   const d = {
@@ -56,7 +61,7 @@ function fakeDesktop({ monitors = [PRIMARY, RIGHT, LAPTOP], windows = [], placeF
 
 /** Launchers that "open" a window, recording what they were called with. */
 function fakeLaunchers(desktop, { fail = {} } = {}) {
-  const calls = { jarvis: [], claudeDesktop: [], claudeCode: [] }
+  const calls = { jarvis: [], claudeDesktop: [], claudeCode: [], chrome: [] }
   const make = (id) => async (...args) => {
     calls[id].push(args)
     if (fail[id] === 'throw') throw new Error(`${id} exploded`)
@@ -64,7 +69,7 @@ function fakeLaunchers(desktop, { fail = {} } = {}) {
     desktop.windows.push(WINDOWS[id])
     return { ok: true }
   }
-  return { calls, launchers: { jarvis: make('jarvis'), claudeDesktop: make('claudeDesktop'), claudeCode: make('claudeCode') } }
+  return { calls, launchers: { jarvis: make('jarvis'), claudeDesktop: make('claudeDesktop'), claudeCode: make('claudeCode'), chrome: make('chrome') } }
 }
 
 const quick = { waitMs: 50, pollMs: 1, sleep: async () => {} }
@@ -188,7 +193,7 @@ test('a cold start launches all three and places each on its own monitor', async
   const ws = createWorkspace({ desktop, launchers, ...quick })
   const r = await ws.start({ trigger: 'clap' })
   assert.equal(r.ok, true)
-  for (const id of ['jarvis', 'claudeDesktop', 'claudeCode']) assert.equal(calls[id].length, 1)
+  for (const id of ['jarvis', 'claudeDesktop', 'claudeCode', 'chrome']) assert.equal(calls[id].length, 1)
   assert.deepEqual(desktop.placed, [
     { hwnd: 11, rect: LAPTOP.work },
     { hwnd: 22, rect: PRIMARY.work },
@@ -208,8 +213,8 @@ test('existing windows are reused and repositioned, never relaunched', async () 
   const ws = createWorkspace({ desktop, launchers, ...quick })
   await ws.start()
   await ws.start()
-  assert.deepEqual([calls.jarvis.length, calls.claudeDesktop.length, calls.claudeCode.length], [0, 0, 0])
-  assert.equal(desktop.windows.length, 3)
+  assert.deepEqual([calls.jarvis.length, calls.claudeDesktop.length, calls.claudeCode.length, calls.chrome.length], [0, 0, 0, 0])
+  assert.equal(desktop.windows.length, 4)
   assert.equal(desktop.placed.length, 6)
   assert.equal(ws.diagnostics().components.claudeDesktop.action, 'reused')
 })
@@ -253,7 +258,7 @@ test('a failed placement leaves the window open and is recorded', async () => {
 
 test('a window that never appears is a bounded wait, not a hang', async () => {
   const desktop = fakeDesktop()
-  const launchers = { jarvis: async () => ({ ok: true }), claudeDesktop: async () => ({ ok: true }), claudeCode: async () => ({ ok: true }) }
+  const launchers = { jarvis: async () => ({ ok: true }), claudeDesktop: async () => ({ ok: true }), claudeCode: async () => ({ ok: true }), chrome: async () => ({ ok: true }) }
   let t = 0
   const ws = createWorkspace({ desktop, launchers, waitMs: 5000, pollMs: 1000, now: () => t, sleep: async (ms) => { t += ms } })
   await ws.start()
@@ -309,4 +314,70 @@ test('the model can neither call nor configure the workspace', async () => {
   const withArgs = await tools.execute('start_workspace', { cwd: 'C:\\evil', command: 'calc' }, { origin: 'router' })
   assert.equal(withArgs.rejected, true)
   assert.deepEqual(starts, [])
+})
+
+// --- the dedicated JARVIS window vs normal Chrome ------------------------------
+
+test('the dedicated JARVIS window and a normal Chrome window are told apart', () => {
+  assert.ok(MATCHERS.jarvis(WINDOWS.jarvis))
+  assert.ok(!MATCHERS.chrome(WINDOWS.jarvis))
+  assert.ok(MATCHERS.chrome(WINDOWS.chrome))
+  assert.ok(!MATCHERS.jarvis(WINDOWS.chrome))
+  // JARVIS in an ordinary tab is somebody's browsing window.
+  assert.ok(!MATCHERS.jarvis(JARVIS_IN_A_TAB))
+  assert.ok(MATCHERS.chrome(JARVIS_IN_A_TAB))
+  // Claude desktop (also Chrome_WidgetWin_1) and other --app windows are neither.
+  assert.ok(!MATCHERS.chrome(WINDOWS.claudeDesktop))
+  assert.ok(!MATCHERS.chrome({ process: 'chrome', className: 'Chrome_WidgetWin_1', title: 'YouTube' }))
+})
+
+test('normal Chrome is never picked as JARVIS: with only a tab, JARVIS is not reused', async () => {
+  const desktop = fakeDesktop({ windows: [JARVIS_IN_A_TAB, WINDOWS.claudeDesktop, WINDOWS.claudeCode] })
+  const { calls, launchers } = fakeLaunchers(desktop)
+  const ws = createWorkspace({ desktop, launchers, ...quick })
+  await ws.start()
+  assert.equal(calls.jarvis.length, 1)
+  assert.equal(calls.chrome.length, 0, 'the tab window already is a normal Chrome window')
+  assert.ok(!desktop.placed.some((p) => p.hwnd === JARVIS_IN_A_TAB.hwnd))
+  assert.deepEqual(desktop.placed[0], { hwnd: 11, rect: LAPTOP.work })
+})
+
+test('normal Chrome is opened only when absent, and never moved', async () => {
+  const desktop = fakeDesktop({ windows: [WINDOWS.jarvis, WINDOWS.claudeDesktop, WINDOWS.claudeCode] })
+  const { calls, launchers } = fakeLaunchers(desktop)
+  const ws = createWorkspace({ desktop, launchers, ...quick })
+  await ws.start()
+  await ws.start()
+  assert.equal(calls.chrome.length, 1)
+  assert.deepEqual(ws.diagnostics().components.chrome, { target: null, monitor: null, fallback: false, action: 'reused', placement: 'not moved', error: '' })
+  assert.ok(!desktop.placed.some((p) => p.hwnd === WINDOWS.chrome.hwnd))
+})
+
+test('normal Chrome launches with no arguments: no URL, no profile, no incognito', async () => {
+  const { spawned, spawnFn } = fakeSpawn()
+  const r = await defaultLaunchers({ catalogue: {}, spawnFn }).chrome()
+  if (!findChrome()) return assert.equal(r.ok, false)
+  assert.equal(r.ok, true)
+  assert.match(spawned[0].file, /chrome\.exe$/i)
+  assert.deepEqual(spawned[0].args, [])
+})
+
+test('Chrome is looked for in its install folders only', () => {
+  const exe = 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe'
+  assert.equal(findChrome({ ProgramFiles: 'C:\\Program Files' }, (p) => p === exe), exe)
+  assert.equal(findChrome({ ProgramFiles: 'C:\\Program Files' }, () => false), null)
+})
+
+test('browser inspection reports the dedicated window and normal Chrome, cached', async () => {
+  let snaps = 0
+  const desktop = fakeDesktop({ windows: [JARVIS_IN_A_TAB] })
+  const counted = { ...desktop, snapshot: async () => (snaps++, desktop.snapshot()) }
+  let t = 0
+  const ws = createWorkspace({ desktop: counted, launchers: {}, now: () => t })
+  assert.deepEqual(await ws.inspectBrowsers(), { jarvisDedicatedWindow: false, normalChromePresent: true, error: '' })
+  desktop.windows.push(WINDOWS.jarvis)
+  await ws.inspectBrowsers()
+  assert.equal(snaps, 1)
+  t = 60000
+  assert.equal((await ws.inspectBrowsers()).jarvisDedicatedWindow, true)
 })

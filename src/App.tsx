@@ -12,7 +12,7 @@ import { createSpeaker, cycleVoice, currentVoiceName } from './lib/tts'
 import * as sfx from './lib/sfx'
 import * as music from './lib/music'
 import * as hands from './lib/hands'
-import { listenForClap } from './lib/clap'
+import { listenForClap, diag as clapDiag } from './lib/clap'
 import * as camera from './lib/camera'
 import * as kokoro from './lib/kokoro'
 import { BRIDGE_HTTP_URL, TTS_ENGINE } from './config'
@@ -53,6 +53,28 @@ const AWAIT_SPEECH_MS = 14000
  *  coming online, short enough not to feel like a loading screen; the real
  *  checks run underneath it and usually finish first. */
 const BOOT_MIN_MS = 4200
+
+/**
+ * Tell the bridge, while dormant, whether a clap would actually be heard: the
+ * facts only, and the bridge decides what "armed" means. Sent when the clap
+ * listener starts and whenever its audio context changes state; never polled.
+ */
+async function reportReadiness(): Promise<void> {
+  let micPermission = 'unknown'
+  try {
+    micPermission = (await navigator.permissions.query({ name: 'microphone' as PermissionName })).state
+  } catch {
+    /* not every browser will say */
+  }
+  let webgl = false
+  try {
+    webgl = Boolean(document.createElement('canvas').getContext('webgl2'))
+  } catch {
+    /* reported as false */
+  }
+  const body = JSON.stringify({ clapListening: clapDiag.listening, audioState: clapDiag.audioState, micPermission, webgl })
+  await fetch(`${BRIDGE_HTTP_URL}/readiness`, { method: 'POST', headers: { 'content-type': 'application/json' }, body }).catch(() => {})
+}
 
 /** Whether the local model answers, for the boot check. Read-only and bounded:
  *  a slow bridge marks the step as a warning rather than holding boot up. */
@@ -592,13 +614,19 @@ export default function App() {
       // The clap also lays out the development workspace. Fire and forget:
       // the bridge owns what opens and where, and drops an overlapping request.
       void fetch(`${BRIDGE_HTTP_URL}/workspace`, { method: 'POST' }).catch(() => {})
+    }, () => {
+      if (!gone) void reportReadiness()
     }).then((l) => {
       if (gone) l.stop()
       else live = l
+      void reportReadiness()
     })
     return () => {
       gone = true
       live?.stop()
+      // No longer listening for a clap: say so, or diagnostics would go on
+      // calling an awake JARVIS "armed".
+      void reportReadiness()
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [phase])

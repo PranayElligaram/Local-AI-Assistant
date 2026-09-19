@@ -19,6 +19,9 @@
     1-based monitor to place that window on, left to right, then top to bottom.
     Carried over from the previous implementation's placement behaviour.
 
+.PARAMETER Source
+    Who started JARVIS, for diagnostics: 'manual' (default) or 'logon', which
+    the logon task passes. It changes nothing about what starts.
 .PARAMETER Fullscreen
     Open the window filling the chosen monitor's work area.
 
@@ -30,7 +33,8 @@ param(
     [switch] $Writes,
     [switch] $Open,
     [int] $Monitor = 0,
-    [switch] $Fullscreen
+    [switch] $Fullscreen,
+    [ValidateSet('manual', 'logon')] [string] $Source = 'manual'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -54,6 +58,9 @@ Write-Host "JARVIS: using $node" -ForegroundColor DarkCyan
 if (-not (Test-Path -LiteralPath (Join-Path $repo 'node_modules'))) {
     throw "Dependencies are not installed. Run `npm ci` in $repo first."
 }
+
+# Read by the bridge through start.mjs's inherited environment.
+$env:JARVIS_START_SOURCE = $Source
 
 $startArgs = @((Join-Path $repo 'scripts\start.mjs'))
 if ($Writes) { $startArgs += '--writes' }

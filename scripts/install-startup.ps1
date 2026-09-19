@@ -35,7 +35,7 @@ if (-not (Test-Path -LiteralPath $launcher -PathType Leaf)) {
     throw "The JARVIS launcher was not found: $launcher"
 }
 
-$launcherArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$launcher`"")
+$launcherArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$launcher`"", '-Source', 'logon')
 if ($Open) { $launcherArgs += '-Open' }
 if ($Monitor -gt 0) { $launcherArgs += @('-Monitor', $Monitor) }
 if ($Fullscreen) { $launcherArgs += '-Fullscreen' }

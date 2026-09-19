@@ -265,6 +265,45 @@ test('the media proxy refuses a private address', async () => {
   assert.ok(res.status >= 400, 'cloud metadata must never be proxied')
 })
 
+test('/readiness decides "armed" itself: a suspended audio context is not armed', async () => {
+  const post = (body) =>
+    fetch(`${BASE}/readiness`, { method: 'POST', headers: { origin: ALLOWED, 'content-type': 'application/json' }, body: JSON.stringify(body) })
+  const startup = async () => (await (await fetch(`${BASE}/diagnostics`)).json()).startup
+
+  assert.equal((await post({ clapListening: true, audioState: 'suspended', micPermission: 'granted', webgl: true })).status, 204)
+  let s = await startup()
+  assert.equal(s.clapArmed, false)
+  assert.equal(s.page.audioState, 'suspended')
+
+  await post({ clapListening: true, audioState: 'running', micPermission: 'granted', webgl: true, clapArmed: true, extra: 'x' })
+  s = await startup()
+  assert.equal(s.clapArmed, true)
+  assert.deepEqual(Object.keys(s.page).sort(), ['audioState', 'clapArmed', 'clapListening', 'micPermission', 'reportedAt', 'webgl'])
+
+  // The page's own claim is ignored; only the parts count.
+  await post({ clapListening: false, audioState: 'running', clapArmed: true })
+  assert.equal((await startup()).clapArmed, false)
+})
+
+test('/diagnostics reports the start source, runtime and browser windows', async () => {
+  const d = await (await fetch(`${BASE}/diagnostics`)).json()
+  assert.equal(d.startup.source, 'manual')
+  assert.equal(d.startup.runtimeReady, true)
+  assert.ok('jarvisWindowReady' in d.startup)
+  assert.ok('jarvisDedicatedWindow' in d.browser && 'normalChromePresent' in d.browser)
+  assert.deepEqual(d.workspace.targets, { jarvis: 1, claudeDesktop: 2, claudeCode: 3 })
+})
+
+test('POST /workspace runs the one orchestrator (a dry run here: nothing opens or moves)', { timeout: 60000 }, async () => {
+  const res = await fetch(`${BASE}/workspace`, { method: 'POST', headers: { origin: ALLOWED } })
+  const body = await res.json()
+  assert.equal(res.status, 200)
+  assert.deepEqual(Object.keys(body.components).sort(), ['chrome', 'claudeCode', 'claudeDesktop', 'jarvis'])
+  for (const c of Object.values(body.components)) assert.ok(['reused', 'dry run'].includes(c.action), c.action)
+  const d = await (await fetch(`${BASE}/diagnostics`)).json()
+  assert.equal(d.workspace.lastTrigger, 'clap')
+})
+
 test('a second bridge on the same port refuses to start, and says why', async () => {
   const second = spawn(process.execPath, ['bridge/server.mjs'], {
     cwd: ROOT,

@@ -5,6 +5,10 @@
  *   monitor 2   the Claude desktop app
  *   monitor 3   Git Bash running Claude Code in the Impromptu workspace folder
  *               (the parent of its repos; Claude picks the repo from the prompt)
+ *   and         an ordinary Chrome browsing window, if none is open
+ *
+ * This is the clap phase only. Logon starts nothing but JARVIS itself
+ * (install-startup.ps1 -> jarvis.ps1 -> open-ui.ps1).
  *
  * Everything that is started here is fixed, trusted configuration in this
  * file. Nothing reaches it from the model or from a spoken sentence: start()
@@ -66,17 +70,32 @@ export function destination(monitors, index) {
 // --- windows -----------------------------------------------------------------
 
 const BROWSERS = /^(?:chrome|msedge)$/i
+/** index.html's <title>. */
+const JARVIS_TITLE = 'J.A.R.V.I.S.'
 
 /** How each component's window is recognised in a snapshot. */
 export const MATCHERS = {
-  jarvis: (w) => BROWSERS.test(w.process) && w.title.startsWith('J.A.R.V.I.S.'),
+  // The dedicated --app window (open-ui.ps1) is titled by the page alone. A
+  // normal browser window showing the same page in a tab carries the browser's
+  // suffix, and is somebody's browsing window, not JARVIS's own.
+  jarvis: (w) => BROWSERS.test(w.process) && w.title === JARVIS_TITLE,
+  // An ordinary Chrome browsing window: --app windows have no suffix.
+  chrome: (w) => /^chrome$/i.test(w.process) && w.className === 'Chrome_WidgetWin_1' && w.title.endsWith(' - Google Chrome'),
   // Electron's main window. The Claude Code CLI is claude.exe too, but it never
   // owns a Chrome_WidgetWin_1 window.
   claudeDesktop: (w) => /^claude$/i.test(w.process) && w.className === 'Chrome_WidgetWin_1',
   claudeCode: (w) => w.className === WORKSPACE.claudeCode.windowClass,
 }
 
-// --- Git Bash ----------------------------------------------------------------
+// --- programs ----------------------------------------------------------------
+
+/** Google Chrome, from the same places open-ui.ps1 looks. */
+export function findChrome(env = process.env, exists = existsSync) {
+  const candidates = [env.ProgramFiles, env['ProgramFiles(x86)'], env.LOCALAPPDATA]
+    .filter(Boolean)
+    .map((base) => win32.join(base, 'Google', 'Chrome', 'Application', 'chrome.exe'))
+  return candidates.find((p) => exists(p)) ?? null
+}
 
 /** Git for Windows' own terminal and shell, from the usual install locations. */
 export function findGitBash(env = process.env, exists = existsSync) {
@@ -190,13 +209,22 @@ export function defaultLaunchers({ catalogue, interfaceConnected = () => false, 
       const [file, args, childEnv] = claudeCodeCommand(git, env)
       return spawnDetached(file, args, { cwd: WORKSPACE.claudeCode.cwd, env: childEnv, windowsHide: false }, spawnFn)
     },
+    async chrome() {
+      // No arguments: the user's own profile, and Chrome's own idea of which
+      // tabs a new window starts with.
+      const chrome = findChrome()
+      if (!chrome) return { ok: false, error: 'Google Chrome is not installed' }
+      return spawnDetached(chrome, [], {}, spawnFn)
+    },
   }
 }
 
 // --- orchestration -------------------------------------------------------------
 
-const COMPONENTS = ['jarvis', 'claudeDesktop', 'claudeCode']
-const LABELS = { jarvis: 'JARVIS', claudeDesktop: 'Claude', claudeCode: 'Claude Code' }
+// Normal Chrome only has to exist; it keeps whatever position Chrome gives it.
+const COMPONENTS = ['jarvis', 'claudeDesktop', 'claudeCode', 'chrome']
+const LABELS = { jarvis: 'JARVIS', claudeDesktop: 'Claude', claudeCode: 'Claude Code', chrome: 'Chrome' }
+const UNPLACED = { monitor: null, fallback: false, rect: null }
 
 /**
  * @param {object} deps
@@ -213,6 +241,7 @@ export function createWorkspace({
   now = Date.now,
   sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
 }) {
+  const browserCache = { at: -Infinity, value: null }
   const diag = {
     monitors: { count: 0, primary: null, error: '' },
     targets: { ...MONITOR_MAP },
@@ -243,7 +272,7 @@ export function createWorkspace({
 
     const results = {}
     for (const id of COMPONENTS) {
-      const dest = destination(monitors, MONITOR_MAP[id])
+      const dest = id in MONITOR_MAP ? destination(monitors, MONITOR_MAP[id]) : UNPLACED
       const found = pick(snap.windows, id)
       const r = (results[id] = { action: found ? 'reused' : '', hwnd: found?.hwnd ?? null, monitor: dest.monitor, fallback: dest.fallback, rect: dest.rect, placement: '', error: '' })
       if (found) continue
@@ -269,6 +298,7 @@ export function createWorkspace({
     for (const id of COMPONENTS) {
       const r = results[id]
       if (!r.hwnd) r.placement = r.action === 'launched' ? 'window not found in time' : 'skipped'
+      else if (!(id in MONITOR_MAP)) r.placement = 'not moved'
       else if (dryRun) r.placement = 'dry run'
       else if (!r.rect) r.placement = 'no monitor information'
       else {
@@ -280,10 +310,10 @@ export function createWorkspace({
     diag.components = Object.fromEntries(
       COMPONENTS.map((id) => {
         const { action, monitor, fallback, placement, error } = results[id]
-        return [id, { target: MONITOR_MAP[id], monitor, fallback, action, placement, error }]
+        return [id, { target: MONITOR_MAP[id] ?? null, monitor, fallback, action, placement, error }]
       }),
     )
-    const trouble = COMPONENTS.filter((id) => results[id].action === 'failed' || !['placed', 'dry run'].includes(results[id].placement))
+    const trouble = COMPONENTS.filter((id) => results[id].action === 'failed' || !['placed', 'dry run', 'not moved'].includes(results[id].placement))
     diag.lastResult = trouble.length ? `issues: ${trouble.join(', ')}` : 'ok'
     console.log(`[jarvis] workspace (${trigger}) -> ${diag.lastResult}`)
     return {
@@ -308,5 +338,15 @@ export function createWorkspace({
       return inFlight
     },
     diagnostics: () => diag,
+    /** Is the dedicated JARVIS window up, and is there a normal Chrome? Cached: it costs a snapshot. */
+    async inspectBrowsers(maxAgeMs = 30000) {
+      if (now() - browserCache.at < maxAgeMs) return browserCache.value
+      const snap = await snapshot()
+      browserCache.at = now()
+      browserCache.value = snap.error
+        ? { jarvisDedicatedWindow: null, normalChromePresent: null, error: snap.error }
+        : { jarvisDedicatedWindow: Boolean(pick(snap.windows, 'jarvis')), normalChromePresent: Boolean(pick(snap.windows, 'chrome')), error: '' }
+      return browserCache.value
+    },
   }
 }

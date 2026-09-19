@@ -38,6 +38,14 @@ const GIVE_UP_MS = 260
 
 /** Nothing counts for this long after a clap, so one strike is one event. */
 const COOLDOWN_MS = 1200
+/**
+ * Deaf for this long after the microphone opens. Opening a capture - this one,
+ * or another page's - can put a click on the line, and one did trigger a
+ * "clap" 0.3 s after arming. A clap now starts the whole workspace, so the
+ * start-up transient must not count. The floor still learns the room meanwhile;
+ * no threshold changes.
+ */
+const SETTLE_MS = 2000
 
 export type ClapListener = { stop: () => void }
 
@@ -46,6 +54,8 @@ export const diag = {
   claps: 0,
   lastPeak: 0,
   rejected: '',
+  /** The listener's AudioContext. Chrome may hold it 'suspended' until the user interacts; suspended hears nothing. */
+  audioState: 'none' as AudioContextState | 'none',
 }
 
 if (typeof window !== 'undefined') {
@@ -60,7 +70,7 @@ if (typeof window !== 'undefined') {
  * button, not a requirement, and an interface that reports an error about a
  * feature the user never asked for is worse than one that quietly does without.
  */
-export async function listenForClap(onClap: () => void): Promise<ClapListener> {
+export async function listenForClap(onClap: () => void, onStateChange: () => void = () => {}): Promise<ClapListener> {
   let stream: MediaStream
   try {
     stream = await getMic()
@@ -70,6 +80,11 @@ export async function listenForClap(onClap: () => void): Promise<ClapListener> {
   }
 
   const ctx = new AudioContext()
+  diag.audioState = ctx.state
+  ctx.onstatechange = () => {
+    diag.audioState = ctx.state
+    onStateChange()
+  }
   void ctx.resume()
   const source = ctx.createMediaStreamSource(stream)
   const analyser = ctx.createAnalyser()
@@ -112,6 +127,8 @@ export async function listenForClap(onClap: () => void): Promise<ClapListener> {
       floor = Math.max(floor, 0.002)
     }
 
+    if (now - armedAt < SETTLE_MS) return
+
     if (candidate) {
       if (level < candidate.peak * DECAY_TO && now - candidate.at < DECAY_MS) {
         // Quiet before, instant rise, immediate collapse. That is a clap.
@@ -145,6 +162,7 @@ export async function listenForClap(onClap: () => void): Promise<ClapListener> {
     candidate = { at: now, peak: level }
   }
 
+  const armedAt = performance.now()
   tick()
   diag.listening = true
 

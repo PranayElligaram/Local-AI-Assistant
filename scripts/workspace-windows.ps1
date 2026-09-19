@@ -1,7 +1,7 @@
 <#
 .SYNOPSIS
     The Win32 half of the development workspace: list displays and windows, or
-    place one window. Called only by bridge/workspace.mjs.
+    place one window. Called by bridge/workspace.mjs and scripts/open-ui.ps1.
 
 .DESCRIPTION
     Two fixed operations and nothing else - no program is started from here:
@@ -25,6 +25,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+if (-not ('JarvisWorkspaceWin' -as [type])) {
 Add-Type -TypeDefinition @'
 using System;
 using System.Collections.Generic;
@@ -81,6 +82,7 @@ public static class JarvisWorkspaceWin {
     public static string Class(IntPtr h) { var s = new StringBuilder(256); GetClassName(h, s, s.Capacity); return s.ToString(); }
 }
 '@
+}
 
 # PER_MONITOR_AWARE_V2. Fails harmlessly if the process is already aware.
 [void][JarvisWorkspaceWin]::SetProcessDpiAwarenessContext([IntPtr](-4))
