@@ -44,6 +44,7 @@ import { originAllowed as allowOrigin } from './policy.mjs'
 import { SYSTEM_PROMPT, createBrain } from './brain/index.mjs'
 import { AppCatalogue } from './apps/catalog.mjs'
 import { createTools } from './tools.mjs'
+import { createWorkspace, defaultLaunchers } from './workspace.mjs'
 import { createConversation, createMetrics } from './assistant.mjs'
 
 /**
@@ -432,6 +433,16 @@ const handleRequest = async (req, res) => {
     return
   }
 
+  /**
+   * The clap. Takes no body: what starts, where it goes, is fixed in
+   * workspace.mjs, and a second clap while one is running is dropped there.
+   */
+  if (req.method === 'POST' && req.url === '/workspace') {
+    const r = await workspace.start({ trigger: 'clap' })
+    res.writeHead(r.suppressed ? 409 : 200, { ...cors, 'content-type': 'application/json' })
+    return res.end(JSON.stringify({ ok: r.ok, suppressed: Boolean(r.suppressed), components: r.data ?? null }))
+  }
+
   if (req.method === 'GET' && req.url === '/diagnostics') {
     const health = await checkBrain()
     const b = brain.diagnostics()
@@ -491,6 +502,7 @@ const handleRequest = async (req, res) => {
             resolutionMethod: tools.state.app.method,
             lastLaunch: tools.state.app.launch,
           },
+          workspace: workspace.diagnostics(),
           speech: {
             elevenlabsConfigured: Boolean(elevenKey()),
             // A key that exists but has been refused: the difference between
@@ -966,8 +978,24 @@ const lifecycle = {
   stop: () => setTimeout(() => shutdown('a stop request'), 3000).unref(),
 }
 
+/**
+ * The clap-started development workspace. Its targets are fixed in
+ * workspace.mjs; the terminal it opens does not inherit keys from JARVIS's own
+ * env files.
+ */
+const projectKeys = new Set(ENV_FILES_LOADED.flatMap(({ keys }) => keys))
+const workspace = createWorkspace({
+  dryRun: LAUNCH_DRY_RUN,
+  launchers: defaultLaunchers({
+    catalogue,
+    interfaceConnected: () => stats.clients > 0,
+    env: Object.fromEntries(Object.entries(process.env).filter(([k]) => !projectKeys.has(k))),
+  }),
+})
+
 const tools = createTools({
   catalogue,
+  workspace,
   dryRun: LAUNCH_DRY_RUN,
   allowWrites: ALLOW_WRITES,
   searchEngine: SEARCH_ENGINE,

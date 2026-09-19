@@ -89,6 +89,7 @@ const spokenDate = (d) =>
  * @param {{ restart: () => void, stop: () => void }} [deps.lifecycle]
  * @param {() => Promise<object>} [deps.systemStatus]
  * @param {() => Date} [deps.now]
+ * @param {{ start: (o?: object) => Promise<object> }} [deps.workspace]  bridge/workspace.mjs
  * @param {object} [deps.launcher]      { launchApp, openUrl, signOut } - injectable for tests
  */
 export function createTools(deps) {
@@ -103,6 +104,7 @@ export function createTools(deps) {
     now = () => new Date(),
     launcher = { launchApp, openUrl, signOut },
     routine = DAILY_START_ROUTINE,
+    workspace = { start: async () => ({ ok: false, say: 'The workspace launcher is not available.' }) },
   } = deps
 
   const state = {
@@ -308,6 +310,17 @@ export function createTools(deps) {
         return failed.length
           ? { ok: false, say: `The daily routine finished with an issue: I couldn't open ${listOf(failed)}.`, data: { opened, failed } }
           : { ok: true, say: 'Your daily workspace is ready.', data: { opened, failed } }
+      },
+    },
+    {
+      name: 'start_workspace',
+      description: 'Arrange the fixed development workspace across the monitors.',
+      parameters: { type: 'object', properties: {}, required: [] },
+      permission: 'safe',
+      model: false,
+      run: async () => {
+        const r = await workspace.start({ trigger: 'voice' })
+        return { ok: r.ok, say: r.say, data: r.data }
       },
     },
     {

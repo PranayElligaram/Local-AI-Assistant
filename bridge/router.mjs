@@ -49,6 +49,7 @@ const DIAGNOSTICS = /^(?:(?:show|open|display|run|bring up|pull up)(?: me)? (?:t
 const STATUS = /^(?:(?:system|systems) status|status report|how are (?:your|the) systems|(?:give me a |run a )?systems? check)$/
 const GOOD_MORNING = /^(?:good morning|morning)$/
 const START_TODAY = /^(?:start (?:today|the day|my day)|start my daily routine)$/
+const START_WORKSPACE = /^start (?:my |the )?workspace$/
 const GOOD_NIGHT = /^good night$/
 const CONFIRM_GOOD_NIGHT = /^(?:confirm good night|good night confirmed)$/
 const CANCEL_GOOD_NIGHT = /^(?:cancel good night|cancel (?:the )?sign ?out|don'?t sign (?:me )?out)$/
@@ -121,6 +122,7 @@ export function route(text) {
   const named = normalizeUtterance(original, { keepName: true })
   if (GOOD_MORNING.test(s)) return { tool: 'good_morning', args: {} }
   if (START_TODAY.test(s)) return { tool: 'start_today', args: {} }
+  if (START_WORKSPACE.test(s)) return { tool: 'start_workspace', args: {} }
   if (GOOD_NIGHT.test(s)) return { tool: 'good_night', args: {} }
   if (CONFIRM_GOOD_NIGHT.test(s)) return { tool: 'confirm_good_night', args: {} }
   if (CANCEL_GOOD_NIGHT.test(s)) return { tool: 'cancel_good_night', args: {} }

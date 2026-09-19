@@ -587,7 +587,11 @@ export default function App() {
     let live: { stop: () => void } | null = null
     let gone = false
     void listenForClap(() => {
-      if (!gone) void powerOn()
+      if (gone) return
+      void powerOn()
+      // The clap also lays out the development workspace. Fire and forget:
+      // the bridge owns what opens and where, and drops an overlapping request.
+      void fetch(`${BRIDGE_HTTP_URL}/workspace`, { method: 'POST' }).catch(() => {})
     }).then((l) => {
       if (gone) l.stop()
       else live = l
