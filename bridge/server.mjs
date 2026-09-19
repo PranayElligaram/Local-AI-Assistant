@@ -138,6 +138,7 @@ const VOICE_STATES = new Set(['OFF', 'WAKE_LISTENING', 'COMMAND_LISTENING', 'TRA
 export function sanitizeReadiness(msg) {
   const pickOf = (v, allowed) => (allowed.includes(v) ? v : 'unknown')
   const level = (v) => (Number.isFinite(v) && v >= 0 && v <= 1 ? Math.round(v * 10000) / 10000 : 0)
+  const count = (v) => (Number.isSafeInteger(v) && v >= 0 ? v : 0)
   const clapListening = msg?.clapListening === true
   const audioState = pickOf(msg?.audioState, ['running', 'suspended', 'closed'])
   return {
@@ -146,9 +147,15 @@ export function sanitizeReadiness(msg) {
     audioState,
     micPermission: pickOf(msg?.micPermission, ['granted', 'prompt', 'denied']),
     webgl: msg?.webgl === true,
-    // The last clap the page accepted, to tell a real one from a false trigger.
-    claps: Number.isSafeInteger(msg?.claps) && msg.claps >= 0 ? msg.claps : 0,
-    lastClapAfterArmMs: Number.isSafeInteger(msg?.lastClapAfterArmMs) && msg.lastClapAfterArmMs >= 0 ? msg.lastClapAfterArmMs : 0,
+    // What the page has heard. rawClaps counts clap-shaped events, which on
+    // their own mean nothing; wakeGestures counts completed two-clap gestures,
+    // and only those start anything.
+    rawClaps: count(msg?.rawClaps),
+    wakeGestures: count(msg?.wakeGestures),
+    pendingFirstClap: msg?.pendingFirstClap === true,
+    lastClapGapMs: count(msg?.lastClapGapMs),
+    lastWakeAfterArmMs: count(msg?.lastWakeAfterArmMs),
+    lastClapAfterArmMs: count(msg?.lastClapAfterArmMs),
     lastPeak: level(msg?.lastPeak),
     floorAtClap: level(msg?.floorAtClap),
     reportedAt: Date.now(),

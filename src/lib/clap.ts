@@ -1,4 +1,5 @@
 import { getMic } from './audio'
+import { createWakeGesture, DOUBLE_CLAP_MIN_MS } from './doubleClap'
 
 /**
  * Clap to wake him up.
@@ -36,7 +37,7 @@ const DECAY_MS = 130
 /** A candidate that has not decayed by now was something sustained. */
 const GIVE_UP_MS = 260
 
-/** Nothing counts for this long after a clap, so one strike is one event. */
+/** Nothing counts for this long after he wakes, so one gesture is one event. */
 const COOLDOWN_MS = 1200
 /**
  * Deaf for this long after the microphone opens. Opening a capture - this one,
@@ -51,14 +52,23 @@ export type ClapListener = { stop: () => void }
 
 export const diag = {
   listening: false,
-  claps: 0,
+  /** Individual clap-shaped events heard. Most of these mean nothing on their own. */
+  rawClaps: 0,
+  /** Completed two-clap wake gestures — the only thing that starts anything. */
+  wakeGestures: 0,
+  /** Is half a gesture in hand, waiting for the second clap. */
+  pendingFirstClap: false,
   lastPeak: 0,
   rejected: '',
   /** The listener's AudioContext. Chrome may hold it 'suspended' until the user interacts; suspended hears nothing. */
   audioState: 'none' as AudioContextState | 'none',
-  /** For the last accepted clap: how long after arming, and the room floor it beat. */
+  /** For the last raw clap: how long after arming, and the room floor it beat. */
   lastClapAfterArmMs: 0,
   floorAtClap: 0,
+  /** Gap between the last two raw claps, whether or not they made a gesture. */
+  lastClapGapMs: 0,
+  /** How long after arming the last completed gesture landed. */
+  lastWakeAfterArmMs: 0,
 }
 
 if (typeof window !== 'undefined') {
@@ -73,7 +83,7 @@ if (typeof window !== 'undefined') {
  * button, not a requirement, and an interface that reports an error about a
  * feature the user never asked for is worse than one that quietly does without.
  */
-export async function listenForClap(onClap: () => void, onStateChange: () => void = () => {}): Promise<ClapListener> {
+export async function listenForClap(onWake: () => void, onStateChange: () => void = () => {}): Promise<ClapListener> {
   let stream: MediaStream
   try {
     stream = await getMic()
@@ -102,7 +112,12 @@ export async function listenForClap(onClap: () => void, onStateChange: () => voi
   let floor = 0.01
   let stopped = false
   let raf = 0
-  let lastClap = 0
+  let lastRawClap = 0
+  let lastWake = 0
+  // Two claps make the gesture; this remembers the first one. It lives with
+  // the listener, so stopping the listener forgets it.
+  const gesture = createWakeGesture(COOLDOWN_MS)
+  diag.pendingFirstClap = false
 
   /** A transient under examination, waiting to prove it decays. */
   let candidate: { at: number; peak: number } | null = null
@@ -134,14 +149,28 @@ export async function listenForClap(onClap: () => void, onStateChange: () => voi
 
     if (candidate) {
       if (level < candidate.peak * DECAY_TO && now - candidate.at < DECAY_MS) {
-        // Quiet before, instant rise, immediate collapse. That is a clap.
+        // Quiet before, instant rise, immediate collapse. That is a clap — an
+        // event, not yet a decision. Two of them in a row are the decision.
+        const at = candidate.at
         candidate = null
-        lastClap = now
-        diag.claps++
+        lastRawClap = now
+        diag.rawClaps++
         diag.rejected = ''
-        diag.lastClapAfterArmMs = Math.round(now - armedAt)
+        diag.lastClapAfterArmMs = Math.round(at - armedAt)
         diag.floorAtClap = floor
-        onClap()
+        const first = gesture.pendingAt
+        const result = gesture.clap(at)
+        if (first !== null) diag.lastClapGapMs = Math.round(at - first)
+        diag.pendingFirstClap = gesture.pendingAt !== null
+        if (result === 'wake') {
+          lastWake = now
+          diag.wakeGestures++
+          diag.lastWakeAfterArmMs = Math.round(at - armedAt)
+          onWake()
+        } else {
+          // Nothing happens, but diagnostics should still show it was heard.
+          onStateChange()
+        }
       } else if (now - candidate.at > GIVE_UP_MS) {
         // Still going. A voice, a chair, music — something with a body to it.
         diag.rejected = 'too sustained to be a clap'
@@ -152,7 +181,18 @@ export async function listenForClap(onClap: () => void, onStateChange: () => voi
       return
     }
 
-    if (now - lastClap < COOLDOWN_MS) return
+    // A first clap whose partner never arrived is not half a gesture any more.
+    // Not while a transient is in flight: it is timed from the strike itself,
+    // which may still be inside the window while it proves it decays.
+    if (gesture.expire(now)) {
+      diag.pendingFirstClap = false
+      onStateChange()
+    }
+
+    if (now - lastWake < COOLDOWN_MS) return
+    // The tail of a clap, or its echo, can look like a fresh strike a few
+    // frames later. One impulse is one clap.
+    if (now - lastRawClap < DOUBLE_CLAP_MIN_MS) return
     if (level < MIN_PEAK || level < floor * PEAK_OVER_FLOOR) return
 
     // Was the room actually quiet a moment ago? A rise out of noise is a swell,
@@ -175,6 +215,8 @@ export async function listenForClap(onClap: () => void, onStateChange: () => voi
     stop: () => {
       stopped = true
       diag.listening = false
+      gesture.reset()
+      diag.pendingFirstClap = false
       cancelAnimationFrame(raf)
       try {
         source.disconnect()

@@ -278,7 +278,10 @@ test('/readiness decides "armed" itself: a suspended audio context is not armed'
   await post({ clapListening: true, audioState: 'running', micPermission: 'granted', webgl: true, clapArmed: true, extra: 'x' })
   s = await startup()
   assert.equal(s.clapArmed, true)
-  assert.deepEqual(Object.keys(s.page).sort(), ['audioState', 'clapArmed', 'clapListening', 'claps', 'floorAtClap', 'lastClapAfterArmMs', 'lastPeak', 'micPermission', 'reportedAt', 'webgl'])
+  assert.deepEqual(Object.keys(s.page).sort(), [
+    'audioState', 'clapArmed', 'clapListening', 'floorAtClap', 'lastClapAfterArmMs', 'lastClapGapMs', 'lastPeak',
+    'lastWakeAfterArmMs', 'micPermission', 'pendingFirstClap', 'rawClaps', 'reportedAt', 'wakeGestures', 'webgl',
+  ])
 
   // The page's own claim is ignored; only the parts count.
   await post({ clapListening: false, audioState: 'running', clapArmed: true })
