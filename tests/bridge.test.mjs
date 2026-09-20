@@ -280,7 +280,7 @@ test('/readiness decides "armed" itself: a suspended audio context is not armed'
   assert.equal(s.clapArmed, true)
   assert.deepEqual(Object.keys(s.page).sort(), [
     'audioState', 'clapArmed', 'clapListening', 'floorAtClap', 'lastClapAfterArmMs', 'lastClapGapMs', 'lastPeak',
-    'lastWakeAfterArmMs', 'micPermission', 'pendingFirstClap', 'rawClaps', 'reportedAt', 'wakeGestures', 'webgl',
+    'lastWakeAfterArmMs', 'micPermission', 'pendingFirstClap', 'rawClaps', 'recentClaps', 'reportedAt', 'wakeGestures', 'webgl',
   ])
 
   // The page's own claim is ignored; only the parts count.

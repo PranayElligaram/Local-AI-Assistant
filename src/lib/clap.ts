@@ -1,5 +1,5 @@
 import { getMic } from './audio'
-import { createWakeGesture, DOUBLE_CLAP_MIN_MS } from './doubleClap'
+import { createWakeGesture, DOUBLE_CLAP_MIN_MS, type ClapResult } from './doubleClap'
 
 /**
  * Clap to wake him up.
@@ -50,6 +50,12 @@ const SETTLE_MS = 2000
 
 export type ClapListener = { stop: () => void }
 
+/** One clap-shaped event: loudness, timing, and what the gesture made of it. */
+export type ClapEvent = { afterArmMs: number; peak: number; floor: number; gapMs: number; result: ClapResult }
+
+/** How many of those are kept. Enough for a 90-second listen in a real room. */
+const RECENT_CLAPS = 40
+
 export const diag = {
   listening: false,
   /** Individual clap-shaped events heard. Most of these mean nothing on their own. */
@@ -69,6 +75,12 @@ export const diag = {
   lastClapGapMs: 0,
   /** How long after arming the last completed gesture landed. */
   lastWakeAfterArmMs: 0,
+  /**
+   * The last few raw claps, newest last. A room's own impulses and a pair of
+   * hands are told apart by how loud they are and how they arrive, and that is
+   * a question for measurement, not for guessing at a threshold.
+   */
+  recent: [] as ClapEvent[],
 }
 
 if (typeof window !== 'undefined') {
@@ -162,6 +174,14 @@ export async function listenForClap(onWake: () => void, onStateChange: () => voi
         const result = gesture.clap(at)
         if (first !== null) diag.lastClapGapMs = Math.round(at - first)
         diag.pendingFirstClap = gesture.pendingAt !== null
+        diag.recent.push({
+          afterArmMs: Math.round(at - armedAt),
+          peak: Math.round(diag.lastPeak * 10000) / 10000,
+          floor: Math.round(floor * 10000) / 10000,
+          gapMs: first === null ? 0 : Math.round(at - first),
+          result,
+        })
+        if (diag.recent.length > RECENT_CLAPS) diag.recent.shift()
         if (result === 'wake') {
           lastWake = now
           diag.wakeGestures++

@@ -74,10 +74,11 @@ async function reportReadiness(): Promise<void> {
     /* reported as false */
   }
   const { listening: clapListening, audioState, rawClaps, wakeGestures, pendingFirstClap } = clapDiag
-  const { lastPeak, lastClapAfterArmMs, floorAtClap, lastClapGapMs, lastWakeAfterArmMs } = clapDiag
+  const { lastPeak, lastClapAfterArmMs, floorAtClap, lastClapGapMs, lastWakeAfterArmMs, recent } = clapDiag
   const body = JSON.stringify({
     clapListening, audioState, micPermission, webgl,
     rawClaps, wakeGestures, pendingFirstClap, lastClapGapMs, lastWakeAfterArmMs, lastPeak, lastClapAfterArmMs, floorAtClap,
+    recentClaps: recent,
   })
   await fetch(`${BRIDGE_HTTP_URL}/readiness`, { method: 'POST', headers: { 'content-type': 'application/json' }, body }).catch(() => {})
 }

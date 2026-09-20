@@ -158,6 +158,15 @@ export function sanitizeReadiness(msg) {
     lastClapAfterArmMs: count(msg?.lastClapAfterArmMs),
     lastPeak: level(msg?.lastPeak),
     floorAtClap: level(msg?.floorAtClap),
+    // Numbers only, and a bounded number of them: loudness and timing of the
+    // claps heard, which is what a threshold argument needs and all it needs.
+    recentClaps: (Array.isArray(msg?.recentClaps) ? msg.recentClaps : []).slice(-40).map((c) => ({
+      afterArmMs: count(c?.afterArmMs),
+      peak: level(c?.peak),
+      floor: level(c?.floor),
+      gapMs: count(c?.gapMs),
+      result: ['armed', 'wake', 'too-soon', 'cooldown'].includes(c?.result) ? c.result : 'unknown',
+    })),
     reportedAt: Date.now(),
   }
 }

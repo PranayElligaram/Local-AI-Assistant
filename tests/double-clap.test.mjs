@@ -27,7 +27,7 @@ test('the timings are a human double clap, not magic numbers', () => {
   assert.equal(DOUBLE_CLAP_MIN_MS, 100)
   assert.equal(DOUBLE_CLAP_MAX_MS, 650)
   const clap = code('src/lib/clap.ts')
-  assert.ok(clap.includes("import { createWakeGesture, DOUBLE_CLAP_MIN_MS } from './doubleClap'"))
+  assert.match(clap, /import \{ createWakeGesture, DOUBLE_CLAP_MIN_MS[^}]*\} from '\.\/doubleClap'/)
   assert.ok(!/\b(100|650)\b/.test(code('src/lib/clap.ts').split('listenForClap')[1] ?? ''), 'no bare intervals in the listener')
 })
 
