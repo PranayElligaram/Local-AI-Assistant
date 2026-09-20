@@ -21,6 +21,7 @@ import {
   destination,
   findChrome,
   findGitBash,
+  resolveChromeProfile,
 } from '../bridge/workspace.mjs'
 
 const IMPROMPTU = 'C:\\Users\\prana\\dev\\src\\Impromptu'
@@ -353,13 +354,66 @@ test('normal Chrome is opened only when absent, and never moved', async () => {
   assert.ok(!desktop.placed.some((p) => p.hwnd === WINDOWS.chrome.hwnd))
 })
 
-test('normal Chrome launches with no arguments: no URL, no profile, no incognito', async () => {
+// --- the profile a normal Chrome window opens with -----------------------------
+
+const USER_DATA = 'C:\\Users\\prana\\AppData\\Local\\Google\\Chrome\\User Data'
+const CHROME_ENV = { LOCALAPPDATA: 'C:\\Users\\prana\\AppData\\Local', ProgramFiles: 'C:\\Program Files' }
+const localState = (lastUsed) => () => JSON.stringify({ profile: { last_used: lastUsed, info_cache: { Default: {}, 'Profile 1': {} } } })
+const has = (...dirs) => (p) => p.endsWith('chrome.exe') || dirs.some((d) => p === `${USER_DATA}\\${d}`)
+
+test("the profile comes from Chrome's own last_used, and must exist on disk", () => {
+  assert.deepEqual(resolveChromeProfile(CHROME_ENV, { readFile: localState('Profile 1'), exists: has('Default', 'Profile 1') }), {
+    directory: 'Profile 1',
+    source: 'last_used',
+    error: '',
+  })
+  // Named but gone: Default, not the other profile Chrome happens to have.
+  assert.equal(resolveChromeProfile(CHROME_ENV, { readFile: localState('Profile 7'), exists: has('Default', 'Profile 1') }).directory, 'Default')
+})
+
+test('Default is the fallback only when last_used cannot be read', () => {
+  const unreadable = () => {
+    throw new Error('ENOENT')
+  }
+  for (const readFile of [unreadable, () => 'not json', localState(undefined), localState('../../elsewhere')]) {
+    assert.deepEqual(resolveChromeProfile(CHROME_ENV, { readFile, exists: has('Default', 'Profile 1') }), { directory: 'Default', source: 'fallback', error: '' })
+  }
+})
+
+test('an unresolvable profile fails cleanly rather than opening the chooser', async () => {
+  // Neither last_used nor Default on disk: no guess between what is left.
+  assert.deepEqual(resolveChromeProfile(CHROME_ENV, { readFile: localState('Profile 1'), exists: has('Profile 2') }), { directory: null, source: '', error: 'no usable Chrome profile directory' })
+  assert.equal(resolveChromeProfile({}, { readFile: localState('Default'), exists: () => true }).directory, null)
+
+  const { spawned, spawnFn } = fakeSpawn()
+  const r = await defaultLaunchers({ catalogue: {}, env: {}, spawnFn }).chrome()
+  if (!findChrome()) return assert.equal(r.ok, false)
+  assert.equal(r.ok, false)
+  assert.equal(spawned.length, 0)
+})
+
+test('normal Chrome launches with the resolved profile and nothing else: no URL, no incognito', async () => {
   const { spawned, spawnFn } = fakeSpawn()
   const r = await defaultLaunchers({ catalogue: {}, spawnFn }).chrome()
   if (!findChrome()) return assert.equal(r.ok, false)
   assert.equal(r.ok, true)
   assert.match(spawned[0].file, /chrome\.exe$/i)
-  assert.deepEqual(spawned[0].args, [])
+  const { directory } = resolveChromeProfile()
+  assert.deepEqual(spawned[0].args, [`--profile-directory=${directory}`])
+  assert.ok(!spawned[0].args.join(' ').match(/incognito|user-data-dir|http|--app/i))
+})
+
+test("nothing but Chrome's own metadata can choose the profile", async () => {
+  // start() takes a trigger label and nothing else, and the launcher reads the
+  // profile itself: there is no argument, spoken or modelled, to carry one.
+  assert.equal(defaultLaunchers({ catalogue: {} }).chrome.length, 0)
+  const desktop = fakeDesktop({ windows: [WINDOWS.jarvis, WINDOWS.claudeDesktop, WINDOWS.claudeCode] })
+  const { spawned, spawnFn } = fakeSpawn()
+  const launchers = defaultLaunchers({ catalogue: {}, env: CHROME_ENV, spawnFn })
+  const ws = createWorkspace({ desktop, launchers: { ...launchers, jarvis: async () => ({ ok: true }), claudeDesktop: async () => ({ ok: true }), claudeCode: async () => ({ ok: true }) }, ...quick })
+  await ws.start({ trigger: '--profile-directory=Evil' })
+  const args = spawned.flatMap((s) => s.args)
+  assert.ok(!args.some((a) => /Evil/.test(a)))
 })
 
 test('Chrome is looked for in its install folders only', () => {

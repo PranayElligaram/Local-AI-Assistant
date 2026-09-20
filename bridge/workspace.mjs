@@ -5,7 +5,8 @@
  *   monitor 2   the Claude desktop app
  *   monitor 3   Git Bash running Claude Code in the Impromptu workspace folder
  *               (the parent of its repos; Claude picks the repo from the prompt)
- *   and         an ordinary Chrome browsing window, if none is open
+ *   and         an ordinary Chrome browsing window, in the profile Chrome
+ *               last used, if none is open
  *
  * This is the clap phase only. Logon starts nothing but JARVIS itself
  * (install-startup.ps1 -> jarvis.ps1 -> open-ui.ps1).
@@ -22,7 +23,7 @@
  */
 
 import { execFile, spawn } from 'node:child_process'
-import { existsSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { dirname, join, win32 } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { launchApp } from './apps/launch.mjs'
@@ -95,6 +96,36 @@ export function findChrome(env = process.env, exists = existsSync) {
     .filter(Boolean)
     .map((base) => win32.join(base, 'Google', 'Chrome', 'Application', 'chrome.exe'))
   return candidates.find((p) => exists(p)) ?? null
+}
+
+/** Chrome's own user data folder, where its profile metadata lives. */
+function chromeUserData(env) {
+  return env.LOCALAPPDATA ? win32.join(env.LOCALAPPDATA, 'Google', 'Chrome', 'User Data') : null
+}
+
+/**
+ * Which profile directory a normal Chrome window opens with. Without one,
+ * Chrome stops at the profile chooser whenever the user has more than one
+ * profile. The name comes from Chrome's own Local State and nowhere else - it
+ * is never a path, never a new profile, and nothing outside this file can
+ * choose it. Falls back to Default only when last_used is unusable, and
+ * reports rather than guessing when neither exists.
+ */
+export function resolveChromeProfile(env = process.env, { readFile = readFileSync, exists = existsSync } = {}) {
+  const userData = chromeUserData(env)
+  if (!userData) return { directory: null, source: '', error: 'no Chrome user data folder' }
+  let lastUsed = null
+  try {
+    lastUsed = JSON.parse(readFile(win32.join(userData, 'Local State'), 'utf8'))?.profile?.last_used
+  } catch {
+    // Missing or unreadable metadata: the Default fallback below, not a guess.
+  }
+  // A bare directory name as Chrome writes them ("Default", "Profile 1").
+  const candidate = typeof lastUsed === 'string' && /^[A-Za-z0-9 _-]{1,32}$/.test(lastUsed) ? lastUsed : null
+  for (const [directory, source] of [[candidate, 'last_used'], ['Default', 'fallback']]) {
+    if (directory && exists(win32.join(userData, directory))) return { directory, source, error: '' }
+  }
+  return { directory: null, source: '', error: 'no usable Chrome profile directory' }
 }
 
 /** Git for Windows' own terminal and shell, from the usual install locations. */
@@ -210,11 +241,14 @@ export function defaultLaunchers({ catalogue, interfaceConnected = () => false, 
       return spawnDetached(file, args, { cwd: WORKSPACE.claudeCode.cwd, env: childEnv, windowsHide: false }, spawnFn)
     },
     async chrome() {
-      // No arguments: the user's own profile, and Chrome's own idea of which
-      // tabs a new window starts with.
+      // The profile Chrome itself last used, so no chooser appears, and
+      // nothing else: no URL, no incognito, no temporary profile, and Chrome's
+      // own idea of which tabs a new window starts with.
       const chrome = findChrome()
       if (!chrome) return { ok: false, error: 'Google Chrome is not installed' }
-      return spawnDetached(chrome, [], {}, spawnFn)
+      const profile = resolveChromeProfile(env)
+      if (!profile.directory) return { ok: false, error: profile.error }
+      return spawnDetached(chrome, [`--profile-directory=${profile.directory}`], {}, spawnFn)
     },
   }
 }
