@@ -140,6 +140,57 @@ test('13. a heavy technical interview lowers the rank without rejecting', () => 
   assert.ok(light.rankScore > heavy.rankScore)
 })
 
+// The real Helsing "Software Engineer (Early Careers)" posting (Greenhouse, 21 Sep 2026), as extracted.
+const HELSING_PROCESS = `The process
+At the core of our technical interview philosophy is Bring Something Awesome (BSA) . A dedicated session where candidates present an ambitious technical project they have designed, built, or contributed to.
+With BSA2A , we are bringing this step to the very front of the application. Instead of an initial CV and recruiter screen, you apply by submitting a short (maximum 10-minute) prerecorded video walkthrough of something technically compelling you have built. We look for:
+•
+Engineering depth & craft: High-quality code, solid architectural choices, and systems-level thinking.
+Candidates selected through BSA2A move into an accelerated, streamlined technical assessment:
+•
+Video Submission: Eligible candidates receive a private link with detailed guidance to upload their 10-minute BSA walkthrough.
+•
+Technical Interviews (2 × 60 mins):
+•
+Round 1: BSA Deep Dive & Systems Design . An interactive, technical exploration of your project and system trade-offs.
+•
+Round 2: Live Coding . Practical, real-world algorithmic and problem-solving assessment.
+•
+Final Interview (30 mins): A conversation with engineering leadership focused on mission alignment, collaboration, and how you work.
+Why apply via this route?
+Accelerated timeline: A focused, high-signal path that bypasses standard preliminary screens and reduces the overall interview cycle by two full stages.`
+const HELSING = `${BODY}\nYou enjoy collaborating with others, including reviewing code and pair programming.\n\n${HELSING_PROCESS}`
+const burden = (text) => ev(job('Graduate Software Engineer', { description: `${BODY}\n\n${text}` })).interviewDifficulty
+
+test('the Helsing process (BSA deep dive + systems design, live coding, 2 × technical interviews) is HEAVY', () => {
+  const r = ev(job('Software Engineer (Early Careers)', { location: 'Berlin; London; Munich', description: HELSING }))
+  assert.equal(r.interviewDifficulty, 'HEAVY')
+  for (const s of ['live coding', 'system design', 'project deep dive / walkthrough', 'multiple technical interviews', 'prerecorded technical submission']) assert.ok(r.interviewSignals.includes(s), s)
+  assert.ok(!r.interviewSignals.includes('practical coding'), 'a culture line about pair programming is not an interview stage')
+  // Independent of the (easy) application form, and never a rejection by itself.
+  assert.equal(r.applicationDifficulty, 'EASY')
+  assert.equal(r.decision, 'QUALIFIED', r.exclusionReasons.join('; '))
+  assert.ok(r.fitScore >= 70)
+  // Ranked below the same role with a light process.
+  const light = ev(job('Software Engineer (Early Careers)', { location: 'Berlin; London; Munich', description: `${BODY}\n\nInterview process: a recruiter screen, then a behavioural interview with the hiring manager.` }))
+  assert.equal(light.interviewDifficulty, 'LIGHT')
+  assert.equal(light.fitScore, r.fitScore)
+  assert.equal(light.rankScore - r.rankScore, 13)
+})
+
+test('interview-process indicators', () => {
+  assert.equal(burden('Round 2 is a live coding session.'), 'HEAVY')
+  assert.equal(burden('The second stage is a systems design interview.'), 'HEAVY')
+  assert.equal(burden('Shortlisted candidates complete a take-home assignment.'), 'HEAVY')
+  assert.equal(burden('Successful applicants are invited to an assessment centre.'), 'HEAVY')
+  assert.equal(burden('Our process includes a Codility coding test.'), 'HEAVY')
+  assert.equal(burden('Interview stages: 1. recruiter call 2. technical interview 3. technical interview 4. final.'), 'HEAVY')
+  assert.equal(burden('Interview process: a recruiter screen followed by a behavioural interview.'), 'LIGHT')
+  assert.equal(burden('Our interview is a relaxed technical chat about a project you are proud of. No take-home, no live coding.'), 'LIGHT')
+  assert.equal(burden('There is one technical interview.'), 'MODERATE')
+  assert.equal(burden('You will contribute to system design and enjoy pair programming.'), 'UNKNOWN', 'duties are not a selection process')
+})
+
 test('14. an unknown interview process stays UNKNOWN', () => {
   const r = ev(job('Graduate Software Engineer'))
   assert.equal(r.interviewDifficulty, 'UNKNOWN')

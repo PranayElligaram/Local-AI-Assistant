@@ -195,32 +195,74 @@ export function parseSalary(job) {
 
 // --- application and interview burden --------------------------------------
 
+// Any one of these in the stated selection process makes it HEAVY.
 const HEAVY_INTERVIEW = [
-  ['leetcode-style', /\bleet ?code|hackerrank|codility|codesignal|competitive programming\b/i],
-  ['algorithms/DSA', /\b(data structures (?:and|&) algorithms|algorithmic (?:interview|test|challenge)|dsa)\b/i],
-  ['system design', /\bsystem design (?:interview|round|stage)\b/i],
+  ['live coding', /\blive[- ]coding\b|\bcoding (?:interview|round|exercise|session)\b/i],
+  ['coding test', /\bcoding (?:test|assessment|challenge)\b|\b(?:hacker ?rank|codility|leet ?code|codesignal|coderpad|competitive programming)\b/i],
+  ['algorithms/DSA', /\b(?:data structures (?:and|&) algorithms|algorithmic (?:interview|test|challenge|assessment)|dsa)\b/i],
+  ['system design', /\bsystems? design\b/i],
+  ['project deep dive / walkthrough', /\bdeep[- ]dive\b|\b(?:technical|project) (?:walkthrough|presentation)\b|\bwalkthrough of (?:a|your|something)\b/i],
   ['take-home', /\btake[- ]home\b/i],
+  ['technical assessment', /\btechnical (?:assessment|test|exercise|task|challenge)\b/i],
   ['assessment centre', /\bassessment (?:centre|center|day)\b/i],
-  ['online test', /\b(online (?:test|assessment)|numerical reasoning|verbal reasoning|psychometric|situational judg(?:e)?ment)\b/i],
+  ['online test', /\b(?:online (?:test|assessment)|numerical reasoning|verbal reasoning|psychometric|situational judg(?:e)?ment)\b/i],
+  ['multiple technical interviews', /\b(?:2|two|3|three|4|four|multiple|several)\s*(?:[x×*]\s*)?(?:\d+[- ]?min\w*\s*)?technical interviews?\b|\btechnical interviews?\s*\(\s*(?:2|3|4|two|three|four)\s*[x×*]/i],
+  ['prerecorded technical submission', /\bpre[- ]?recorded\b[^.\n]{0,80}\b(?:video|walkthrough|presentation|technical|project)\b/i],
 ]
 const LIGHT_INTERVIEW = [
-  ['project discussion', /\b(discuss (?:a |your )?(?:past |previous )?projects?|project (?:discussion|walkthrough|deep[- ]dive))\b/i],
-  ['practical coding', /\b(pair programming|practical (?:coding|exercise|session)|debugging (?:session|exercise))\b/i],
-  ['behavioural', /\b(behaviou?ral interview|values interview|culture (?:fit|interview))\b/i],
-  ['short process', /\b(two|2)[- ](?:stage|step|round)s? (?:interview|process)|(?:interview|hiring) process[^.]{0,40}\b(two|2) (?:stages|steps|rounds)\b|no (?:coding|technical) test|no take[- ]home\b/i],
+  ['recruiter screen', /\brecruiter (?:screen|call|chat|conversation|interview)\b/i],
+  ['hiring-manager conversation', /\bhiring[- ]manager (?:conversation|chat|call|interview)\b/i],
+  ['behavioural', /\b(?:behaviou?ral interview|values interview|culture (?:fit|interview)|competency[- ]based interview)\b/i],
+  ['project discussion', /\b(?:discuss(?:ion of)? (?:a |your )?(?:past |previous )?projects?|project discussion)\b/i],
+  ['informal technical chat', /\b(?:informal|relaxed) (?:technical )?(?:chat|conversation)\b|\btechnical (?:chat|conversation)\b/i],
+  ['short process', /\b(?:two|2)[- ](?:stage|step|round)s? (?:interview|process)\b|\b(?:interview|hiring) process[^.]{0,40}\b(?:two|2) (?:stages|steps|rounds)\b/i],
 ]
+/** A line that talks about selection, not about the job itself. */
+const PROCESS_WORD = /\b(?:interview\w*|round \d|stage \d|step \d|\d (?:stages|rounds)|hiring process|recruitment process|selection process|application process|what to expect|assessment (?:centre|center|day)|take[- ]home|live[- ]coding|coding (?:test|assessment|challenge)|hacker ?rank|codility|leet ?code|codesignal|pre[- ]?recorded|recruiter (?:screen|call))\b/i
+const PROCESS_HEADING = /^(?:[•*-]\s*)?(?:the |our )?(?:(?:interview|hiring|recruitment|selection|application) process|process|what to expect|how we hire|interview stages|next steps)\b[^.]{0,30}$/i
+const NEGATED = /\bno (?:live[- ]coding|coding (?:test|challenge|assessment)|technical test|take[- ]homes?(?: assignments?)?|leet ?code|system design)\b/gi
 
+/**
+ * The selection-process text only: lines under an interview/hiring-process
+ * heading, plus any line that is itself about selection. Duties ("you will
+ * contribute to system design", "enjoy pair programming") are not a process.
+ */
+export function processText(description) {
+  const out = []
+  let inSection = false
+  for (const raw of String(description ?? '').split(/\n+/)) {
+    const line = raw.trim()
+    if (!line || /^[•*-]$/.test(line)) continue
+    const headingLike = line.length <= 60 && !/^[•*-]/.test(line) && !/[.;]$/.test(line) && !PROCESS_WORD.test(line)
+    if (PROCESS_HEADING.test(line)) inSection = true
+    else if (headingLike) inSection = false
+    if (inSection || PROCESS_WORD.test(line)) out.push(line)
+  }
+  return out.join('\n')
+}
+
+/**
+ * LIGHT / MODERATE / HEAVY / UNKNOWN, from what the job actually says about
+ * its selection process. Nothing stated -> UNKNOWN (never inferred). This is
+ * a ranking factor only: it never rejects a role.
+ */
 export function interviewBurden(description) {
-  const text = String(description ?? '')
+  const raw = processText(description)
+  const negated = raw.match(NEGATED) ?? []
+  const text = raw.replace(NEGATED, ' ')
   const heavy = HEAVY_INTERVIEW.filter(([, re]) => re.test(text)).map(([n]) => n)
   const light = LIGHT_INTERVIEW.filter(([, re]) => re.test(text)).map(([n]) => n)
-  const rounds = /\b(\d|four|five|six)\s*(?:-|–)?\s*(?:stage|round|step)s?\b/i.exec(text)
-  const n = rounds ? toNum(rounds[1]) : null
-  if (n != null && n >= 4) heavy.push(`${n} rounds`)
-  if (!heavy.length && !light.length) return { level: 'UNKNOWN', signals: [] }
-  if (heavy.length >= 2 || heavy.includes('assessment centre')) return { level: 'HEAVY', signals: [...heavy, ...light] }
-  if (heavy.length) return { level: 'MODERATE', signals: [...heavy, ...light] }
-  return { level: 'LIGHT', signals: light }
+  if (negated.length) light.push('no coding test / take-home stated')
+  // Three or more stages, when any of them is technical.
+  const stages = [...text.matchAll(/\b(?:round|stage|step)\s*(\d)\b|\b(\d|three|four|five|six)\s*(?:-|–)?\s*(?:stages?|rounds?|steps?)\b/gi)].map((m) => toNum(m[1] ?? m[2]) ?? 0)
+  const most = stages.length ? Math.max(...stages) : 0
+  if (most >= 3 && /\b(?:technical|coding|design|engineering)\b/i.test(text)) heavy.push(`${most} technical stages`)
+  // "…2. technical interview 3. technical interview…": more than one technical round.
+  if ((text.match(/\btechnical interview\b/gi) ?? []).length >= 2 && !heavy.includes('multiple technical interviews')) heavy.push('multiple technical interviews')
+  if (heavy.length) return { level: 'HEAVY', signals: [...heavy, ...light] }
+  if (/\btechnical interviews?\b/i.test(text)) return { level: 'MODERATE', signals: ['technical interview (format not stated)', ...light] }
+  if (light.length) return { level: 'LIGHT', signals: light }
+  return { level: 'UNKNOWN', signals: [] }
 }
 
 const STANDARD_ATS = new Set(['greenhouse', 'lever', 'ashby', 'workable', 'teamtailor', 'smartrecruiters', 'recruitee', 'personio'])
