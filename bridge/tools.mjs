@@ -91,6 +91,7 @@ const spokenDate = (d) =>
  * @param {() => Date} [deps.now]
  * @param {{ start: (o?: object) => Promise<object> }} [deps.workspace]  bridge/workspace.mjs
  * @param {object} [deps.launcher]      { launchApp, openUrl, signOut } - injectable for tests
+ * @param {object|null} [deps.jobs]     the job agent (bridge/jobs/agent.mjs); read-only answers + pause/resume
  */
 export function createTools(deps) {
   const {
@@ -105,6 +106,7 @@ export function createTools(deps) {
     launcher = { launchApp, openUrl, signOut },
     routine = DAILY_START_ROUTINE,
     workspace = { start: async () => ({ ok: false, say: 'The workspace launcher is not available.' }) },
+    jobs = null,
   } = deps
 
   const state = {
@@ -291,7 +293,11 @@ export function createTools(deps) {
       parameters: { type: 'object', properties: {}, required: [] },
       permission: 'safe',
       model: false,
-      run: async () => ({ ok: true, say: `Good morning. It's ${spokenDate(now())}. JARVIS is online and ready.` }),
+      run: async () => {
+        // A job line only when there is something worth saying.
+        const job = jobs?.morningText?.() ?? ''
+        return { ok: true, say: `Good morning. It's ${spokenDate(now())}. JARVIS is online and ready.${job ? ` ${job}` : ''}` }
+      },
     },
     {
       name: 'start_today',
@@ -384,7 +390,53 @@ export function createTools(deps) {
         return { ok: true, say: 'Shutting down.' }
       },
     },
+    ...jobTools(),
   ]
+
+  /** The job agent's voice surface. Read-only, except pause/resume, which keep the queue. Nothing here withdraws or applies. */
+  function jobTools() {
+    const unavailable = { ok: false, say: 'The job agent is not available in this build.' }
+    // Router-only, like the other routines: the model's tool menu stays small.
+    const answer = (name, description, text, model = false) => ({
+      name,
+      description,
+      parameters: { type: 'object', properties: {}, required: [] },
+      permission: 'safe',
+      model,
+      run: async () => (jobs ? { ok: true, say: text() } : unavailable),
+    })
+    return [
+      answer('job_status', "Report how the user's autonomous job search is going.", () => jobs.statusText()),
+      answer('job_applied_count', 'Say how many job applications have been submitted with verified confirmation.', () => jobs.appliedCountText()),
+      answer('job_applied_today', 'List the jobs applied for today.', () => jobs.appliedTodayText()),
+      answer('job_needs_input', 'List the job applications that need the user.', () => jobs.needsInputText()),
+      answer('job_today', "List today's newly added job roles.", () => jobs.todaysJobsText()),
+      {
+        name: 'job_pause',
+        description: 'Pause the autonomous job search. The queue is kept.',
+        parameters: { type: 'object', properties: {}, required: [] },
+        permission: 'safe',
+        model: false,
+        run: async () => {
+          if (!jobs) return unavailable
+          jobs.pause()
+          return { ok: true, say: "Job searching is paused. Nothing in the queue has been lost; say 'resume job searching' to carry on." }
+        },
+      },
+      {
+        name: 'job_resume',
+        description: 'Resume the autonomous job search.',
+        parameters: { type: 'object', properties: {}, required: [] },
+        permission: 'safe',
+        model: false,
+        run: async () => {
+          if (!jobs) return unavailable
+          jobs.resume()
+          return { ok: true, say: 'Job searching has resumed.' }
+        },
+      },
+    ]
+  }
 
   const byName = new Map(defs.map((d) => [d.name, d]))
 

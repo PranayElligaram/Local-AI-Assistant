@@ -55,6 +55,14 @@ const CONFIRM_GOOD_NIGHT = /^(?:confirm good night|good night confirmed)$/
 const CANCEL_GOOD_NIGHT = /^(?:cancel good night|cancel (?:the )?sign ?out|don'?t sign (?:me )?out)$/
 const RESTART = /^(?:restart|reboot|reload) (?:jarvis|yourself|the assistant)$/
 const STOP = /^(?:(?:stop|shut down|shutdown|quit|exit|close|turn off) (?:jarvis|yourself|the assistant)|jarvis (?:shut down|shutdown|stop))$/
+// The job agent: read-only status, plus pause/resume (which keep the queue).
+const JOB_STATUS = /^(?:how(?:'s| is| are) (?:the |my )?job (?:search|hunt|agent|applications)(?: going| doing)?(?: so far)?|(?:give me )?(?:a |the |my )?job (?:search |agent )?(?:status|update|report)|job search)$/
+const JOB_APPLIED_COUNT = /^how many (?:jobs|roles|positions|places|companies|applications) (?:have|did) you (?:applied|apply|submitted|submit|sent|send)(?: (?:to|for))?(?: so far| in total| altogether)?$/
+const JOB_APPLIED_TODAY = /^(?:what|which) (?:jobs|roles|positions|companies) (?:did|have) you (?:apply|applied) (?:for|to) today$/
+const JOB_NEEDS_INPUT = /^(?:which|what) (?:applications|jobs|roles)(?: applications)? (?:need|needs|require|requires) (?:me|my input|my attention|my help|input)$/
+const JOB_TODAY = /^(?:(?:show|tell|give) me )?today'?s (?:jobs|roles|job matches)$|^what (?:jobs|roles) did you find today$/
+const JOB_PAUSE = /^(?:pause|stop|suspend|halt) (?:the )?job (?:searching|search|hunting|hunt|agent)$/
+const JOB_RESUME = /^(?:resume|restart|continue|unpause|start) (?:the )?job (?:searching|search|hunting|hunt|agent)(?: again)?$/
 const REFRESH_APPS = /^(?:refresh|rescan|reload|update) (?:the |my )?(?:app|apps|application|applications|programs)(?: list| catalogue| catalog)?$/
 
 const OPEN = /^(?:open|launch|start|run|fire up|bring up|load|start up|boot up) (?:up )?(.+)$/
@@ -133,6 +141,13 @@ export function route(text) {
   if (RESTART.test(named)) return { tool: 'restart_jarvis', args: {} }
   if (STOP.test(named)) return { tool: 'stop_jarvis', args: {} }
   if (REFRESH_APPS.test(s)) return { tool: 'refresh_applications', args: {} }
+  if (JOB_STATUS.test(s)) return { tool: 'job_status', args: {} }
+  if (JOB_APPLIED_COUNT.test(s)) return { tool: 'job_applied_count', args: {} }
+  if (JOB_APPLIED_TODAY.test(s)) return { tool: 'job_applied_today', args: {} }
+  if (JOB_NEEDS_INPUT.test(s)) return { tool: 'job_needs_input', args: {} }
+  if (JOB_TODAY.test(s)) return { tool: 'job_today', args: {} }
+  if (JOB_PAUSE.test(s)) return { tool: 'job_pause', args: {} }
+  if (JOB_RESUME.test(s)) return { tool: 'job_resume', args: {} }
 
   let m = RESEARCH.exec(s)
   if (m && m[1]) return { tool: 'research_web', args: { query: tail(original, m[1]) } }

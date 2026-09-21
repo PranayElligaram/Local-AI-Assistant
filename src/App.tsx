@@ -496,6 +496,14 @@ export default function App() {
         case 'diagnostics':
           window.dispatchEvent(new CustomEvent('jarvis:diagnostics', { detail: a }))
           break
+        case 'notify':
+          // A batched background update (the job agent). Shown, not spoken:
+          // it must never talk over the user or a turn in progress.
+          {
+            const text = (args as { text?: unknown } | undefined)?.text
+            if (typeof text === 'string' && text.trim()) s.pushTurn({ id: `notify-${Date.now()}`, role: 'jarvis', text: text.slice(0, 600) })
+          }
+          break
         default:
           console.warn('[jarvis] unknown ui op:', op, args)
       }

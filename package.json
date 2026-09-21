@@ -24,6 +24,7 @@
     "bridge": "node bridge/server.mjs",
     "bridge:writes": "node bridge/server.mjs --writes",
     "app": "node scripts/apps.mjs",
+    "jobs": "node scripts/jobs.mjs",
     "diagnostics": "node scripts/diagnostics.mjs",
     "setup": "node scripts/diagnostics.mjs"
   },

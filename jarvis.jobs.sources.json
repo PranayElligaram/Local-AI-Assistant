@@ -1,0 +1,25 @@
+{
+  "_comment": "Public job boards the JARVIS job agent searches. A board name, or {\"board\": ..., \"company\": ...} to give the company its proper name. URLs are built by bridge/jobs/sources.mjs; nothing here is fetched verbatim except https career pages under \"careers\". Keep the list short: each board costs one request per run. See docs/job-agent.md.",
+  "greenhouse": [
+    { "board": "monzo", "company": "Monzo" },
+    { "board": "helsing", "company": "Helsing" },
+    { "board": "gocardless", "company": "GoCardless" },
+    { "board": "isomorphiclabs", "company": "Isomorphic Labs" },
+    { "board": "wayve", "company": "Wayve" },
+    { "board": "deliveroo", "company": "Deliveroo" },
+    { "board": "catapultsports", "company": "Catapult Sports" }
+  ],
+  "ashby": [
+    { "board": "synthesia", "company": "Synthesia" },
+    { "board": "relay", "company": "Relay Technologies" },
+    { "board": "granola", "company": "Granola" },
+    { "board": "elevenlabs", "company": "ElevenLabs" }
+  ],
+  "lever": [],
+  "leverEu": [],
+  "workable": [
+    { "board": "homey", "company": "Homey" },
+    { "board": "low-carbon", "company": "Low Carbon" }
+  ],
+  "careers": []
+}

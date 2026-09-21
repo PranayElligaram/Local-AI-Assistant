@@ -32,6 +32,7 @@ import {
   LAUNCH_DRY_RUN,
   MIN_NODE_MAJOR,
   PORT,
+  ROOT,
   RUN_DIR,
   SEARCH_ENGINE,
   STT_TIMEOUT_MS,
@@ -46,6 +47,9 @@ import { AppCatalogue } from './apps/catalog.mjs'
 import { createTools } from './tools.mjs'
 import { createWorkspace, defaultLaunchers } from './workspace.mjs'
 import { createConversation, createMetrics } from './assistant.mjs'
+import { jobsConfig } from './jobs/config.mjs'
+import { createJobAgent } from './jobs/agent.mjs'
+import { showToast } from './jobs/toast.mjs'
 
 /**
  * Several of the APIs below (structuredClone, streaming fetch with
@@ -612,6 +616,8 @@ const handleRequest = async (req, res) => {
             lastAskAt: stats.lastAskAt,
             ...(stats.voice ?? { voiceState: 'unreported' }),
           },
+          // Counts and health only: no tokens, profile values, CV or JD text.
+          jobs: jobAgent.diagnostics(),
           isolation: {
             globalClaudeConfigRead: false,
             mcpServers: [],
@@ -1082,8 +1088,26 @@ const workspace = createWorkspace({
   }),
 })
 
+/**
+ * The autonomous job agent. Off unless JOBS_AGENT_ENABLED=true; when on it
+ * only arms timers here, so start-up never waits for a search. Its batched
+ * update goes to the interface as text and to a Windows toast; it is never
+ * spoken over whatever the user is doing.
+ */
+const JOBS = jobsConfig()
+const jobAgent = createJobAgent({
+  cfg: JOBS,
+  root: ROOT,
+  runDir: RUN_DIR,
+  notify: (text) => {
+    broadcastUi('notify', { text, source: 'jobs' })
+    if (JOBS.notifyToast) void showToast('JARVIS job search', text)
+  },
+})
+
 const tools = createTools({
   catalogue,
+  jobs: jobAgent,
   workspace,
   dryRun: LAUNCH_DRY_RUN,
   allowWrites: ALLOW_WRITES,
@@ -1123,6 +1147,11 @@ server.listen(PORT, '127.0.0.1', () => {
       (EXTRA_ORIGINS.length ? ` plus ${EXTRA_ORIGINS.join(', ')}` : '') +
       (ALLOW_NO_ORIGIN ? ' and clients that send no origin' : ''),
   )
+  // Timers only: the first search runs a couple of minutes after start-up.
+  if (jobAgent.start()) {
+    const d = jobAgent.diagnostics()
+    console.log(`[jarvis] job agent on: search every ${JOBS.intervalMinutes} min, applications ${JOBS.applicationMode}, tracker writes ${JOBS.trackerWrites ? 'on' : 'off'}${d.paused ? ' (paused)' : ''}`)
+  }
   // Neither of these blocks startup. The catalogue loads its cache now and
   // rescans in the background when stale; the model is loaded so the first
   // question is not a cold start. Both degrade quietly if unavailable.
@@ -1160,6 +1189,7 @@ function shutdown(signal, code = 0) {
   }
   shuttingDown = true
   console.log(`[jarvis] ${signal} — shutting down.`)
+  jobAgent.stop()
   for (const end of sessions) {
     try {
       end()
