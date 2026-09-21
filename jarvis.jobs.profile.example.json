@@ -1,0 +1,35 @@
+{
+  "_comment": "Copy to jarvis.jobs.profile.json (git-ignored) and fill in ONLY what you are happy for JARVIS to submit on application forms. Anything left blank is never guessed: a required question it cannot answer from this file stops the application and asks you. Check with: npm run jobs -- audit",
+  "fields": {
+    "firstName": "",
+    "lastName": "",
+    "preferredName": "",
+    "email": "",
+    "phone": "",
+    "city": "",
+    "postcode": "",
+    "country": "",
+    "linkedinUrl": "",
+    "githubUrl": "",
+    "portfolioUrl": "",
+    "noticePeriod": "",
+    "availability": "",
+    "rightToWorkUK": "",
+    "requiresSponsorship": "",
+    "salaryExpectation": "",
+    "university": "",
+    "degree": "",
+    "graduationDate": "",
+    "referralSource": ""
+  },
+  "demographics": {
+    "_comment": "policy 'skip' leaves optional demographic questions blank; 'decline' picks a 'Prefer not to say' option where the form offers one. A per-question answer below always wins. Required demographic questions with no answer and no decline option need your input.",
+    "policy": "skip",
+    "answers": {}
+  },
+  "declarations": {
+    "_comment": "Set true only if you want JARVIS to tick these boxes for you.",
+    "accuracyStatement": false,
+    "privacyConsent": false
+  }
+}

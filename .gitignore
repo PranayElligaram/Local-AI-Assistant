@@ -50,3 +50,7 @@ public/mediapipe/
 
 # Local Claude Code skills
 .claude/skills/
+
+# The job agent's application profile (personal answers). Never committed;
+# jarvis.jobs.profile.example.json is the template.
+jarvis.jobs.profile.json

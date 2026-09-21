@@ -50,6 +50,8 @@ import { createConversation, createMetrics } from './assistant.mjs'
 import { jobsConfig } from './jobs/config.mjs'
 import { createJobAgent } from './jobs/agent.mjs'
 import { showToast } from './jobs/toast.mjs'
+import { createApplier } from './jobs/apply/applier.mjs'
+import { loadProfile } from './jobs/profile.mjs'
 
 /**
  * Several of the APIs below (structuredClone, streaming fetch with
@@ -1103,6 +1105,8 @@ const jobAgent = createJobAgent({
     broadcastUi('notify', { text, source: 'jobs' })
     if (JOBS.notifyToast) void showToast('JARVIS job search', text)
   },
+  // Re-read each watch pass so profile edits apply without a restart.
+  createApplier: (ctx) => createApplier({ ...ctx, profile: loadProfile(ROOT, JOBS.profileFile), cvDir: join(RUN_DIR, 'jobs', 'cv') }),
 })
 
 const tools = createTools({
