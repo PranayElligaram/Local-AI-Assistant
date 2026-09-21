@@ -20,7 +20,7 @@
  *   - JARVIS's own bookkeeping lives in one extra tab, JARVIS_META.
  */
 
-import { canonicalUrl } from './job.mjs'
+import { atsIdFromUrl, canonicalUrl, locationKey } from './job.mjs'
 import { driveIdFromUrl } from './google/api.mjs'
 import { normalizeKey } from './text.mjs'
 
@@ -341,9 +341,79 @@ export function planRowUpdate(parsed, rec, change) {
   }
   if (change.note && 'notes' in c) {
     const cur = current('notes')
-    if (!cur.formula) reqs.push(cellWrite(tab.sheetId, rec.row, c.notes, literal(`${cur.value ? `${cur.value}\n` : ''}${String(change.note).slice(0, 400)}`.slice(-4000))))
+    if (!cur.formula) {
+      const text = `${cur.value ? `${cur.value}\n` : ''}${String(change.note).slice(0, 400)}`.slice(-4000)
+      reqs.push(cellWrite(tab.sheetId, rec.row, c.notes, literal(text)))
+      // Later notes planned into the same batch append to this one, not replace it.
+      const row = tab.rows.find((r) => r.row === rec.row)
+      if (row) row.cells[c.notes] = { ...cur, value: text, kind: 'string' }
+    }
   }
   return { ok: true, requests: reqs }
+}
+
+// --- marker recovery -----------------------------------------------------------
+
+const metaAts = (m) => (m.atsJobId && m.source ? `${String(m.source).split(':')[0]}:${m.atsJobId}` : atsIdFromUrl(m.applicationUrl) ?? atsIdFromUrl(m.canonicalUrl))
+const ctlKey = (company, title, location) => (company && title ? `${normalizeKey(company)}|${normalizeKey(title)}|${locationKey(location)}` : null)
+const LEVELS = ['ats', 'url', 'ctl']
+
+/**
+ * How strongly an unmarked row is the same vacancy as a meta record: 'ats',
+ * 'url', 'ctl' (company + title + location, exact after normalising case and
+ * punctuation), or null. Differing ATS ids rule a pair out entirely.
+ */
+function identityLevel(rec, m) {
+  const ra = atsIdFromUrl(rec.applicationUrl)
+  const ma = metaAts(m)
+  if (ra && ma) return ra === ma ? 'ats' : null
+  if (rec.applicationUrl && [m.applicationUrl, m.canonicalUrl].map(canonicalUrl).includes(rec.applicationUrl)) return 'url'
+  const rk = ctlKey(rec.company, rec.title, rec.location)
+  if (rk && rk === ctlKey(m.company, m.title, m.location)) return 'ctl'
+  return null
+}
+
+/**
+ * Re-link tracker rows whose [JARVIS:id] marker was removed (e.g. Automation
+ * Notes rewritten by the tailoring workflow) to their JARVIS_META record.
+ * Deterministic only: each meta record in `jobIds` is matched at the
+ * strongest identity level available, and only when exactly one unmarked row
+ * matches at that level and that row matches no other record at that level.
+ * Anything else is reported as a problem and left alone — never guessed.
+ * @returns {{ matches: Map<string, object>, problems: {jobId:string, reason:string}[] }}
+ */
+export function recoverMarkers(records, metas, jobIds) {
+  const marked = new Set(records.map((r) => r.jobId).filter(Boolean))
+  const unmarked = records.filter((r) => !r.jobId)
+  const wanted = metas.filter((m) => jobIds.has(m.jobId) && !marked.has(m.jobId))
+  const levelOf = new Map() // `${jobId}#${row}` -> level
+  for (const m of wanted) for (const r of unmarked) {
+    const l = identityLevel(r, m)
+    if (l) levelOf.set(`${m.jobId}#${r.sheetId}!${r.row}`, l)
+  }
+  const matches = new Map()
+  const problems = []
+  for (const m of wanted) {
+    const hits = unmarked.map((r) => ({ r, l: levelOf.get(`${m.jobId}#${r.sheetId}!${r.row}`) })).filter((h) => h.l)
+    if (!hits.length) {
+      problems.push({ jobId: m.jobId, reason: 'no tracker row carries its marker or matches it exactly' })
+      continue
+    }
+    const best = LEVELS.find((l) => hits.some((h) => h.l === l))
+    const top = hits.filter((h) => h.l === best)
+    if (top.length > 1) {
+      problems.push({ jobId: m.jobId, reason: `${top.length} unmarked rows match by ${best}: ${top.map((h) => `${h.r.tab}!${h.r.row + 1}`).join(', ')}` })
+      continue
+    }
+    const r = top[0].r
+    const rivals = wanted.filter((o) => o !== m && levelOf.get(`${o.jobId}#${r.sheetId}!${r.row}`) === best)
+    if (rivals.length) {
+      problems.push({ jobId: m.jobId, reason: `row ${r.tab}!${r.row + 1} also matches ${rivals.map((o) => o.jobId).join(', ')} by ${best}` })
+      continue
+    }
+    matches.set(m.jobId, { ...r, jobId: m.jobId, recoveredBy: best })
+  }
+  return { matches, problems }
 }
 
 // --- JARVIS_META -------------------------------------------------------------

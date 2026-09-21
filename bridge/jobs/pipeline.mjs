@@ -25,6 +25,7 @@ import {
   parseSpreadsheet,
   planInsert,
   planRowUpdate,
+  recoverMarkers,
   trackerRecords,
 } from './tracker.mjs'
 
@@ -244,10 +245,28 @@ export async function runWatch(ctx) {
   }
   const records = trackerRecords(parsed)
   const byId = new Map(records.filter((r) => r.jobId).map((r) => [r.jobId, r]))
-  const metas = new Map(metaRecords(parsed).map((m) => [m.jobId, m]))
+  const metaList = metaRecords(parsed)
+  const metas = new Map(metaList.map((m) => [m.jobId, m]))
 
   // A lost local store is rebuilt from JARVIS_META.
   for (const [id, m] of metas) if (!store.job(id) && m.state) store.upsertJob({ id, status: m.state, company: m.company, title: m.title, location: m.location, source: m.source, sourceJobId: m.atsJobId, applicationUrl: m.applicationUrl, canonicalUrl: m.canonicalUrl, fitScore: Number(m.fitScore) || null, tailoredCvUrl: m.tailoredCvUrl || undefined, updatedAt: m.updatedAt })
+
+  // Rows whose marker was edited away are re-linked only on an exact, unique match.
+  const requests = []
+  const active = new Set(store.jobs().filter((j) => ACTIVE_STATES.has(j.status)).map((j) => j.id))
+  const recovered = recoverMarkers(records, metaList, active)
+  run.markersRecovered = recovered.matches.size
+  run.reconcileProblems = recovered.problems
+  if (recovered.problems.length) err('RECONCILE_UNMATCHED')
+  for (const p of recovered.problems) log(`[jobs] ${p.jobId}: not re-linked — ${p.reason}`)
+  for (const [id, rec] of recovered.matches) {
+    byId.set(id, rec)
+    log(`[jobs] ${id}: marker missing; re-linked to ${rec.tab}!${rec.row + 1} by ${rec.recoveredBy}`)
+    if (cfg.trackerWrites) {
+      const plan = planRowUpdate(parsed, rec, { note: `[JARVIS:${id}] Re-linked by JARVIS ${iso.slice(0, 10)} (marker was missing; matched by ${rec.recoveredBy}).` })
+      if (plan.ok) requests.push(...plan.requests)
+    }
+  }
 
   const changed = []
   const set = (job, next) => {
@@ -294,7 +313,6 @@ export async function runWatch(ctx) {
   // Keep the tailoring backlog topped up from roles already in the tracker.
   const backlog = store.jobs().filter((j) => ['READY_TO_TAILOR', 'TAILORING'].includes(j.status)).length
   let room = Math.max(0, (cfg.maxTailorBacklog ?? 4) - backlog)
-  const requests = []
   if (cfg.trackerWrites) {
     for (const job of store.jobs().filter((j) => j.status === 'QUALIFIED').sort((a, b) => (b.rankScore ?? 0) - (a.rankScore ?? 0))) {
       if (room <= 0) break

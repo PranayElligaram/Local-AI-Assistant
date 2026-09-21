@@ -238,6 +238,93 @@ test('end to end: discovered -> queued -> tailored by the workflow -> applied wi
   assert.equal(meta.rows[1][1].userEnteredValue.stringValue, 'APPLIED')
 })
 
+/** A role inserted and queued by a search run, then tailored by the workflow with its marker wiped. */
+async function tailoredWithoutMarker({ applicationMode = 'dry-run' } = {}) {
+  const { runSearch } = await import('../bridge/jobs/pipeline.mjs')
+  const { COL, fakeHttp, fakeSource, posting } = await import('./jobs-fakes.mjs')
+  const google = fakeGoogle()
+  const dir = tmp()
+  const store = createStore(join(dir, 'state.json'))
+  const cfg = { ...jobsConfig({}), trackerWrites: true, applicationMode }
+  const driver = fakeDriver()
+  const ctx = { cfg, store, google, trackerId: 'SHEET_ID_123456', http: fakeHttp(), sources: [fakeSource([posting({ applicationUrl: 'https://job-boards.greenhouse.io/acme/jobs/9001' })])], now: () => new Date('2026-09-21T12:00:00Z') }
+  await runSearch(ctx)
+  const rows = google.fixture.tabs[0].rows
+  const id = store.jobs()[0].id
+  assert.match(rows[8][COL['Automation Notes']].userEnteredValue.stringValue, new RegExp(`\\[JARVIS:${id}\\]`))
+  rows[8][COL['Tailor Queue']] = { ...rows[8][COL['Tailor Queue']], userEnteredValue: { stringValue: '✅ Tailored' }, formattedValue: '✅ Tailored' }
+  rows[8][COL['CV PDF']] = { userEnteredValue: { formulaValue: '=HYPERLINK("https://drive.google.com/file/d/1TailoredPdfId_abcdef/view","PDF")' }, formattedValue: 'PDF' }
+  rows[8][COL['CV DOCX']] = { userEnteredValue: { formulaValue: '=HYPERLINK("https://docs.google.com/document/d/1TailoredDocId_abcdef/edit","DOCX")' }, formattedValue: 'DOCX' }
+  const summary = 'Tailored by ChatGPT 21 Sep: led with RAG + evaluation work; moved Rust project up.'
+  rows[8][COL['Automation Notes']] = { userEnteredValue: { stringValue: summary }, formattedValue: summary }
+  ctx.applier = createApplier({ ...ctx, profile: PROFILE, driver, cvDir: join(dir, 'cv') })
+  return { ctx, google, store, driver, rows, id, summary, COL }
+}
+
+test('a tailored row whose marker was replaced is re-linked by exact identity, marker restored, and never submitted', async () => {
+  const { runWatch } = await import('../bridge/jobs/pipeline.mjs')
+  const { metaRecords, parseSpreadsheet } = await import('../bridge/jobs/tracker.mjs')
+  const { ctx, google, store, driver, rows, id, summary, COL } = await tailoredWithoutMarker()
+  const rowCount = rows.filter((r) => r[COL.Programme]?.formattedValue).length
+  const r = await runWatch(ctx)
+  assert.equal(r.run.tailoredObserved, 1)
+  assert.equal(r.run.markersRecovered, 1)
+  assert.deepEqual(r.run.reconcileProblems, [])
+  assert.equal(r.run.applicationsSubmitted, 0)
+  assert.equal(driver.log.submits, 0, 'dry-run never submits')
+  const job = store.job(id)
+  assert.ok(job.history.some((h) => h.from === 'READY_TO_TAILOR' && h.to === 'TAILORED'))
+  assert.ok(!job.history.some((h) => h.to === 'APPLIED'))
+  const meta = metaRecords(parseSpreadsheet(await google.getSpreadsheet())).find((m) => m.jobId === id)
+  assert.ok(['TAILORED', 'APPLYING', 'NEEDS_INPUT'].includes(meta.state), meta.state)
+  assert.notEqual(meta.state, 'APPLIED')
+  assert.equal(meta.tailoredCvUrl, 'https://docs.google.com/document/d/1TailoredDocId_abcdef/edit')
+  assert.equal(meta.tailoredPdfUrl, 'https://drive.google.com/file/d/1TailoredPdfId_abcdef/view')
+  assert.ok(meta.tailoredAt && meta.updatedAt)
+  const notes = rows[8][COL['Automation Notes']].userEnteredValue.stringValue
+  assert.ok(notes.startsWith(summary), 'the tailoring summary is kept')
+  assert.match(notes, new RegExp(`\\[JARVIS:${id}\\] Re-linked by JARVIS .* matched by ats`))
+  assert.equal(rows.filter((x) => x[COL.Programme]?.formattedValue).length, rowCount, 'no row added')
+  assert.equal(rows[8][COL['Application Status']].userEnteredValue.stringValue, '☐ Not applied')
+  // Next pass reads the restored marker directly.
+  const again = await runWatch(ctx)
+  assert.equal(again.run.markersRecovered, 0)
+})
+
+test('a missing marker with two equally matching rows is never guessed', async () => {
+  const { runWatch } = await import('../bridge/jobs/pipeline.mjs')
+  const { ctx, store, driver, rows, id, summary, COL } = await tailoredWithoutMarker()
+  // A second unmarked row with the same company/title/location and neither with a link.
+  rows[9] = structuredClone(rows[8])
+  rows[8][COL.View] = {}
+  rows[9][COL.View] = {}
+  const r = await runWatch(ctx)
+  assert.equal(r.run.tailoredObserved, 0)
+  assert.equal(r.run.markersRecovered, 0)
+  assert.equal(r.run.reconcileProblems.length, 1)
+  assert.match(r.run.reconcileProblems[0].reason, /2 unmarked rows match by ctl/)
+  assert.ok(r.run.errorCategories.includes('RECONCILE_UNMATCHED'))
+  assert.equal(store.job(id).status, 'READY_TO_TAILOR')
+  assert.equal(driver.log.opened.length, 0)
+  for (const row of [rows[8], rows[9]]) assert.equal(row[COL['Automation Notes']].userEnteredValue.stringValue, summary)
+})
+
+test('recoverMarkers: differing ATS ids never match, and one row cannot serve two jobs', async () => {
+  const { recoverMarkers } = await import('../bridge/jobs/tracker.mjs')
+  const row = { sheetId: 0, row: 8, tab: 'Active Roles', company: 'Helsing', title: 'Software Engineer (Early Careers)', location: 'London', applicationUrl: 'https://job-boards.greenhouse.io/helsing/jobs/111', jobId: null }
+  const meta = (jobId, over = {}) => ({ jobId, company: 'Helsing', title: 'Software Engineer (Early Careers)', location: 'London, UK', source: 'greenhouse:helsing', atsJobId: '111', applicationUrl: '', canonicalUrl: '', ...over })
+  let r = recoverMarkers([row], [meta('jb_a', { atsJobId: '222' })], new Set(['jb_a']))
+  assert.equal(r.matches.size, 0, 'same name, different ATS id: not the same vacancy')
+  r = recoverMarkers([row], [meta('jb_a')], new Set(['jb_a']))
+  assert.equal(r.matches.get('jb_a').recoveredBy, 'ats')
+  r = recoverMarkers([{ ...row, applicationUrl: '' }], [meta('jb_a', { atsJobId: '' }), meta('jb_b', { atsJobId: '' })], new Set(['jb_a', 'jb_b']))
+  assert.equal(r.matches.size, 0)
+  assert.equal(r.problems.length, 2)
+  r = recoverMarkers([{ ...row, jobId: 'jb_a' }], [meta('jb_a')], new Set(['jb_a']))
+  assert.equal(r.matches.size, 0, 'a marked job needs no recovery')
+  assert.equal(r.problems.length, 0)
+})
+
 // --- URL validation -----------------------------------------------------------
 
 test('55/57. the browser opens only validated job URLs', () => {

@@ -123,7 +123,11 @@ No full read-write Drive access. Revoke any time at
   formula.
 * Dropdown values are taken from the cell's own validation list.
 * Everything JARVIS needs internally goes in one extra tab, `JARVIS_META`.
-* Rows are identified by the `[JARVIS:jb_…]` marker in Automation Notes.
+* Rows are identified by the `[JARVIS:jb_…]` marker in Automation Notes. If
+  the marker is edited away, the watcher re-links the row to its `JARVIS_META`
+  record only on an exact, unique match (ATS job id, then canonical URL, then
+  company + title + location) and appends the marker back to the notes. Zero
+  or several matches are reported (`reconcileProblems`), never guessed.
 
 ## 5. Application profile and modes
 
