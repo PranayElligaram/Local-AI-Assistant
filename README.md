@@ -152,6 +152,17 @@ model does not have; JARVIS opens the search and says he cannot read live result
 yet rather than inventing them. `bridge/web.mjs` documents the
 `WebSearchProvider` extension point for real retrieval later.
 
+### Job agent
+
+An optional autonomous job search (`JOBS_AGENT_ENABLED=true`): on a timer it
+searches public ATS boards, filters roles against the canonical requirements,
+deduplicates against your Google Sheet tracker, adds the best few and queues
+them for CV tailoring by a separate ChatGPT Scheduled Task, notices when a CV
+is tailored, and (in dry-run by default) prepares the application. Ask "How is
+the job search going?". Setup, safety rules and the ChatGPT hand-off:
+[docs/job-agent.md](docs/job-agent.md) and
+[docs/job-agent-chatgpt-tailoring.md](docs/job-agent-chatgpt-tailoring.md).
+
 ### Voice
 
 - **Wake:** "Hey Jarvis", matched in the transcript (or offline with a Picovoice
