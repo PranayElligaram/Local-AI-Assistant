@@ -97,5 +97,26 @@ export function sanitizeEvidence(e = {}) {
   }
 }
 
+/**
+ * Submit was triggered but no positive evidence could be read, so the outcome
+ * is UNKNOWN: the employer may already have the application. Parked in
+ * NEEDS_INPUT (resuming to APPLYING, which nothing picks up automatically)
+ * and flagged so no automatic path re-queues it. Only a person clears this.
+ */
+export const SUBMISSION_UNKNOWN_REASON = 'Submission was triggered but confirmation could not be verified. Check employer ATS/email before retrying.'
+/** Recognises an ambiguous-submission reason when a job is rebuilt from JARVIS_META. */
+export const SUBMISSION_UNKNOWN_RE = /\b(submit|submission) was triggered\b/i
+
+export function markSubmissionUnknown(job, { at, reason = SUBMISSION_UNKNOWN_REASON, error, diagnostic } = {}) {
+  const next = transition(job, 'NEEDS_INPUT', { at, reason })
+  return {
+    ...next,
+    resumeState: 'APPLYING',
+    submissionOutcome: 'UNKNOWN',
+    ...(error !== undefined ? { lastApplyError: error } : {}),
+    ...(diagnostic ? { postSubmitDiagnostic: diagnostic } : {}),
+  }
+}
+
 /** Queues the watcher cares about, by state. */
 export const ACTIVE_STATES = new Set(['QUALIFIED', 'READY_TO_TAILOR', 'TAILORING', 'TAILORED', 'APPLYING', 'NEEDS_INPUT', 'APPLICATION_FAILED'])

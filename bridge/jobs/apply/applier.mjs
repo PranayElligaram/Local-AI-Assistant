@@ -10,13 +10,19 @@
  *            fill approved answers, upload the tailored CV, submit when nothing
  *            is unresolved, and record APPLIED only on positive evidence.
  *
+ * Once submit has been triggered the employer may have the application, so
+ * anything short of positive evidence (an unreadable page, a browser error, no
+ * confirmation text) is an UNKNOWN outcome, not a failure: the job is parked
+ * in NEEDS_INPUT with submissionOutcome UNKNOWN and is never retried
+ * automatically. Errors before submit are ordinary APPLICATION_FAILED.
+ *
  * Any unresolved question stops the application (NEEDS_INPUT) — no guessing.
  * Every run is capped by JOBS_MAX_APPLICATIONS_PER_DAY.
  */
 
 import { mkdirSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { transition } from '../state.mjs'
+import { markSubmissionUnknown, transition } from '../state.mjs'
 import { planRowUpdate } from '../tracker.mjs'
 import { driveIdFromUrl } from '../google/api.mjs'
 import { auditProfile } from '../profile.mjs'
@@ -46,6 +52,24 @@ export function validateApplicationUrl(raw, job = {}) {
   const embeddedGreenhouse = String(job.source ?? '').startsWith('greenhouse:') && canonicalHost === host && u.searchParams.has('gh_jid')
   if (!ATS_HOSTS.test(host) && !employerOk && !embeddedGreenhouse) return { ok: false, reason: `${host} is not a recognised ATS or the employer's own site` }
   return { ok: true, url: href }
+}
+
+/** One line of an exception, bounded, with URL queries, emails and known profile values removed. */
+export function sanitizeError(err, profile) {
+  let m = String(err?.message ?? err ?? '').split('\n')[0].replace(/\s+/g, ' ')
+  m = m.replace(/(https?:\/\/[^\s?#"']+)[?#][^\s"']*/g, '$1')
+  for (const v of Object.values(profile?.fields ?? {})) if (typeof v === 'string' && v.length >= 3) m = m.split(v).join('[redacted]')
+  return m.replace(/[\w.+-]+@[\w-]+\.[\w.]+/g, '[email]').slice(0, 200)
+}
+
+/** Origin + path only: confirmation pages can carry tokens in the query. */
+function safeFinalUrl(u) {
+  try {
+    const x = new URL(String(u))
+    return `${x.origin}${x.pathname}`.slice(0, 300)
+  } catch {
+    return ''
+  }
 }
 
 /**
@@ -88,6 +112,35 @@ export function createApplier(d) {
     }
   }
 
+  const polls = Math.max(1, cfg.postSubmitPolls ?? 8)
+  const pollMs = cfg.postSubmitPollMs ?? 2500
+
+  /**
+   * After submit: re-read whichever page/frame is current, a bounded number of
+   * times, until positive evidence (or a blocker) appears. Reads that throw are
+   * tolerated — navigation, a detached frame or an SPA rerender are expected.
+   * Returns the last readable page and the last read error. A changed page is
+   * never itself evidence; verify.mjs decides.
+   */
+  async function readOutcome(session) {
+    let last = null
+    let readError = null
+    for (let i = 0; i < polls; i++) {
+      if (i) await Promise.resolve(session.wait?.(pollMs)).catch(() => {})
+      try {
+        const snap = await session.snapshot()
+        if (snap && snap.readable !== false) {
+          last = snap
+          if (evidence(snap).verified || blockers(snap).length) break
+        }
+      } catch (err) {
+        readError = err
+        if (err?.fatal) break // the browser itself is gone; nothing more to read
+      }
+    }
+    return { after: last, readError }
+  }
+
   /** One job. Returns { job, outcome, requests } and never throws. */
   async function applyOne(job0, { rec, parsed, mode }) {
     const iso = now().toISOString()
@@ -113,9 +166,28 @@ export function createApplier(d) {
     job = transition(job, 'APPLYING', { at: iso })
     let session = null
     let submittedClick = false
+    let stage = 'open'
+    let lastUrl = ''
+    // Bounded and non-sensitive: no field values, no page text.
+    const diagnostic = ({ err, snap } = {}) => ({
+      stage,
+      errorClass: err ? String(err.name ?? 'Error').slice(0, 60) : '',
+      errorMessage: err ? sanitizeError(err, profile) : '',
+      finalUrl: safeFinalUrl(snap?.url ?? lastUrl),
+      submitTriggered: submittedClick,
+      formStillPresent: typeof snap?.formStillPresent === 'boolean' ? snap.formStillPresent : null,
+      at: iso,
+    })
+    const unknown = (detail, diag) => {
+      job = markSubmissionUnknown(job, { at: iso, error: detail, diagnostic: diag })
+      note(`Submit was triggered but the submission could not be verified (${detail}). NOT marked applied and will not be retried — check the employer's ATS/email.`)
+      return { job, outcome: 'SUBMISSION_UNKNOWN', requests }
+    }
     try {
       session = await (await getDriver()).open(target.url)
+      stage = 'read-form'
       const page = await session.snapshot()
+      lastUrl = page.url ?? ''
       const stop = blockers(page)
       if (stop.some((b) => b.kind === 'closed')) {
         job = { ...transition(job, 'CLOSED', { at: iso }), closedReason: 'vacancy closed at application time' }
@@ -135,20 +207,34 @@ export function createApplier(d) {
         return { job, outcome: 'DRY_RUN_READY', requests }
       }
 
+      stage = 'fill'
       for (const p of plan) {
         if (p.action === 'fill') await session.fill(p.field.id, p.value)
         else if (p.action === 'choose') await session.choose(p.field.id, p.option)
         else if (p.action === 'check') await session.check(p.field.id)
         else if (p.action === 'upload') await session.upload(p.field.id, cv.path)
       }
+      stage = 'pre-submit-check'
       const before = blockers(await session.snapshot())
       if (before.length) return needs(before[0].reason)
 
-      submittedClick = true
-      store.count('attempted', 1, now())
-      await session.submit()
-      const after = await session.snapshot()
-      const ev = evidence(after)
+      stage = 'submit'
+      let submitError = null
+      try {
+        submittedClick = true
+        store.count('attempted', 1, now())
+        await session.submit()
+      } catch (err) {
+        // Only the driver's explicit "nothing was clicked" is pre-submit; any other error may have submitted.
+        if (err?.submitNotTriggered) {
+          submittedClick = false
+          throw err
+        }
+        submitError = err
+      }
+      stage = 'post-submit-read'
+      const { after, readError } = await readOutcome(session)
+      const ev = after ? evidence(after) : { verified: false, kind: 'none', detail: 'the page could not be read after submit' }
       if (ev.verified) {
         job = transition(job, 'APPLIED', { at: iso, evidence: ev })
         store.count('submitted', 1, now())
@@ -159,19 +245,23 @@ export function createApplier(d) {
         }
         return { job, outcome: 'APPLIED', requests }
       }
-      // 48: a click without proof is not an application.
-      const late = blockers(after)
-      if (late.length) return needs(late[0].reason)
-      job = { ...transition(job, 'APPLICATION_FAILED', { at: iso }), lastApplyError: ev.detail }
-      note(`Submission could not be verified (${ev.detail}); not marked applied.`)
-      return { job, outcome: 'APPLICATION_FAILED', requests }
+      // 48: a click without proof is not an application — nor, after a click, a failure: the outcome is unknown.
+      const err = submitError ?? (after ? null : readError)
+      if (err) log(`[jobs] application ${job.id} after submit (${stage}): ${sanitizeError(err, profile)}`)
+      const late = after ? blockers(after) : []
+      const detail = err ? sanitizeError(err, profile) : late.length ? `after submit: ${late[0].reason}` : ev.detail
+      return { ...unknown(detail, diagnostic({ err, snap: after })), ...(err ? { error: 'BROWSER' } : {}) }
     } catch (err) {
-      log(`[jobs] application ${job.id}: ${err.message}`)
-      if (submittedClick) {
-        job = { ...transition(job, 'APPLICATION_FAILED', { at: iso }), lastApplyError: 'browser error after submit' }
+      log(`[jobs] application ${job.id} (${stage}): ${sanitizeError(err, profile)}`)
+      if (job.status === 'APPLIED') return { job, outcome: 'APPLIED', requests } // evidence already recorded
+      if (submittedClick) return { ...unknown(sanitizeError(err, profile), diagnostic({ err })), error: 'BROWSER' }
+      if (mode === 'live') {
+        // Nothing was submitted. Not retried automatically either: fields may have been half-filled.
+        job = { ...transition(job, 'APPLICATION_FAILED', { at: iso }), lastApplyError: sanitizeError(err, profile), postSubmitDiagnostic: diagnostic({ err }) }
+        note(`Application failed before submit (${sanitizeError(err, profile)}); nothing was submitted.`)
         return { job, outcome: 'APPLICATION_FAILED', requests, error: 'BROWSER' }
       }
-      job = { ...transition(job, 'TAILORED', { at: iso }), lastApplyError: String(err.message).slice(0, 160) }
+      job = { ...transition(job, 'TAILORED', { at: iso }), lastApplyError: sanitizeError(err, profile).slice(0, 160) }
       return { job, outcome: 'ERROR', requests, error: 'BROWSER' }
     } finally {
       await session?.close?.().catch?.(() => {})
@@ -198,7 +288,8 @@ export function createApplier(d) {
       const room = Math.max(0, cfg.maxApplicationsPerDay - used)
       const queue = store
         .jobs()
-        .filter((j) => j.status === 'TAILORED' && !(mode !== 'live' && j.dryRunInspectedAt))
+        // An UNKNOWN submission is never re-applied automatically, whatever state it ends up in.
+        .filter((j) => j.status === 'TAILORED' && j.submissionOutcome !== 'UNKNOWN' && !(mode !== 'live' && j.dryRunInspectedAt))
         .sort((a, b) => (b.rankScore ?? 0) - (a.rankScore ?? 0))
         .slice(0, room)
       for (const job of queue) {
@@ -208,11 +299,11 @@ export function createApplier(d) {
         r.changed.push(out.job)
         r.requests.push(...out.requests)
         if (out.error && !r.errorCategories.includes(out.error)) r.errorCategories.push(out.error)
-        if (out.outcome === 'NEEDS_INPUT') {
+        if (['NEEDS_INPUT', 'SUBMISSION_UNKNOWN'].includes(out.outcome)) {
           r.needsInput++
           store.count('needsInput', 1, at)
         }
-        if (['APPLIED', 'APPLICATION_FAILED'].includes(out.outcome)) r.attempted++
+        if (['APPLIED', 'APPLICATION_FAILED', 'SUBMISSION_UNKNOWN'].includes(out.outcome)) r.attempted++
         if (out.outcome === 'APPLIED') r.submitted++
       }
       return r

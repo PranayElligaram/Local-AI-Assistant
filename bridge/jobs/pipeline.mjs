@@ -15,7 +15,7 @@
 import { randomUUID } from 'node:crypto'
 import { DedupeIndex, descriptionFingerprint, normalizeJob } from './job.mjs'
 import { classifyLocation, classifyTitle, evaluate, rankJobs } from './criteria.mjs'
-import { ACTIVE_STATES, transition } from './state.mjs'
+import { ACTIVE_STATES, SUBMISSION_UNKNOWN_RE, transition } from './state.mjs'
 import {
   ensureMetaRequests,
   insertRequests,
@@ -249,7 +249,12 @@ export async function runWatch(ctx) {
   const metas = new Map(metaList.map((m) => [m.jobId, m]))
 
   // A lost local store is rebuilt from JARVIS_META.
-  for (const [id, m] of metas) if (!store.job(id) && m.state) store.upsertJob({ id, status: m.state, company: m.company, title: m.title, location: m.location, source: m.source, sourceJobId: m.atsJobId, applicationUrl: m.applicationUrl, canonicalUrl: m.canonicalUrl, fitScore: Number(m.fitScore) || null, tailoredCvUrl: m.tailoredCvUrl || undefined, updatedAt: m.updatedAt })
+  for (const [id, m] of metas) {
+    if (store.job(id) || !m.state) continue
+    // An unverified submission must survive a rebuild, or the job would look retryable.
+    const unknown = m.state === 'NEEDS_INPUT' && SUBMISSION_UNKNOWN_RE.test(m.needsInputReason ?? '')
+    store.upsertJob({ id, status: m.state, company: m.company, title: m.title, location: m.location, source: m.source, sourceJobId: m.atsJobId, applicationUrl: m.applicationUrl, canonicalUrl: m.canonicalUrl, fitScore: Number(m.fitScore) || null, tailoredCvUrl: m.tailoredCvUrl || undefined, updatedAt: m.updatedAt, ...(unknown ? { resumeState: 'APPLYING', submissionOutcome: 'UNKNOWN', needsInput: { reason: m.needsInputReason, question: '', at: m.updatedAt } } : {}) })
+  }
 
   // Rows whose marker was edited away are re-linked only on an exact, unique match.
   const requests = []
@@ -289,6 +294,11 @@ export async function runWatch(ctx) {
       const q = rec?.tailorQueue ?? ''
       const cvUrl = rec?.cvDocx || meta?.tailoredCvUrl || rec?.cvPdf || ''
       const pdfUrl = rec?.cvPdf || meta?.tailoredPdfUrl || ''
+      // A job whose submission outcome is UNKNOWN is only ever closed (tracker Applied/Void/Skip), never re-queued.
+      if (job.submissionOutcome === 'UNKNOWN') {
+        if (q === 'skip') job = set(job, { ...advance(job, 'CLOSED', { at: iso }), closedReason: 'skipped in the tracker' })
+        continue
+      }
       if (['READY_TO_TAILOR', 'TAILORING', 'NEEDS_INPUT'].includes(job.status) && (q === 'tailored' || meta?.state === 'TAILORED') && cvUrl) {
         job = set(job, { ...advance(job, 'TAILORED', { at: iso, cvUrl }), tailoredPdfUrl: pdfUrl, tailoredAt: meta?.tailoredAt || rec?.lastTailored || iso })
         run.tailoredObserved++

@@ -82,6 +82,8 @@ const PAGE_FACTS = () => ({
   fileInputs: document.querySelectorAll('input[type=file]').length,
 })
 
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+
 export function createPlaywrightDriver({ profileDir, headless = true, timeoutMs = 45_000 }) {
   return {
     async open(url) {
@@ -101,7 +103,13 @@ export function createPlaywrightDriver({ profileDir, headless = true, timeoutMs 
       await page.waitForSelector('input:not([type=hidden]), textarea, select', { timeout: 12_000 }).catch(() => {})
       await page.waitForTimeout(1500)
       let status = response?.status() ?? 0
-      const frames = () => page.frames()
+      // A successful submit may navigate, replace the frame, or open a new page; always read the newest open one.
+      const current = () => {
+        const open = context.pages().filter((p) => !p.isClosed())
+        if (!open.length) throw Object.assign(new Error('the application browser page was closed'), { name: 'PageClosedError', fatal: true })
+        return open.at(-1)
+      }
+      const frames = () => current().frames()
       const locate = (id) => {
         const [f] = String(id).split(':')
         return frames()[Number(f)].locator(`[data-jarvis-idx="${String(id).replace(/[^0-9:]/g, '')}"]`)
@@ -110,16 +118,19 @@ export function createPlaywrightDriver({ profileDir, headless = true, timeoutMs 
 
       return {
         async snapshot() {
+          const p = current()
           const facts = []
-          for (const f of frames()) facts.push(await f.evaluate(PAGE_FACTS).catch(() => null))
+          // A frame detached or mid-navigation reads as null, never as an error.
+          for (const f of p.frames()) facts.push(await f.evaluate(PAGE_FACTS).catch(() => null))
           const ok = facts.filter(Boolean)
           return {
-            url: page.url(),
-            title: await page.title().catch(() => ''),
+            readable: ok.length > 0,
+            url: p.url(),
+            title: await p.title().catch(() => ''),
             status,
             text: ok.map((x) => x.text).join('\n').slice(0, 20_000),
             hasPasswordField: ok.some((x) => x.hasPasswordField),
-            captchaFrames: frames().filter((f) => /recaptcha|hcaptcha|turnstile|challenges\.cloudflare|arkoselabs|funcaptcha/i.test(f.url())).length,
+            captchaFrames: p.frames().filter((f) => /recaptcha|hcaptcha|turnstile|challenges\.cloudflare|arkoselabs|funcaptcha/i.test(f.url())).length,
             formStillPresent: ok.some((x) => x.fileInputs > 0 || x.formInputs > 3),
           }
         },
@@ -144,20 +155,30 @@ export function createPlaywrightDriver({ profileDir, headless = true, timeoutMs 
         },
         check: (id) => locate(id).check(),
         upload: (id, path) => locate(id).setInputFiles(path),
+        /**
+         * Clicks submit, then waits a bounded time for the page to settle.
+         * Throws with `submitNotTriggered` only when nothing was clicked; any
+         * error after the click is left for the caller to treat as UNKNOWN.
+         */
         async submit() {
+          let btn = null
           for (const f of frames()) {
-            const btn = f.locator('button[type=submit], input[type=submit], button:has-text("Submit application"), button:has-text("Submit Application"), button:has-text("Submit")').first()
-            if (await btn.count()) {
-              const nav = page.waitForLoadState('networkidle', { timeout: 20_000 }).catch(() => {})
-              await btn.click()
-              await nav
-              await page.waitForTimeout(2500)
-              status = 200
-              return
+            const b = f.locator('button[type=submit], input[type=submit], button:has-text("Submit application"), button:has-text("Submit Application"), button:has-text("Submit")').first()
+            if (await b.count().catch(() => 0)) {
+              btn = b
+              break
             }
           }
-          throw new Error('no submit button found')
+          if (!btn) throw Object.assign(new Error('no submit button found'), { submitNotTriggered: true })
+          // noWaitAfter: a navigation or detached frame after the click must not surface as a click error.
+          await btn.click({ noWaitAfter: true })
+          status = 200
+          const p = current()
+          await p.waitForLoadState('domcontentloaded', { timeout: 20_000 }).catch(() => {})
+          await p.waitForLoadState('networkidle', { timeout: 15_000 }).catch(() => {})
+          await sleep(2500)
         },
+        wait: (ms) => sleep(Math.min(ms, 10_000)),
         close: () => context.close(),
       }
     },

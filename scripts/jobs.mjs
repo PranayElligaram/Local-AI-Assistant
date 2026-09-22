@@ -10,11 +10,13 @@
  *   npm run jobs -- watch                one tracker watch pass (tailoring detection)
  *   npm run jobs -- audit                application-profile answer audit
  *   npm run jobs -- apply-check <jobId>  dry-run an application form (never submits)
+ *   npm run jobs -- inspect-job <jobId>  read-only: one job's state and diagnostics (no profile values)
  */
 
 import { ROOT, RUN_DIR } from '../bridge/config.mjs'
 import { jobsConfig } from '../bridge/jobs/config.mjs'
 import { createJobAgent, tokenFile } from '../bridge/jobs/agent.mjs'
+import { inspectJob } from '../bridge/jobs/store.mjs'
 import { createAuth, createTokenStore } from '../bridge/jobs/google/oauth.mjs'
 import { createGoogle } from '../bridge/jobs/google/api.mjs'
 import { mappingProblems, parseSpreadsheet, resolveTracker, trackerRecords, metaRecords } from '../bridge/jobs/tracker.mjs'
@@ -139,8 +141,16 @@ async function main() {
       print(await applier.inspect(job))
       break
     }
+    case 'inspect-job': {
+      const jobId = rest[0]
+      if (!/^jb_[a-z0-9]+$/.test(String(jobId))) return console.log('usage: npm run jobs -- inspect-job <jobId>')
+      const job = createJobAgent({ cfg: { ...base, applicationMode: 'dry-run' }, root: ROOT, runDir: RUN_DIR }).store.job(jobId)
+      if (!job) return console.log(`[jobs] no job ${jobId} in local state`)
+      print(inspectJob(job))
+      break
+    }
     default:
-      console.log('usage: npm run jobs -- status|auth|resolve|discover|queue-one --yes|watch|audit|apply-check <jobId>')
+      console.log('usage: npm run jobs -- status|auth|resolve|discover|queue-one --yes|watch|audit|apply-check <jobId>|inspect-job <jobId>')
   }
 }
 

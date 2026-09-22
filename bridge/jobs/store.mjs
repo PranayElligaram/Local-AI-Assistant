@@ -50,8 +50,30 @@ export function slimJob(job) {
     'applicationDifficulty', 'interviewDifficulty', 'status', 'resumeState', 'needsInput', 'tailoredCvUrl', 'tailoredPdfUrl',
     'tailoredAt', 'appliedAt', 'submissionEvidence', 'history', 'updatedAt', 'trackerRow', 'descriptionFingerprint', 'dryRun',
     'trackerTab', 'closedReason', 'lastApplyError', 'dryRunInspectedAt', 'dryRunPlan',
+    'submissionOutcome', 'postSubmitDiagnostic',
   ]
   return Object.fromEntries(keep.filter((k) => job[k] !== undefined).map((k) => [k, job[k]]))
+}
+
+/** A read-only, non-sensitive view of one job for `npm run jobs -- inspect-job`. Never profile values or CV contents. */
+export function inspectJob(job) {
+  return {
+    id: job.id,
+    company: job.company ?? null,
+    title: job.title ?? null,
+    status: job.status,
+    resumeState: job.resumeState ?? null,
+    submissionOutcome: job.submissionOutcome ?? null,
+    needsInput: job.needsInput ?? null,
+    lastApplyError: job.lastApplyError ?? null,
+    dryRunInspectedAt: job.dryRunInspectedAt ?? null,
+    applicationUrl: job.applicationUrl ?? null,
+    tailoredCvAvailable: Boolean(job.tailoredCvUrl || job.tailoredPdfUrl),
+    appliedAt: job.appliedAt ?? null,
+    submissionEvidence: job.submissionEvidence ?? null,
+    history: job.history ?? [],
+    postSubmitDiagnostic: job.postSubmitDiagnostic ?? null,
+  }
 }
 
 export function createStore(file) {

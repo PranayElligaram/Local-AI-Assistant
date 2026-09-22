@@ -35,9 +35,13 @@ const FORM = [
   { id: '0:8', label: 'Gender', type: 'select', required: false, options: ['Male', 'Female', 'Prefer not to say'] },
 ]
 
-/** A scripted page: before/after submit. */
-function fakeDriver({ page = {}, fields = FORM, after = { text: 'Thank you for applying! Your application has been received. Reference number: GH-12345' }, onOpen } = {}) {
-  const log = { opened: [], filled: [], uploads: [], submits: 0, closed: 0 }
+/**
+ * A scripted page: before/after submit. `afterReads` scripts successive
+ * post-submit reads (a page object, or an Error to throw); the last one repeats.
+ * `submitError` makes submit() throw after the click.
+ */
+function fakeDriver({ page = {}, fields = FORM, after = { text: 'Thank you for applying! Your application has been received. Reference number: GH-12345' }, afterReads = null, submitError = null, onOpen } = {}) {
+  const log = { opened: [], filled: [], uploads: [], submits: 0, closed: 0, reads: 0 }
   return {
     log,
     async open(url) {
@@ -45,7 +49,13 @@ function fakeDriver({ page = {}, fields = FORM, after = { text: 'Thank you for a
       onOpen?.(url)
       let submitted = false
       return {
-        snapshot: async () => (submitted ? { url: `${url}/confirmation`, title: 'Application submitted', ...after } : { url, title: 'Apply', text: 'Apply for this job', ...page }),
+        snapshot: async () => {
+          if (!submitted) return { url, title: 'Apply', text: 'Apply for this job', ...page }
+          if (!afterReads) return { url: `${url}/confirmation`, title: 'Application submitted', ...after }
+          const r = afterReads[Math.min(log.reads++, afterReads.length - 1)]
+          if (r instanceof Error) throw r
+          return { url, ...r }
+        },
         fields: async () => fields,
         fill: async (id, v) => log.filled.push([id, v]),
         choose: async (id, o) => log.filled.push([id, o]),
@@ -54,6 +64,7 @@ function fakeDriver({ page = {}, fields = FORM, after = { text: 'Thank you for a
         submit: async () => {
           log.submits++
           submitted = true
+          if (submitError) throw submitError
         },
         close: async () => log.closed++,
       }
@@ -132,14 +143,143 @@ test('49. verified success produces APPLIED with a small evidence record', async
   assert.equal(store.day(new Date('2026-09-21T12:00:00Z')).submitted, 1)
 })
 
-test('48. a submit click without confirmation is NOT applied', async () => {
-  for (const after of [{ text: 'Apply for this job' }, { text: '' }, { text: 'Thank you for applying', formStillPresent: true }, { text: 'Thank you for applying. There were errors: this field is required.' }]) {
+test('48/F. a submit click without confirmation is NOT applied — and, since it may have submitted, not "failed" either', async () => {
+  for (const after of [{ text: 'Apply for this job' }, { text: '' }, { text: 'Thank you for applying', formStillPresent: true }, { text: 'Thank you for applying. There were errors: this field is required.' }, { text: 'Page changed', url: 'https://job-boards.greenhouse.io/acme/jobs/9001/next' }]) {
     const { run, store } = setup({ mode: 'live', driver: fakeDriver({ after }) })
     const r = await run()
     assert.equal(r.submitted, 0, JSON.stringify(after))
-    assert.notEqual(store.job('jb_test1').status, 'APPLIED')
-    assert.equal(store.job('jb_test1').status, 'APPLICATION_FAILED')
+    const j = store.job('jb_test1')
+    assert.equal(j.status, 'NEEDS_INPUT', JSON.stringify(after))
+    assert.equal(j.submissionOutcome, 'UNKNOWN')
+    assert.equal(j.appliedAt, undefined)
+    assert.equal(j.submissionEvidence, undefined)
   }
+})
+
+// --- post-submit outcomes -------------------------------------------------------
+
+const CONFIRMED = { text: 'Thank you for applying! Your application has been received.', formStillPresent: false }
+
+test('A. submit + confirmation visible -> APPLIED with a diagnostic-free record', async () => {
+  const { run, store } = setup({ mode: 'live', driver: fakeDriver({ afterReads: [CONFIRMED] }) })
+  await run()
+  const j = store.job('jb_test1')
+  assert.equal(j.status, 'APPLIED')
+  assert.equal(j.submissionEvidence.kind, 'thank-you-page')
+  assert.equal(j.submissionOutcome, undefined)
+})
+
+test('B. submit + navigation / SPA rerender (reads throw, then empty, then confirmation) -> APPLIED', async () => {
+  const detached = Object.assign(new Error('Execution context was destroyed, most likely because of a navigation'), { name: 'Error' })
+  const driver = fakeDriver({ submitError: new Error('frame was detached'), afterReads: [detached, { text: '', readable: false }, { text: 'Loading…' }, { ...CONFIRMED, url: 'https://job-boards.greenhouse.io/acme/jobs/9001/confirmation?token=abc' }] })
+  const { run, store } = setup({ mode: 'live', driver })
+  await run()
+  const j = store.job('jb_test1')
+  assert.equal(j.status, 'APPLIED')
+  assert.equal(driver.log.submits, 1)
+  assert.equal(j.submissionEvidence.url, 'https://job-boards.greenhouse.io/acme/jobs/9001/confirmation')
+})
+
+test('C. submit triggered + page/context throws before confirmation can be read -> NEEDS_INPUT (UNKNOWN), not APPLICATION_FAILED', async () => {
+  const closed = Object.assign(new Error('Target page, context or browser has been closed\nCall log: test@example.invalid'), { name: 'TargetClosedError' })
+  const { run, store } = setup({ mode: 'live', driver: fakeDriver({ afterReads: [closed] }) })
+  const r = await run()
+  assert.equal(r.submitted, 0)
+  assert.equal(r.attempted, 1)
+  assert.deepEqual(r.errorCategories, ['BROWSER'])
+  const j = store.job('jb_test1')
+  assert.equal(j.status, 'NEEDS_INPUT')
+  assert.equal(j.resumeState, 'APPLYING')
+  assert.equal(j.submissionOutcome, 'UNKNOWN')
+  assert.match(j.needsInput.reason, /Submission was triggered but confirmation could not be verified/)
+  assert.equal(j.lastApplyError, 'Target page, context or browser has been closed')
+  const d = j.postSubmitDiagnostic
+  assert.deepEqual(Object.keys(d).sort(), ['at', 'errorClass', 'errorMessage', 'finalUrl', 'formStillPresent', 'stage', 'submitTriggered'])
+  assert.equal(d.stage, 'post-submit-read')
+  assert.equal(d.submitTriggered, true)
+  assert.equal(d.errorClass, 'TargetClosedError')
+  assert.equal(d.formStillPresent, null)
+  assert.equal(d.finalUrl, 'https://job-boards.greenhouse.io/acme/jobs/9001')
+  for (const v of Object.values(PROFILE.fields)) assert.ok(!JSON.stringify(j).includes(v), `profile value leaked: ${v}`)
+  assert.equal(store.day(new Date('2026-09-21T12:00:00Z')).submitted ?? 0, 0)
+})
+
+test('D. an UNKNOWN submission is never retried: not by the next apply pass, not by a watch pass, not after a META rebuild', async () => {
+  const { runSearch, runWatch } = await import('../bridge/jobs/pipeline.mjs')
+  const { COL, fakeHttp, fakeSource, posting } = await import('./jobs-fakes.mjs')
+  const google = fakeGoogle()
+  const dir = tmp()
+  let store = createStore(join(dir, 'state.json'))
+  const cfg = { ...jobsConfig({}), trackerWrites: true, applicationMode: 'live' }
+  const driver = fakeDriver({ afterReads: [new Error('Target page, context or browser has been closed')] })
+  const ctx = { cfg, store, google, trackerId: 'SHEET_ID_123456', http: fakeHttp(), sources: [fakeSource([posting({ applicationUrl: 'https://job-boards.greenhouse.io/acme/jobs/9001' })])], now: () => new Date('2026-09-21T12:00:00Z') }
+  await runSearch(ctx)
+  const row = google.fixture.tabs[0].rows[8]
+  row[COL['Tailor Queue']].formattedValue = '✅ Tailored'
+  row[COL['CV PDF']] = { userEnteredValue: { formulaValue: '=HYPERLINK("https://drive.google.com/file/d/1TailoredPdfId_abcdef/view","PDF")' }, formattedValue: 'PDF' }
+  ctx.applier = createApplier({ ...ctx, profile: PROFILE, driver, cvDir: join(dir, 'cv') })
+  await runWatch(ctx)
+  const id = store.jobs()[0].id
+  assert.equal(store.job(id).status, 'NEEDS_INPUT')
+  assert.equal(driver.log.submits, 1)
+  assert.notEqual(google.fixture.tabs[0].rows[8][COL['Application Status']].userEnteredValue?.stringValue, '✅ Applied')
+  const meta = google.fixture.tabs.find((t) => t.properties.title === 'JARVIS_META')
+  assert.match(meta.rows[1].map((c) => c.userEnteredValue?.stringValue ?? '').join('|'), /NEEDS_INPUT.*Submission was triggered/)
+
+  // Next passes: the tracker still says Tailored, but nothing re-queues or re-submits.
+  await runWatch(ctx)
+  await runWatch(ctx)
+  assert.equal(driver.log.opened.length, 1)
+  assert.equal(driver.log.submits, 1)
+  assert.equal(store.job(id).status, 'NEEDS_INPUT')
+
+  // Local state lost: rebuilt from JARVIS_META, still UNKNOWN, still not retried.
+  store = createStore(join(tmp(), 'state.json'))
+  ctx.store = store
+  ctx.applier = createApplier({ ...ctx, profile: PROFILE, driver, cvDir: join(dir, 'cv') })
+  await runWatch(ctx)
+  assert.equal(store.job(id).status, 'NEEDS_INPUT')
+  assert.equal(store.job(id).submissionOutcome, 'UNKNOWN')
+  assert.equal(driver.log.submits, 1)
+
+  // A job forced back to TAILORED while flagged UNKNOWN is still skipped by the apply queue.
+  store.upsertJob({ ...store.job(id), status: 'TAILORED', tailoredCvUrl: 'https://docs.google.com/document/d/1TailoredDocId_abcdef/edit' })
+  await ctx.applier.processQueue({ parsed: null, byId: new Map() })
+  assert.equal(driver.log.submits, 1)
+})
+
+test('E. an error before submit is APPLICATION_FAILED, with submitTriggered false, and nothing is clicked', async () => {
+  const driver = fakeDriver()
+  const base = driver.open
+  driver.open = async (url) => ({ ...(await base(url)), upload: async () => { throw new Error('setInputFiles: element is not attached') } })
+  const { run, store } = setup({ mode: 'live', driver })
+  await run()
+  const j = store.job('jb_test1')
+  assert.equal(j.status, 'APPLICATION_FAILED')
+  assert.equal(j.submissionOutcome, undefined)
+  assert.equal(driver.log.submits, 0)
+  assert.equal(j.postSubmitDiagnostic.submitTriggered, false)
+  assert.equal(j.postSubmitDiagnostic.stage, 'fill')
+
+  const noButton = fakeDriver()
+  const base2 = noButton.open
+  noButton.open = async (url) => ({ ...(await base2(url)), submit: async () => { throw Object.assign(new Error('no submit button found'), { submitNotTriggered: true }) } })
+  const s2 = setup({ mode: 'live', driver: noButton })
+  await s2.run()
+  assert.equal(s2.store.job('jb_test1').status, 'APPLICATION_FAILED')
+  assert.equal(s2.store.job('jb_test1').postSubmitDiagnostic.submitTriggered, false)
+})
+
+test('inspectJob shows state and diagnostics, never profile values or CV links', async () => {
+  const { inspectJob } = await import('../bridge/jobs/store.mjs')
+  const { run, store } = setup({ mode: 'live', driver: fakeDriver({ afterReads: [new Error('boom')] }) })
+  await run()
+  const out = inspectJob({ ...store.job('jb_test1'), profile: PROFILE })
+  assert.equal(out.status, 'NEEDS_INPUT')
+  assert.equal(out.tailoredCvAvailable, true)
+  assert.equal(out.postSubmitDiagnostic.submitTriggered, true)
+  const s = JSON.stringify(out)
+  assert.ok(!s.includes('TailoredDocId') && !s.includes('Test Person') && !s.includes('example.invalid'))
 })
 
 // --- NEEDS_INPUT ------------------------------------------------------------
