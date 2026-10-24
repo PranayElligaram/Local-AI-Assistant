@@ -5,7 +5,7 @@
 
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { knownSite, normalizeUtterance, pickChoice, route } from '../bridge/router.mjs'
+import { knownSite, normalizeUtterance, pickChoice, route, routeSoftApp } from '../bridge/router.mjs'
 
 const tool = (text) => route(text)?.tool ?? null
 
@@ -115,4 +115,16 @@ test('answering "which one?" picks exactly one candidate or none', () => {
   assert.equal(pickChoice('visual studio', c), null)
   assert.equal(pickChoice('never mind', c), false)
   assert.equal(pickChoice('what time is it', c), null)
+})
+
+test('looser app phrasings are candidates (the caller checks the catalogue), conversation is not', () => {
+  const name = (s) => routeSoftApp(s)?.args.name ?? null
+  assert.equal(name("I'd like to do some sums, could you get the calculator going?"), 'calculator')
+  assert.equal(name('I need to write a letter, get Word up please.'), 'Word')
+  assert.equal(name('Could you get Spotify running for me'), 'Spotify')
+  assert.equal(name('pull up the task manager'), null) // "pull up X" already belongs to route() or the brain
+  assert.equal(name('get me going'), null)
+  assert.equal(name('get the party started and then call mum'), null)
+  assert.equal(name('what is the capital of France'), null)
+  assert.equal(route('get the calculator going'), null, 'not a strict command')
 })

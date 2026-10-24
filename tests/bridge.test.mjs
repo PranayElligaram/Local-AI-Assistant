@@ -58,6 +58,9 @@ test.before(async () => {
       // No key: this run must exercise the keyless fallback path, whatever the
       // developer happens to have in their own .env.
       ELEVENLABS_API_KEY: '',
+      // The default (Ollama) build, whatever brain the developer's .env.local
+      // selects; Hermes mode has its own tests (hermes.test.mjs, npm run e2e:hermes).
+      JARVIS_BRAIN_PROVIDER: 'ollama',
       // Ollama deliberately unreachable: every assertion here must hold with
       // no model at all. Launches are dry runs; user app settings are scratch.
       JARVIS_OLLAMA_URL: 'http://127.0.0.1:9',

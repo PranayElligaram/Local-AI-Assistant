@@ -500,22 +500,66 @@ export function interrupt(): void {
 
 /** The voice loop's state, for the bridge's /diagnostics. The bridge keeps
  *  only states and times; the transcript itself is sent as a length. */
-export function reportVoice(v: {
-  engine: string
-  voiceState: string
-  wakeListening: boolean
-  commandRecognitionActive: boolean
-  ttsActive: boolean
-  recognitionGeneration: number
-  wakes: number
-  accepted: number
-  lastFinalTranscript: string
-  lastUtteranceSentAt: number
-  lastWakeAt: number
-}): void {
+export function reportVoice(
+  v: {
+    engine: string
+    voiceState: string
+    voiceMode: string
+    running: boolean
+    wakeListening: boolean
+    commandRecognitionActive: boolean
+    ttsActive: boolean
+    recognitionGeneration: number
+    wakes: number
+    accepted: number
+    restarts: number
+    lastFinalTranscript: string
+    lastUtteranceSentAt: number
+    lastWakeAt: number
+    wakeToListenMs: number
+    wakeToMicMs: number
+    dropCode: string
+    wakeRejectCode: string
+    lastWakeRejectionAt: number
+    lastTransitionAt: number
+    commandSince: number
+    lastError: string
+  },
+  conversation: { lastTransition: string; listeningSince: number; timeouts: number },
+): void {
   if (socket?.readyState !== WebSocket.OPEN) return
-  const { lastFinalTranscript, ...rest } = v
-  socket.send(JSON.stringify({ type: 'voice', ...rest, lastFinalTranscriptChars: lastFinalTranscript.length }))
+  // Named fields only: the diag object also holds what was heard, and none of
+  // that leaves the page.
+  socket.send(
+    JSON.stringify({
+      type: 'voice',
+      engine: v.engine,
+      voiceState: v.voiceState,
+      voiceMode: v.voiceMode,
+      micCapturing: v.running,
+      wakeListening: v.wakeListening,
+      commandRecognitionActive: v.commandRecognitionActive,
+      ttsActive: v.ttsActive,
+      recognitionGeneration: v.recognitionGeneration,
+      wakes: v.wakes,
+      accepted: v.accepted,
+      restarts: v.restarts,
+      lastFinalTranscriptChars: v.lastFinalTranscript.length,
+      lastUtteranceSentAt: v.lastUtteranceSentAt,
+      lastWakeAt: v.lastWakeAt,
+      wakeToListenMs: v.wakeToListenMs,
+      wakeToMicMs: v.wakeToMicMs,
+      dropCode: v.dropCode,
+      wakeRejectCode: v.wakeRejectCode,
+      lastWakeRejectionAt: v.lastWakeRejectionAt,
+      lastTransitionAt: v.lastTransitionAt,
+      commandSince: v.commandSince,
+      lastError: v.lastError,
+      phaseTransition: conversation.lastTransition,
+      listeningSince: conversation.listeningSince,
+      listenTimeouts: conversation.timeouts,
+    }),
+  )
 }
 
 /** `mcp__higgsfield__generate_image` -> `higgsfield · generate image` */

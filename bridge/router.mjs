@@ -183,6 +183,24 @@ export function route(text) {
 }
 
 /**
+ * Looser phrasings of "open <app>": "get the calculator going", "get Word up",
+ * "..., could you get Spotify running". Only the last clause is read. The
+ * caller must confirm the name is an INSTALLED application before acting on
+ * it, and hand the utterance to the brain otherwise - unlike route(), a match
+ * here is a candidate, not a command.
+ */
+const SOFT_OPEN = /^(?:get|bring|pull|fire|boot|start|put)(?: up)? (.+?) (?:going|up|running|started|open|on)$/
+export function routeSoftApp(text) {
+  const clauses = String(text ?? '').split(/[,;]/)
+  const original = clauses.at(-1).trim()
+  const m = SOFT_OPEN.exec(normalizeUtterance(original))
+  if (!m) return null
+  const name = cleanAppName(m[1])
+  if (!name || name.split(' ').length > 4 || /\b(?:and|then|with|about|if|when|because|me|you|it|this|that)\b/.test(name)) return null
+  return { tool: 'open_application', args: { name: tail(original, name) } }
+}
+
+/**
  * The answer to a "which one?" question. Given the candidates JARVIS just
  * offered, does this utterance pick exactly one?
  */

@@ -16,7 +16,7 @@ async function setup(t, premium = false) {
   const module = await loadBrowserModule('src/lib/voice.ts', {
     '../config': "export const BRIDGE_HTTP_URL = 'http://test.invalid'",
     './audio': 'export const getMicSoon = async () => ({}); export const onMicChange = fn => { globalThis.__voiceTest.listeners.add(fn); return () => globalThis.__voiceTest.listeners.delete(fn) }',
-    './tts': "export const speakingNow = () => ''; export const speakingSince = () => 0; export const speakingEndedAt = () => 0",
+    './tts': "export const speakingNow = () => ''; export const speakingSince = () => 0; export const speakingEndedAt = () => 0; export const lastSpoken = () => ''",
     './capabilities': 'export const caps = () => ({ stt: globalThis.__voiceTest.premium })',
     './vad': 'export async function startVad(h) { globalThis.__voiceTest.capture = h; return { stop() { globalThis.__voiceTest.stopped = true }, live: () => true, meter: () => ({ speaking: false }), setGuard() {} } }',
   })

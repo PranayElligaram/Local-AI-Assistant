@@ -20,6 +20,8 @@
     "test": "node --import tsx --test tests/*.test.mjs",
     "e2e": "node scripts/e2e.mjs",
     "e2e:offline": "node scripts/e2e.mjs --offline",
+    "e2e:hermes": "node scripts/e2e.mjs --hermes",
+    "bench:hermes": "node scripts/bench-hermes.mjs",
     "preview": "vite preview",
     "bridge": "node bridge/server.mjs",
     "bridge:writes": "node bridge/server.mjs --writes",

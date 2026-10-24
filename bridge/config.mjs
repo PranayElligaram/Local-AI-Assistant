@@ -88,8 +88,37 @@ export function brainConfig(env = process.env) {
   }
   const okUrl = parsed && (parsed.protocol === 'http:' || parsed.protocol === 'https:')
   if (!okUrl) console.warn(`[jarvis] JARVIS_OLLAMA_URL="${url}" is not an http(s) URL - using the default.`)
+  const hermesUrl = str(env.JARVIS_HERMES_URL) ?? 'http://127.0.0.1:8642/v1'
+  const hermesFallback = (str(env.JARVIS_HERMES_FALLBACK) ?? 'ollama').toLowerCase()
+  if (!['ollama', 'none'].includes(hermesFallback)) {
+    console.warn(`[jarvis] JARVIS_HERMES_FALLBACK="${hermesFallback}" is not "ollama" or "none" - using "ollama".`)
+  }
+  // The provider itself enforces loopback-only; reject rather than use a remote host.
   return {
     provider: (str(env.JARVIS_BRAIN_PROVIDER) ?? 'ollama').toLowerCase(),
+    hermesUrl,
+    hermesKey: str(env.JARVIS_HERMES_KEY) ?? '',
+    hermesModel: str(env.JARVIS_HERMES_MODEL) ?? 'hermes-agent',
+    hermesSessionKey: str(env.JARVIS_HERMES_SESSION_KEY) ?? 'jarvis:desktop:primary',
+    hermesResponseTimeoutMs: seconds('JARVIS_HERMES_RESPONSE_TIMEOUT_S', 180, 600),
+    // Connecting to a loopback gateway is quick, but its first byte can wait
+    // behind a busy event loop; this bounds only "until response headers".
+    hermesConnectTimeoutMs: seconds('JARVIS_HERMES_CONNECT_TIMEOUT_S', 10, 120),
+    hermesFallback: hermesFallback === 'none' ? 'none' : 'ollama',
+    // A conversation is one Hermes session; a new one starts after this much
+    // silence or this many turns (bounding the prompt Hermes re-reads).
+    hermesSessionIdleMs: num('JARVIS_HERMES_SESSION_IDLE_MIN', env.JARVIS_HERMES_SESSION_IDLE_MIN, { min: 1, max: 24 * 60, fallback: 30 }) * 60_000,
+    hermesSessionMaxTurns: num('JARVIS_HERMES_SESSION_MAX_TURNS', env.JARVIS_HERMES_SESSION_MAX_TURNS, { min: 1, max: 500, fallback: 24 }),
+    hermesSessionFile: join(RUN_DIR, 'hermes-session.json'),
+    // Open each new session with a short background exchange (see PRIMING_MESSAGE).
+    hermesPrime: str(env.JARVIS_HERMES_PRIME) !== '0',
+    // The Ollama model Hermes is configured to use - only for warm-up.
+    hermesBackendModel: str(env.JARVIS_HERMES_BACKEND_MODEL) ?? null,
+    // While a JARVIS window is open, renew that model's keep_alive this often
+    // (minutes; 0 = never). Ollama otherwise unloads it after keep_alive idle,
+    // and the next question pays a reload plus a full re-read of Hermes'
+    // prompt (measured 38.5 s). Costs the model's memory while JARVIS is open.
+    hermesKeepWarmMs: num('JARVIS_HERMES_KEEP_WARM_MIN', env.JARVIS_HERMES_KEEP_WARM_MIN, { min: 0, max: 24 * 60, fallback: 10 }) * 60_000,
     ollamaUrl: okUrl ? url.replace(/\/+$/, '') : 'http://127.0.0.1:11434',
     model: str(env.JARVIS_LOCAL_MODEL) ?? 'granite4:3b',
     fallbackModel: str(env.JARVIS_LOCAL_FALLBACK_MODEL) ?? 'qwen3.5:4b',

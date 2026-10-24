@@ -54,3 +54,9 @@ public/mediapipe/
 # The job agent's application profile (personal answers). Never committed;
 # jarvis.jobs.profile.example.json is the template.
 jarvis.jobs.profile.json
+
+# Python caches and virtual environments
+__pycache__/
+*.pyc
+.venv/
+venv/

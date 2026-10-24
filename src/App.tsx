@@ -7,8 +7,9 @@ import { Ignition } from './ui/Ignition'
 import { Diagnostics } from './ui/Diagnostics'
 import { useStore } from './store'
 import { reportVoice } from './lib/bridge'
-import { diag as voiceDiag, startVoice, VOICE_BARGE_IN, type Voice, type VoiceMode } from './lib/voice'
-import { createSpeaker, cycleVoice, currentVoiceName } from './lib/tts'
+import { diag as voiceDiag, startVoice, type Voice } from './lib/voice'
+import { convDiag, createConversation, type Conversation } from './lib/conversation'
+import { createSpeaker, cycleVoice, currentVoiceName, preloadPhrases } from './lib/tts'
 import * as sfx from './lib/sfx'
 import * as music from './lib/music'
 import * as hands from './lib/hands'
@@ -17,7 +18,7 @@ import { isJarvisSurface, JARVIS_SURFACE, SURFACE_HEADER } from './lib/surface'
 import * as camera from './lib/camera'
 import * as kokoro from './lib/kokoro'
 import { BRIDGE_HTTP_URL, TTS_ENGINE } from './config'
-import { forTool, attention } from './lib/fillers'
+import { forTool, attention, ATTENTION_LINES } from './lib/fillers'
 import {
   ask,
   warm,
@@ -45,10 +46,6 @@ import { probeCapabilities } from './lib/capabilities'
  * events at us; every one of them is legal in every phase. Saying anything at
  * all stops him talking, and whatever you say next becomes the new turn.
  */
-
-/** How long to wait for someone to start speaking after he wakes. Generous:
- *  people say his name and *then* think about what they wanted. */
-const AWAIT_SPEECH_MS = 14000
 
 /** The shortest the start-up sequence runs. Long enough to read as a system
  *  coming online, short enough not to feel like a loading screen; the real
@@ -95,22 +92,11 @@ async function brainReady(): Promise<boolean> {
   }
 }
 
-/** Phases in which he owns the floor. Half-duplex: nothing heard then is a turn. */
-const BUSY = new Set(['thinking', 'tooling', 'speaking'])
-
 /** crypto.randomUUID needs a secure context, which a LAN address over plain
  *  http is not. Not worth failing a whole turn over an id. */
 const newId = () =>
   globalThis.crypto?.randomUUID?.() ??
   `id${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`
-
-/** The same mishearings voice.ts accepts for the wake word — otherwise a turn
- *  that woke him as "travis" gets that word sent on to the model as a question. */
-const NAME = '(?:jarvis|jarvys|jervis|travis|jarviss|java\'s|jarv)'
-/** A bare vocative — "Jarvis", "hey jarvis" — with nothing asked. */
-const BARE_NAME = new RegExp(`^(?:hey|hi|ok|okay|yo)?\\s*${NAME}[\\s,.!?]*$`, 'i')
-/** A leading vocative on a real command: "Jarvis, what's the weather". */
-const LEADING_NAME = new RegExp(`^(?:hey|hi|ok|okay|yo)?\\s*${NAME}\\b[\\s,.:!?-]*`, 'i')
 
 export default function App() {
   const store = useStore
@@ -125,45 +111,62 @@ export default function App() {
    */
   const turn = useRef(0)
   const booting = useRef(false)
-  const idleTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const voicePoll = useRef<ReturnType<typeof setInterval> | null>(null)
   const voiceReport = useRef<ReturnType<typeof setInterval> | null>(null)
   const voiceWatch = useRef<ReturnType<typeof setInterval> | null>(null)
 
   // -- helpers --------------------------------------------------------------
 
-  const clearIdle = () => {
-    if (idleTimer.current) clearTimeout(idleTimer.current)
-    idleTimer.current = null
-  }
-
   const silence = () => {
     speaker.current?.cancel()
     speaker.current = null
   }
 
-  const goDormant = () => {
-    clearIdle()
-    silence()
-    turn.current++
-    const s = store.getState()
-    s.setCaption('')
-    s.setActiveTool(null)
-    music.working(false)
-    music.duck(false)
-    sfx.duck(false)
-    s.setPhase('dormant')
+  /**
+   * The phase machine — wake, listen, answer, stand down — lives in
+   * lib/conversation.ts, where it is tested. This supplies its side effects.
+   * Created once; every effect reads refs and the store, never render state.
+   */
+  const conv = useRef<Conversation | null>(null)
+  if (!conv.current) {
+    conv.current = createConversation({
+      getPhase: () => store.getState().phase,
+      setPhase: (p) => store.getState().setPhase(p),
+      greet: () => {
+        // Deliberately not awaited: the voice loop holds the microphone shut
+        // while it plays and re-opens it the moment it ends.
+        const greeting = createSpeaker()
+        speaker.current = greeting
+        greeting.say(attention())
+        void greeting.end()
+      },
+      respond: (said) => void respond(said),
+      silence,
+      abandonTurn: () => {
+        // The turn counter moves in respond()'s replacement; bumping it here
+        // covers the case where nothing replaces it.
+        turn.current++
+        interrupt()
+        store.getState().setActiveTool(null)
+        music.working(false)
+        sfx.duck(false)
+        music.duck(false)
+      },
+      clearStage: () => {
+        turn.current++
+        const s = store.getState()
+        s.setCaption('')
+        s.setActiveTool(null)
+        music.working(false)
+        music.duck(false)
+        sfx.duck(false)
+      },
+      sfx: (name) => sfx.play(name),
+      setCaption: (text) => store.getState().setCaption(text),
+      clearError: () => store.getState().setError(null),
+    })
   }
-
-  /** Open the mic and wait. `window` is how long before he gives up. */
-  const listen = (window: number) => {
-    clearIdle()
-    const s = store.getState()
-    s.setCaption('')
-    s.setPhase('listening')
-    sfx.play('listen')
-    idleTimer.current = setTimeout(goDormant, window)
-  }
+  const machine = conv.current
 
   // -- one turn -------------------------------------------------------------
 
@@ -171,7 +174,7 @@ export default function App() {
     const mine = ++turn.current
     const stale = () => mine !== turn.current
 
-    clearIdle()
+    machine.beginTurn()
     const s = store.getState()
     // Last turn's panels and blades go now, before the new answer starts
     // putting its own up. Anything the model marked sticky survives.
@@ -249,115 +252,12 @@ export default function App() {
         // Back to the wake word, and only once he has finished speaking. The
         // open follow-up window kept the command recogniser listening to the
         // tail of his own answer; the voice loop re-arms after a short guard.
-        goDormant()
+        machine.standDown('answered')
       }
     }
   }
 
   // -- voice events ---------------------------------------------------------
-
-  /** What the voice loop should do with what it hears, derived from phase. */
-  const mode = (): VoiceMode => {
-    switch (store.getState().phase) {
-      case 'offline':
-      case 'boot':
-        return 'deaf'
-      case 'dormant':
-        return 'wake'
-      case 'waking':
-      case 'listening':
-        return 'command'
-      default:
-        return 'guard' // thinking, tooling, speaking
-    }
-  }
-
-  const onWake = (trailing: string) => {
-    const phase = store.getState().phase
-    if (phase === 'offline' || phase === 'boot') return
-    if (!VOICE_BARGE_IN && BUSY.has(phase)) return
-
-    store.getState().setError(null)
-    sfx.play('wake')
-
-    // "Jarvis, what's happening in AI this week" in one breath. Waiting for a
-    // greeting he didn't need is the most common way an assistant wastes time.
-    if (trailing) {
-      void respond(trailing)
-      return
-    }
-
-    store.getState().setPhase('waking')
-
-    // Answer to his name. Deliberately NOT awaited any more: the microphone is
-    // already open and the echo filter knows his voice, so the user can talk
-    // straight over the greeting instead of waiting it out.
-    const greeting = createSpeaker()
-    speaker.current = greeting
-    greeting.say(attention())
-    void greeting.end()
-
-    listen(AWAIT_SPEECH_MS)
-  }
-
-  /**
-   * Someone started talking. This is the whole point of the rewrite: he stops,
-   * immediately, whatever he was doing.
-   */
-  const onSpeechStart = () => {
-    clearIdle()
-    const phase = store.getState().phase
-    if (phase === 'offline' || phase === 'boot' || phase === 'dormant') return
-
-    const wasBusy =
-      phase === 'thinking' || phase === 'tooling' || phase === 'speaking'
-
-    silence()
-    if (wasBusy) {
-      // Abandon the answer in flight. The turn counter moves in respond()'s
-      // replacement; bumping it here covers the case where nothing replaces it.
-      turn.current++
-      interrupt()
-      store.getState().setActiveTool(null)
-      music.working(false)
-      sfx.duck(false)
-      music.duck(false)
-    }
-    store.getState().setPhase('listening')
-  }
-
-  /** The voice loop's speech-start. Half-duplex, it never interrupts him —
-   *  the keyboard (Space, Escape) is the way to cut him off. */
-  const onVoiceSpeechStart = () => {
-    if (!VOICE_BARGE_IN && BUSY.has(store.getState().phase)) return
-    onSpeechStart()
-  }
-
-  const onUtterance = (text: string) => {
-    const phase = store.getState().phase
-    if (phase === 'offline' || phase === 'boot' || phase === 'dormant') return
-    // One command, one ask: anything arriving while a turn is in flight is
-    // either his own voice or a stale recogniser result.
-    if (!VOICE_BARGE_IN && BUSY.has(phase)) return
-
-    // People keep using his name as a vocative once they're already talking to
-    // him. Strip it rather than sending "jarvis" to the model as a question.
-    if (BARE_NAME.test(text)) {
-      listen(AWAIT_SPEECH_MS)
-      return
-    }
-    const said = text.replace(LEADING_NAME, '').trim()
-    if (!said) {
-      listen(AWAIT_SPEECH_MS)
-      return
-    }
-
-    void respond(said)
-  }
-
-  const onPartial = (text: string) => {
-    store.getState().setCaption(text)
-  }
 
   const onVoiceError = (message: string) => {
     store.getState().setError(message)
@@ -579,20 +479,23 @@ export default function App() {
     // fallback when it is not — no flag, no reload.
     store.getState().setBootStep('voice', 'run')
     await probeCapabilities()
+    // The wake greeting plays while the microphone is shut: generate its audio
+    // now, not on the first "Hey Jarvis". Not awaited - boot does not wait on it.
+    void preloadPhrases([...ATTENTION_LINES])
     store.getState().setBootStep('voice', 'ok')
     store.getState().setBootStep('wake', 'run')
 
     // One voice loop, started once, running until the page closes.
     voice.current = await startVoice({
-      mode,
-      onWake,
-      onSpeechStart: onVoiceSpeechStart,
-      onPartial,
-      onUtterance,
+      mode: machine.mode,
+      onWake: machine.onWake,
+      onSpeechStart: machine.onSpeechStart,
+      onPartial: machine.onPartial,
+      onUtterance: machine.onUtterance,
       onError: onVoiceError,
     })
     // So the bridge's /diagnostics can tell "never heard" from "never sent".
-    voiceReport.current = setInterval(() => reportVoice(voiceDiag), 1000)
+    voiceReport.current = setInterval(() => reportVoice(voiceDiag, convDiag), 1000)
     // The HUD needs to know whether the microphone is really open (the greeting
     // and the re-arm window close it while the phase says 'listening'). Mirrored
     // only on change, so this costs nothing between transitions.
@@ -745,7 +648,7 @@ export default function App() {
       // no key for at all.
       if (e.key === 'Escape') {
         e.preventDefault()
-        if (store.getState().phase !== 'offline') goDormant()
+        machine.escape()
         return
       }
 
@@ -754,28 +657,20 @@ export default function App() {
       if (e.code !== 'Space' || e.repeat) return
       e.preventDefault()
 
-      const phase = store.getState().phase
-      if (phase === 'offline') {
-        void powerOn()
-      } else if (phase === 'boot') {
-        /* ignore — the boot sequence owns the phase until it finishes */
-      } else if (
-        phase === 'thinking' ||
-        phase === 'tooling' ||
-        phase === 'speaking'
-      ) {
-        onSpeechStart()
-        listen(AWAIT_SPEECH_MS)
-      } else {
-        onWake('')
-      }
+      if (machine.space() === 'power') void powerOn()
     }
     window.addEventListener('keydown', onKey)
+
+    // Every phase change, wherever it was made, goes through the machine's
+    // invariant: a listening phase always has a deadline.
+    const unsubscribe = store.subscribe((st, prev) => {
+      if (st.phase !== prev.phase) machine.phaseChanged(prev.phase, st.phase)
+    })
 
     return () => {
       cancelAnimationFrame(raf)
       window.removeEventListener('keydown', onKey)
-      clearIdle()
+      unsubscribe()
       if (voicePoll.current) clearInterval(voicePoll.current)
       if (voiceReport.current) clearInterval(voiceReport.current)
       if (voiceWatch.current) clearInterval(voiceWatch.current)

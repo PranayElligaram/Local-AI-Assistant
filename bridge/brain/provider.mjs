@@ -84,10 +84,15 @@ export class BrainChain {
       let firstTokenMs = null
       try {
         for await (const ev of provider.stream(request)) {
+          // First WORDS, not first event: a tool starting is not an answer.
+          if (firstTokenMs === null && ev.type === 'text') firstTokenMs = Date.now() - started
           if (!said) {
             said = true
-            firstTokenMs = Date.now() - started
-            yield { type: 'model', provider: provider.id, model: provider.model, fallbackUsed: i > 0 }
+            yield {
+              type: 'model', provider: provider.id, model: provider.model, fallbackUsed: i > 0,
+              // false: this brain never sees JARVIS's tool schemas (Hermes), see assistant.mjs
+              ...(provider.supportsTools === false ? { supportsTools: false } : {}),
+            }
           }
           yield ev
         }
@@ -104,7 +109,10 @@ export class BrainChain {
       } catch (err) {
         lastErr = err instanceof BrainError ? err : new BrainError('provider_error', String(err?.message ?? err))
         if (lastErr.code === 'aborted') throw lastErr
-        if (said || !worthFallingBack(lastErr) || i === order.length - 1) break
+        if (said || lastErr.code === 'aborted' || i === order.length - 1) break
+        // A dead Ollama server is not fixed by a second model on that same
+        // server. A different provider (Hermes -> Ollama) CAN recover.
+        if (lastErr.code === 'offline' && order[i + 1]?.url === provider.url) break
       }
     }
     this.failures++
@@ -132,13 +140,18 @@ export class BrainChain {
     return this.primary.warm?.() ?? false
   }
 
+  /** Get the primary ready for an imminent question (Hermes: prime a fresh session). */
+  async prepare() {
+    return this.primary.prepare?.() ?? false
+  }
+
   async unload() {
     await Promise.all(this.providers.map((p) => p.unload?.()))
   }
 
   diagnostics() {
     return {
-      mode: 'local',
+      mode: this.primary.id === 'hermes' ? 'agent' : 'local',
       provider: this.primary.id,
       endpoint: this.primary.url ?? null,
       primary: this.primary.diagnostics(),
@@ -146,7 +159,8 @@ export class BrainChain {
       last: this.last,
       turns: this.turns,
       failures: this.failures,
-      cloudRequired: false,
+      // Hermes may use a cloud OR local model: do not misrepresent its privacy.
+      cloudRequired: this.primary.id === 'hermes' ? null : false,
       claudeRuntime: 'none',
     }
   }

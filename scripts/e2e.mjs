@@ -24,6 +24,7 @@ import { WebSocket } from 'ws'
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const OFFLINE_ONLY = process.argv.includes('--offline')
+const HERMES_ONLY = process.argv.includes('--hermes')
 const TURN_TIMEOUT_MS = Number(process.env.JARVIS_E2E_TIMEOUT_MS ?? 150_000)
 const ORIGIN = 'http://localhost:5173'
 const NOT_AN_ANSWER = /unavailable|error|quota|limit|rate.?limit|unauthori[sz]ed|forbidden|session|failed|ECONN/i
@@ -102,6 +103,33 @@ async function startBridge(port, env) {
       socket.on('message', on)
       socket.send(JSON.stringify({ type: 'ask', id, text }))
     })
+  /** Ask, interrupt on the first streamed words, report what leaked after. */
+  const askAndInterrupt = (text) =>
+    new Promise((res) => {
+      const id = `e2e${++seq}`
+      let interruptedAt = 0
+      let lateFrames = 0
+      const on = (raw) => {
+        const m = JSON.parse(raw.toString())
+        if (m.ask !== id) return
+        if (interruptedAt) lateFrames++
+        else if (m.type === 'text') {
+          interruptedAt = Date.now()
+          socket.send(JSON.stringify({ type: 'interrupt' }))
+          setTimeout(() => {
+            socket.off('message', on)
+            res({ interrupted: true, lateFrames })
+          }, 1500)
+        }
+      }
+      socket.on('message', on)
+      socket.send(JSON.stringify({ type: 'ask', id, text }))
+      setTimeout(() => {
+        if (interruptedAt) return
+        socket.off('message', on)
+        res({ interrupted: false, lateFrames })
+      }, TURN_TIMEOUT_MS)
+    })
   const diagnostics = async () => (await fetch(`http://127.0.0.1:${port}/diagnostics`)).json()
   const health = async () => (await fetch(`http://127.0.0.1:${port}/health`)).ok
   const stop = async () => {
@@ -110,7 +138,7 @@ async function startBridge(port, env) {
     await new Promise((r) => (child.exitCode !== null ? r() : child.once('exit', r)))
     rmSync(runDir, { recursive: true, force: true })
   }
-  return { ask, diagnostics, health, stop, log: () => log }
+  return { ask, askAndInterrupt, diagnostics, health, stop, log: () => log }
 }
 
 const aiAnswer = (r, model) =>
@@ -122,9 +150,12 @@ const aiAnswer = (r, model) =>
   !NOT_AN_ANSWER.test(r.text)
 
 
+// The Ollama scenarios pin the provider: .env.local may select Hermes.
+const OLLAMA = { JARVIS_BRAIN_PROVIDER: 'ollama' }
+
 // --- deterministic + offline: Ollama deliberately unreachable -------------
-{
-  const b = await startBridge(8781, { JARVIS_OLLAMA_URL: 'http://127.0.0.1:9' })
+if (!HERMES_ONLY) {
+  const b = await startBridge(8781, { ...OLLAMA, JARVIS_OLLAMA_URL: 'http://127.0.0.1:9' })
   try {
     const time = await b.ask('What time is it?')
     check(time.source === 'router' && time.tool === 'get_time' && /^It's \d/.test(time.text), 'deterministic: time', time.text, JSON.stringify(time))
@@ -160,9 +191,9 @@ const aiAnswer = (r, model) =>
   }
 }
 
-if (!OFFLINE_ONLY) {
+if (!OFFLINE_ONLY && !HERMES_ONLY) {
   // --- local brain + tool: granite4:3b ------------------------------------
-  const b = await startBridge(8782, {})
+  const b = await startBridge(8782, { ...OLLAMA })
   try {
     const answer = await b.ask('In one short sentence, what does a CPU do?')
     check(aiAnswer(answer, 'granite4:3b') && answer.frames > 0, 'local brain: granite answers', `${answer.model}: ${answer.text}`, JSON.stringify(answer))
@@ -191,7 +222,7 @@ if (!OFFLINE_ONLY) {
   }
 
   // --- fallback: the primary model is missing, qwen answers ---------------
-  const f = await startBridge(8783, { JARVIS_LOCAL_MODEL: 'jarvis-missing-model:0b', JARVIS_MODEL_KEEP_ALIVE: '2m' })
+  const f = await startBridge(8783, { ...OLLAMA, JARVIS_LOCAL_MODEL: 'jarvis-missing-model:0b', JARVIS_MODEL_KEEP_ALIVE: '2m' })
   try {
     const answer = await f.ask('In one short sentence, what is a keyboard for?')
     check(
@@ -207,5 +238,121 @@ if (!OFFLINE_ONLY) {
   }
 }
 
-console.log(`\n${results.length - failures} passed, ${failures} failed`)
+// --- Hermes Agent: the real loopback gateway --------------------------------
+// Needs `hermes gateway` with the API server enabled and JARVIS_HERMES_KEY in
+// .env.local. Without them this is reported as SKIPPED - never as a pass.
+let skipped = 0
+if (!OFFLINE_ONLY) {
+  const { BRAIN } = await import('../bridge/config.mjs')
+  let gateway = false
+  try {
+    gateway = (await fetch(`${BRAIN.hermesUrl.replace(/\/v1$/, '')}/health`, { signal: AbortSignal.timeout(3000) })).ok
+  } catch {
+    /* not running */
+  }
+  if (!BRAIN.hermesKey || !gateway) {
+    skipped++
+    console.log(`SKIP  hermes  ${BRAIN.hermesKey ? 'gateway not answering at ' + BRAIN.hermesUrl : 'JARVIS_HERMES_KEY not configured'}`)
+  } else {
+    const HERMES = { JARVIS_BRAIN_PROVIDER: 'hermes', JARVIS_HERMES_FALLBACK: 'ollama' }
+    const hermesAnswer = (r) =>
+      !r.timeout && r.type === 'done' && r.source === 'hermes' && Boolean(r.text?.trim()) && !NOT_AN_ANSWER.test(r.text)
+    const h = await startBridge(8784, HERMES)
+    try {
+      const before = await h.diagnostics()
+      const allowed = ['web_search', 'web_extract'] // HERMES_SAFE_TOOLS
+      check(
+        before.brain.provider === 'hermes' && before.brain.primary.ok && before.brain.primary.tools.every((t) => allowed.includes(t)),
+        'hermes: gateway healthy, only allowlisted tools enabled',
+        `tools [${before.brain.primary.tools}]`,
+        JSON.stringify(before.brain),
+      )
+      const answer = await h.ask('Explain the difference between a CPU and a GPU.')
+      check(hermesAnswer(answer) && answer.frames > 1, 'hermes: conversational answer streamed', `${answer.frames} frames: ${answer.text}`, JSON.stringify(answer))
+
+      const time = await h.ask('What time is it?')
+      const open = await h.ask('Open Spotify')
+      const mid = await h.diagnostics()
+      check(
+        time.source === 'router' && open.source === 'router' && open.tool === 'open_application' && mid.brain.aiTurns === 1,
+        'hermes: deterministic commands bypass Hermes',
+        `${time.text} / ${open.text} (AI turns still ${mid.brain.aiTurns})`,
+        JSON.stringify({ time, open, aiTurns: mid.brain.aiTurns }),
+      )
+
+      // Not a strict command: in Hermes mode JARVIS recognises it itself (a 4B
+      // agent following an "ask JARVIS" protocol measured ~60% reliable), and
+      // only because Calculator is installed. Dry run: nothing really opens.
+      const sums = await h.ask("I'd like to do some sums, could you get the calculator going?")
+      const afterSums = await h.diagnostics()
+      check(
+        sums.source === 'router' && sums.tool === 'open_application' && afterSums.apps.lastResolved === 'Calculator' && afterSums.apps.lastLaunch === 'ok (dry run)',
+        'hermes mode: natural app request -> JARVIS opens the installed app',
+        `${sums.text} (resolved ${afterSums.apps.lastResolved}, ${afterSums.apps.lastLaunch})`,
+        `${JSON.stringify(sums)} apps=${JSON.stringify(afterSums.apps)}`,
+      )
+
+      await h.ask('For this conversation, my favourite colour is teal. Reply in one short sentence.')
+      const recall = await h.ask('What is my favourite colour?')
+      check(hermesAnswer(recall) && /teal/i.test(recall.text), 'hermes: session remembers earlier turns', recall.text, JSON.stringify(recall))
+
+      const cut = await h.askAndInterrupt('Write a detailed 500 word essay on the history of computing.')
+      const next = await h.ask('Reply with just the word ready.')
+      check(
+        cut.interrupted && cut.lateFrames === 0 && hermesAnswer(next) && /ready/i.test(next.text),
+        'hermes: barge-in cancels; next turn answers cleanly',
+        `late frames ${cut.lateFrames}, next: ${next.text}`,
+        JSON.stringify({ cut, next }),
+      )
+      const after = await h.diagnostics()
+      check(
+        !JSON.stringify(after).includes(BRAIN.hermesKey) && after.brain.cloudRequired === null && after.brain.claudeRuntime === 'none',
+        'hermes: diagnostics never contain the API key',
+        `cloud required ${after.brain.cloudRequired}, Claude runtime ${after.brain.claudeRuntime}`,
+        'key or Claude runtime present in diagnostics',
+      )
+    } catch (err) {
+      fail('hermes bridge', err.message)
+    } finally {
+      await h.stop()
+    }
+
+    // Hermes down: deterministic commands keep working; conversation falls back to Ollama.
+    const down = await startBridge(8785, { ...HERMES, JARVIS_HERMES_URL: 'http://127.0.0.1:9/v1' })
+    try {
+      const time = await down.ask('What time is it?')
+      const chat = await down.ask('In one short sentence, what is a keyboard for?')
+      check(
+        time.source === 'router' && time.ok && chat.source === 'ollama' && chat.fallbackUsed === true && aiAnswer(chat),
+        'hermes down: router works, Ollama answers',
+        `${time.text} / ${chat.model}: ${chat.text}`,
+        JSON.stringify({ time, chat }),
+      )
+    } catch (err) {
+      fail('hermes-down bridge', err.message)
+    } finally {
+      await down.stop()
+    }
+
+    // Wrong key with fallback disabled: an honest failure, and JARVIS stays up.
+    const strict = await startBridge(8786, { ...HERMES, JARVIS_HERMES_FALLBACK: 'none', JARVIS_HERMES_KEY: 'wrong-key-for-e2e' })
+    try {
+      const chat = await strict.ask('Tell me something interesting about the moon.')
+      const time = await strict.ask('What time is it?')
+      const d = await strict.diagnostics()
+      check(
+        chat.source === 'unavailable' && /authentication failed/.test(d.brain.lastError) && time.ok && (await strict.health()),
+        'hermes bad key, no fallback: explicit failure, JARVIS alive',
+        `"${chat.text}" (${d.brain.lastError})`,
+        JSON.stringify({ chat, time, err: d.brain.lastError }),
+      )
+    } catch (err) {
+      fail('hermes-strict bridge', err.message)
+    } finally {
+      await strict.stop()
+    }
+  }
+}
+
+console.log(`\n${results.length - failures} passed, ${failures} failed${skipped ? `, ${skipped} skipped` : ''}`)
 process.exit(failures ? 1 : 0)

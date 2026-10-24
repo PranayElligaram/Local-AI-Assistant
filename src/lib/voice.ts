@@ -1,6 +1,6 @@
 import { BRIDGE_HTTP_URL } from '../config'
 import { getMicSoon, onMicChange } from './audio'
-import { speakingEndedAt, speakingNow, speakingSince } from './tts'
+import { lastSpoken, speakingEndedAt, speakingNow, speakingSince } from './tts'
 import { startVad, type Vad, type VadHandlers } from './vad'
 import { caps } from './capabilities'
 import {
@@ -220,13 +220,81 @@ export const diag = {
   lastFinalTranscript: '',
   lastUtteranceSentAt: 0,
   lastWakeAt: 0,
+  /** Wake word heard -> microphone open for the question (the HUD's listening
+   *  state), for the last wake that was followed by a question. */
+  wakeToListenMs: 0,
+  /** Wake word heard -> recogniser actually capturing again. Browser engine
+   *  only: rec.start() takes a moment after the HUD already says listening. */
+  wakeToMicMs: 0,
+  /** OFF | STANDBY (waiting for his name) | WAKE (name heard, greeting or
+   *  re-arm, mic shut) | COMMAND (mic open for the question) | THINKING | SPEAKING */
+  voiceMode: 'OFF',
+  /** The wake phrase as the recogniser heard it ("hey travis"), nothing more. */
+  lastWakePhrase: '',
+  /** Why the last thing heard while waiting for his name did not wake him. */
+  lastWakeRejection: '',
+  lastWakeRejectionAt: 0,
+  /** Machine-readable form of `dropped`, safe to send to the bridge. */
+  dropCode: '' as DropCode | '',
+  wakeRejectCode: '' as DropCode | '',
+  /** "wake -> guard": the voice loop's own last mode change. */
+  lastTransition: '',
+  lastTransitionAt: 0,
+  /** When the command microphone last opened; 0 while it is shut. */
+  commandSince: 0,
+}
+
+export type DropCode =
+  | 'not-wake'
+  | 'debounced'
+  | 'echo'
+  | 'stale'
+  | 'closed'
+  | 'empty'
+  | 'stt-failed'
+  | 'unreachable'
+
+/** Set on a bare wake (no command in the same breath) until it is measured. */
+let wakePending = 0
+let micPending = 0
+
+/** A wake that opens a listening window: time how long until it really listens. */
+function noteWake(at: number, text: string, trailing: string) {
+  wakePending = trailing ? 0 : at
+  micPending = wakePending
+  diag.lastWakePhrase = (WAKE.exec(text)?.[0] ?? '').trim().slice(0, 40)
+  diag.lastWakeRejection = ''
+  diag.wakeRejectCode = ''
 }
 
 /** Record why a transcript went nowhere. Silence always has a reason; this is
  *  the difference between debugging it and speculating about it. */
-function drop(why: string) {
+function drop(why: string, code: DropCode) {
   diag.dropped = why
+  diag.dropCode = code
+  if (diag.mode === 'wake') {
+    diag.lastWakeRejection = why
+    diag.wakeRejectCode = code
+    diag.lastWakeRejectionAt = Date.now()
+  }
 }
+
+/** Something heard while waiting for his name, and what to make of it. */
+function wakeVerdict(text: string, lastWake: number): 'wake' | DropCode {
+  if (!WAKE.test(text)) return 'not-wake'
+  // His name, but inside the window of the wake that already fired: one
+  // utterance yields several results that all contain it.
+  if (Date.now() - lastWake <= WAKE_DEBOUNCE) return 'debounced'
+  return 'wake'
+}
+
+const rejectWake = (text: string, code: DropCode) =>
+  drop(
+    code === 'debounced'
+      ? `heard his name again within ${WAKE_DEBOUNCE} ms of the last wake`
+      : `heard "${text.slice(-40)}" — not his name`,
+    code,
+  )
 
 if (typeof window !== 'undefined') {
   ;(window as unknown as Record<string, unknown>).__voice = diag
@@ -249,6 +317,21 @@ export const VOICE_BARGE_IN = false
 /** After his last word, how long the microphone stays shut before re-arming.
  *  Covers the gap between two sentences and the room's reverb. */
 export const REARM_MS = 500
+/**
+ * ...and after a line of a few words - in practice the wake greeting, which is
+ * the one thing standing between "Hey Jarvis" and him hearing the question.
+ * There is no next sentence to wait for, and a short line leaves a short echo
+ * (the text echo filter still has its tail). The browser recogniser then takes
+ * a further ~0.1-0.3 s to start capturing.
+ */
+export const SHORT_REARM_MS = 250
+const SHORT_LINE_WORDS = 4
+
+/** How long to stay shut after `spoken` finished playing. */
+export function rearmFor(spoken: string): number {
+  const words = spoken.trim().split(/\s+/).filter(Boolean).length
+  return words > 0 && words <= SHORT_LINE_WORDS ? SHORT_REARM_MS : REARM_MS
+}
 
 /** Modes in which something heard may become a wake or a turn. */
 const accepting = (m: VoiceMode | '') => m === 'wake' || m === 'command'
@@ -263,7 +346,7 @@ export function effectiveMode(h: Pick<VoiceHandlers, 'mode'>): VoiceMode {
   const m = h.mode()
   if (VOICE_BARGE_IN || m === 'deaf') return m
   const ended = speakingEndedAt()
-  if (speakingSince() || (ended && Date.now() - ended < REARM_MS)) {
+  if (speakingSince() || (ended && Date.now() - ended < rearmFor(lastSpoken()))) {
     diag.voiceState = speakingSince() ? 'SPEAKING' : 'REARMING'
     return 'guard'
   }
@@ -280,19 +363,46 @@ export function effectiveMode(h: Pick<VoiceHandlers, 'mode'>): VoiceMode {
  * over - most often his own voice, captured while he spoke - so it is dropped
  * rather than becoming a second turn.
  */
-function makeCycle(h: Pick<VoiceHandlers, 'mode'>, onChange: (open: boolean) => void) {
+function makeCycle(
+  h: Pick<VoiceHandlers, 'mode'>,
+  onChange: (open: boolean) => void,
+  /** Any mode change, including wake <-> command, which leaves the mic open. */
+  onMode?: (from: VoiceMode, to: VoiceMode) => void,
+) {
   let last: VoiceMode | '' = ''
   return {
     sync(): VoiceMode {
       const m = effectiveMode(h)
       const changed = last !== '' && accepting(m) !== accepting(last)
+      const from = last
       last = m
+      diag.voiceMode = voiceModeLabel(h.mode(), m)
+      if (from !== m) {
+        diag.lastTransition = `${from || 'start'} -> ${m}`
+        diag.lastTransitionAt = Date.now()
+        diag.commandSince = m === 'command' ? Date.now() : 0
+        if (from) onMode?.(from, m)
+      }
       diag.mode = m
       diag.wakeListening = m === 'wake'
       diag.commandRecognitionActive = m === 'command'
       diag.ttsActive = Boolean(speakingSince())
       if (m === 'wake') diag.voiceState = 'WAKE_LISTENING'
-      else if (m === 'command') diag.voiceState = 'COMMAND_LISTENING'
+      else if (m === 'command') {
+        diag.voiceState = 'COMMAND_LISTENING'
+        // Counted once the greeting that answered the wake has finished: until
+        // then 'command' is only the instant before he starts speaking it.
+        if (wakePending && speakingEndedAt() >= wakePending) {
+          const ms = Date.now() - wakePending
+          wakePending = 0
+          // Only a listening window that this wake opened; ten seconds on, it is
+          // some other turn's.
+          if (ms < 10_000) {
+            diag.wakeToListenMs = ms
+            if (diag.engine === 'elevenlabs') diag.wakeToMicMs = ms
+          } else micPending = 0
+        }
+      }
       else if (m === 'deaf') diag.voiceState = 'OFF'
       else if (!diag.ttsActive && diag.voiceState !== 'REARMING') diag.voiceState = 'THINKING'
       if (changed && !VOICE_BARGE_IN) {
@@ -304,6 +414,17 @@ function makeCycle(h: Pick<VoiceHandlers, 'mode'>, onChange: (open: boolean) => 
     open: () => accepting(last),
     generation: () => diag.recognitionGeneration,
   }
+}
+
+/** The one-word answer to "what is the voice loop doing", from the app's mode
+ *  and the mode the loop is actually applying. */
+export function voiceModeLabel(app: VoiceMode, effective: VoiceMode): string {
+  if (effective === 'deaf') return 'OFF'
+  if (effective === 'wake') return 'STANDBY'
+  if (effective === 'command') return 'COMMAND'
+  // Shut, but the app is waiting for a question: the greeting, or the re-arm.
+  if (app === 'command') return 'WAKE'
+  return speakingSince() || app === 'wake' ? 'SPEAKING' : 'THINKING'
 }
 
 /** A finished command, on its way to the app and so to the bridge. */
@@ -430,7 +551,7 @@ async function startElevenVoice(
   const assemble = makeAssembler({
     emit: (text) => {
       if (!VOICE_BARGE_IN && cycle.sync() !== 'command') {
-        drop('microphone closed before the command was sent')
+        drop('microphone closed before the command was sent', 'closed')
         return
       }
       diag.dropped = ''
@@ -461,7 +582,7 @@ async function startElevenVoice(
   const transcribe = async ({ blob, gen }: { blob: Blob; gen: number }) => {
     if (stopped || cycle.sync() === 'deaf') return
     if (!VOICE_BARGE_IN && gen !== cycle.generation()) {
-      drop('stale segment from an earlier cycle')
+      drop('stale segment from an earlier cycle', 'stale')
       return
     }
     diag.voiceState = 'TRANSCRIBING'
@@ -478,7 +599,7 @@ async function startElevenVoice(
       if (!res.ok) {
         diag.restarts++
         diag.lastError = `stt ${res.status}`
-        drop(`transcription failed (${res.status})`)
+        drop(`transcription failed (${res.status})`, 'stt-failed')
         // 401/403 is the key being refused, and it will be refused again for
         // every segment after this one. 503 is the bridge saying it has no key
         // at all. None of those get better by waiting.
@@ -496,19 +617,19 @@ async function startElevenVoice(
       // is thinking or talking, is never a turn.
       const mode = cycle.sync()
       if (!VOICE_BARGE_IN && (gen !== cycle.generation() || !accepting(mode))) {
-        drop('stale transcription - the cycle moved on')
+        drop('stale transcription - the cycle moved on', 'stale')
         return
       }
 
       if (!said) {
-        drop('nothing intelligible in the segment')
+        drop('nothing intelligible in the segment', 'empty')
         return
       }
 
       // His own voice, come back through the microphone. The raised guard
       // threshold stops most of it at the door; this catches the rest.
       if (isEcho(said, speakingNow())) {
-        drop('echo of his own voice')
+        drop('echo of his own voice', 'echo')
         return
       }
 
@@ -516,15 +637,17 @@ async function startElevenVoice(
       diag.heardAt = Date.now()
 
       if (mode === 'wake') {
-        if (WAKE.test(said) && Date.now() - lastWake > WAKE_DEBOUNCE) {
+        const verdict = wakeVerdict(said, lastWake)
+        if (verdict === 'wake') {
           lastWake = Date.now()
           diag.lastWakeAt = lastWake
           diag.wakes++
           diag.dropped = ''
           diag.accepted++
+          noteWake(lastWake, said, afterWake(said))
           h.onWake(afterWake(said))
         } else {
-          drop(`heard "${said.slice(-40)}" — not his name`)
+          rejectWake(said, verdict)
         }
         return
       }
@@ -536,7 +659,7 @@ async function startElevenVoice(
       if (stopped) return
       diag.restarts++
       diag.lastError = String(err)
-      drop('could not reach the speech service')
+      drop('could not reach the speech service', 'unreachable')
     }
   }
 
@@ -580,7 +703,7 @@ async function startElevenVoice(
       const gen = segmentGen ?? cycle.generation()
       segmentGen = null
       if (!VOICE_BARGE_IN && (gen !== cycle.generation() || !accepting(mode))) {
-        drop('captured while the microphone was closed')
+        drop('captured while the microphone was closed', 'closed')
         return
       }
       pendingAudio.push({ blob, gen })
@@ -697,7 +820,7 @@ function startBrowserVoice(h: VoiceHandlers, blocked = false): Voice {
   const assemble = makeAssembler({
     emit: (text) => {
       if (!VOICE_BARGE_IN && cycle.sync() !== 'command') {
-        drop('microphone closed before the command was sent')
+        drop('microphone closed before the command was sent', 'closed')
         return
       }
       diag.dropped = ''
@@ -715,12 +838,25 @@ function startBrowserVoice(h: VoiceHandlers, blocked = false): Voice {
    * to discard what Chrome has already buffered — his own voice, heard while
    * he spoke, would otherwise arrive as a final result a second later.
    */
-  const cycle = makeCycle(h, (open) => {
-    reset()
-    assemble.cancel()
-    retire()
-    if (open) spin()
-  })
+  const cycle = makeCycle(
+    h,
+    (open) => {
+      reset()
+      assemble.cancel()
+      retire()
+      if (open) spin()
+    },
+    (from, to) => {
+      // Standby <-> command keeps the same recogniser running, but not what it
+      // had half-heard: a fragment of a command abandoned by Escape or the
+      // timeout must not open the next conversation, and wake-mode noise must
+      // not become the start of a command.
+      if (accepting(from) && accepting(to)) {
+        reset()
+        assemble.cancel()
+      }
+    },
+  )
 
   const touch = () => {
     lastAlive = Date.now()
@@ -746,22 +882,24 @@ function startBrowserVoice(h: VoiceHandlers, blocked = false): Voice {
     if (!VOICE_BARGE_IN && !accepting(mode)) return
     if (!text || mode === 'deaf') return
     if (isEcho(text, speakingNow())) {
-      drop('echo of his own voice')
+      drop('echo of his own voice', 'echo')
       return
     }
     diag.heard = text
     diag.heardAt = Date.now()
     if (mode === 'wake') {
       assemble.cancel()
-      if (WAKE.test(text) && Date.now() - lastWake > WAKE_DEBOUNCE) {
+      const verdict = wakeVerdict(text, lastWake)
+      if (verdict === 'wake') {
         lastWake = Date.now()
         diag.lastWakeAt = lastWake
         diag.wakes++
         diag.dropped = ''
         diag.accepted++
+        noteWake(lastWake, text, afterWake(text))
         h.onWake(afterWake(text))
       } else {
-        drop(`heard "${text.slice(-40)}" — not his name`)
+        rejectWake(text, verdict)
       }
       return
     }
@@ -795,7 +933,7 @@ function startBrowserVoice(h: VoiceHandlers, blocked = false): Voice {
       if (e.results[i].isFinal) fresh += chunk
       else interim += chunk
     }
-    const heard = `${settled}${fresh} ${interim}`.replace(/\s+/g, ' ').trim()
+    const heard = `${settled} ${fresh} ${interim}`.replace(/\s+/g, ' ').trim()
     if (!heard) return
     if (isEcho(`${fresh} ${interim}`, speakingNow())) {
       interim = ''
@@ -803,29 +941,41 @@ function startBrowserVoice(h: VoiceHandlers, blocked = false): Voice {
     }
 
     if (mode === 'wake') {
-      settled += fresh
-      if (WAKE.test(heard) && Date.now() - lastWake > WAKE_DEBOUNCE) {
-        // Still mid-phrase: "hey jarvis what" is not a command yet. Waking on
-        // the partial sent that fragment to the bridge as the question. Let
-        // the recogniser finish (or the quiet gap endpoint it) and wake from
-        // the whole phrase in emit().
-        if (interim.trim()) {
-          bumpSilence()
-          return
+      settled = `${settled} ${fresh}`.replace(/\s+/g, ' ').trim()
+      const verdict = wakeVerdict(heard, lastWake)
+      if (verdict !== 'wake') {
+        // Report finished phrases only; partials are still being decided.
+        if (fresh.trim()) {
+          diag.heard = fresh.trim()
+          diag.heardAt = Date.now()
+          rejectWake(fresh.trim(), verdict)
         }
-        lastWake = Date.now()
-        diag.lastWakeAt = lastWake
-        diag.wakes++
-        const trailing = afterWake(heard)
-        reset()
-        h.onWake(trailing)
-      } else if (settled.length > 400) {
-        settled = ''
+        // A name inside the debounce belongs to the wake that already fired.
+        // Kept, it would combine with the next stray word into a false wake.
+        if (verdict === 'debounced' || settled.length > 400) settled = ''
+        return
       }
+      // Still mid-phrase: "hey jarvis what" is not a command yet. Waking on
+      // the partial sent that fragment to the bridge as the question. Let
+      // the recogniser finish (or the quiet gap endpoint it) and wake from
+      // the whole phrase in emit().
+      if (interim.trim()) {
+        bumpSilence()
+        return
+      }
+      lastWake = Date.now()
+      diag.lastWakeAt = lastWake
+      diag.wakes++
+      diag.dropped = ''
+      diag.accepted++
+      const trailing = afterWake(heard)
+      reset()
+      noteWake(lastWake, heard, trailing)
+      h.onWake(trailing)
       return
     }
 
-    settled += fresh
+    settled = `${settled} ${fresh}`.replace(/\s+/g, ' ').trim()
     const full = `${settled} ${interim}`.replace(/\s+/g, ' ').trim()
     if (!started || (mode === 'guard' && !barged)) {
       const words = full.split(/\s+/).filter(Boolean).length
@@ -877,6 +1027,12 @@ function startBrowserVoice(h: VoiceHandlers, blocked = false): Voice {
       diag.lastError = ''
       diag.running = true
       diag.sessions++
+      // The first recogniser started for the question after a wake.
+      if (micPending && speakingEndedAt() >= micPending && cycle.open() && h.mode() === 'command') {
+        const ms = Date.now() - micPending
+        micPending = 0
+        if (ms < 10_000) diag.wakeToMicMs = ms
+      }
       touch()
     }
     rec.onresult = (e: any) => {

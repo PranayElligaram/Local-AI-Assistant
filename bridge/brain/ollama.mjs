@@ -53,6 +53,8 @@ export class OllamaBrain {
     this.responseTimeoutMs = o.responseTimeoutMs ?? 20_000
     this.loadTimeoutMs = o.loadTimeoutMs ?? 60_000
     this.maxTokens = o.maxTokens ?? 256
+    // false: leave the model to its keep_alive on exit (see createBrain, Hermes mode).
+    this.unloadOnExit = o.unloadOnExit ?? true
     this.fetch = o.fetch ?? globalThis.fetch
     this.supportsTools = true
     this.lastSuccessAt = 0
@@ -286,6 +288,7 @@ export class OllamaBrain {
 
   /** Release the model's memory. Called when JARVIS itself stops. */
   async unload() {
+    if (this.unloadOnExit === false) return
     try {
       await this.fetch(`${this.url}/api/chat`, {
         method: 'POST',

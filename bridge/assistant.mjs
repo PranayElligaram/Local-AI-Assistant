@@ -15,7 +15,7 @@
  *   { type: 'done', text, source: 'router'|'ollama'|'unavailable'|'empty', model, tool, ok }
  */
 
-import { pickChoice, route } from './router.mjs'
+import { pickChoice, route, routeSoftApp } from './router.mjs'
 
 export const UNAVAILABLE = 'My local AI brain is unavailable right now.'
 const NO_ANSWER = "I don't have an answer for that."
@@ -33,7 +33,7 @@ const CHOICE_TTL_MS = 90_000
 export const ACTION_CLAIM = {
   /** Unmistakable: "I've opened Word", "The calculator is now open". */
   strong:
-    /^(?:(?:ok(?:ay)?|sure|certainly|done)[,.!]?\s+)?(?:i(?:'ve| have) (?:opened|launched|started)\b|.*\b(?:is|are) now (?:open|running|launched)\b|.*\bhas been (?:opened|launched|started)\b)/i,
+    /^["'“]?(?:(?:ok(?:ay)?|sure|certainly|done|alright|all right)[,.!]?\s+)?(?:i(?:'ve| have) (?:opened|launched|started)\b|i(?:'ve| have) got (?:the |your )?[\w .+#&'-]{1,40}? (?:ready|running|open|going|up)\b|.*\b(?:is|are) now (?:open|running|launched)\b|.*\bhas been (?:opened|launched|started)\b)/i,
   /** Probable: "Opening Visual Studio Code." - but "Starting points vary" is not. */
   lead: /^(?:(?:ok(?:ay)?|sure|certainly)[,.!]?\s+)?(?:i'?m |now )?(?:opening|launching|starting|opened|launched|started)\s/i,
 }
@@ -137,6 +137,15 @@ export function createConversation({ brain, tools, systemPrompt, send, metrics =
       const intent = route(said)
       if (intent) return await runTool(intent.tool, intent.args, said, 'router')
 
+      // A brain that cannot call JARVIS's tools (Hermes) cannot open an app it
+      // is asked for in looser words, so JARVIS recognises those itself - but
+      // only for an application that is actually installed.
+      if (brain.primary?.supportsTools === false) {
+        const soft = routeSoftApp(said)
+        if (soft && (await tools.canOpen(soft.args.name))) return await runTool(soft.tool, soft.args, said, 'router')
+        if (!live()) return
+      }
+
       return await think(said)
     } finally {
       if (current === turn) current = null
@@ -193,6 +202,9 @@ export function createConversation({ brain, tools, systemPrompt, send, metrics =
               claim += delta
             }
           } else if (ev.type === 'tool_calls') calls.push(...ev.calls)
+          // A brain's own tool starting (Hermes' web_search): the interface
+          // says "Searching." now rather than staying silent until the answer.
+          else if (ev.type === 'tool' && !spoken && !held) emit({ type: 'tool', name: ev.name })
         }
         release(true)
       } catch (err) {
@@ -215,12 +227,23 @@ export function createConversation({ brain, tools, systemPrompt, send, metrics =
 
       // An action claimed but not called: do the real thing if it is one JARVIS
       // can route (still validated like any model request), or say so.
+      //
+      // A brain without JARVIS's tool schemas (Hermes, which also reads web
+      // pages) may REQUEST only an installed application this way - resolved
+      // against the catalogue, no arguments. A web address it names is never
+      // opened: that would let a page it read choose what the browser loads.
       if (claim !== null && !calls.length) {
         const intent = route(claimAsCommand(claim) ?? '')
-        const real =
-          intent?.tool === 'open_application'
+        const urlClaims = model?.supportsTools !== false
+        // Hermes' one action request (hermesSystemAddendum): an answer that is
+        // exactly "Opening <application>." goes to the open_application tool,
+        // which validates and resolves the name and says what really happened.
+        const asked = !urlClaims ? /^opening\s+([^.!?]+?)[.!]?$/i.exec(claim.trim()) : null
+        const real = asked
+          ? { tool: 'open_application', args: { name: asked[1].trim() } }
+          : intent?.tool === 'open_application'
             ? (await tools.canOpen(intent.args.name)) && intent
-            : intent?.tool === 'open_url'
+            : intent?.tool === 'open_url' && urlClaims
               ? intent
               : null
         if (!live()) return
@@ -228,7 +251,8 @@ export function createConversation({ brain, tools, systemPrompt, send, metrics =
         if (real) {
           console.log(`[jarvis] model claimed ${real.tool} without calling it; running it for real`)
           calls.push({ name: real.tool, arguments: real.args })
-        } else if (ACTION_CLAIM.strong.test(claim)) {
+        } else if (ACTION_CLAIM.strong.test(claim) || (intent?.tool === 'open_url' && !urlClaims)) {
+          if (intent?.tool === 'open_url' && !urlClaims) console.log(`[jarvis] ${model?.provider} named a web address to open; not opened`)
           say = "I couldn't carry that out."
         } else {
           say = claim // not an action after all ("Starting points vary...")
@@ -284,13 +308,13 @@ export function createConversation({ brain, tools, systemPrompt, send, metrics =
       emit({
         type: 'done',
         text: answer,
-        source: 'ollama',
+        source: model?.provider ?? 'ollama',
         model: model?.model ?? null,
         fallbackUsed: Boolean(model?.fallbackUsed),
         tools: used,
         ok: true,
       })
-      metrics.lastSource = 'ollama'
+      metrics.lastSource = model?.provider ?? 'ollama'
       metrics.lastTurnAt = Date.now()
     }
   }

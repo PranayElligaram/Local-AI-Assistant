@@ -52,6 +52,7 @@ import { createJobAgent } from './jobs/agent.mjs'
 import { showToast } from './jobs/toast.mjs'
 import { createApplier } from './jobs/apply/applier.mjs'
 import { loadProfile } from './jobs/profile.mjs'
+import { sanitizeVoiceReport } from './voice-report.mjs'
 
 /**
  * Several of the APIs below (structuredClone, streaming fetch with
@@ -132,8 +133,6 @@ const stats = {
   voice: null,
 }
 
-const VOICE_STATES = new Set(['OFF', 'WAKE_LISTENING', 'COMMAND_LISTENING', 'TRANSCRIBING', 'THINKING', 'SPEAKING', 'REARMING'])
-
 /**
  * The dormant interface's own account of whether a clap would be heard. The
  * WebSocket only opens on power-on, so this arrives over HTTP. "Armed" is
@@ -177,24 +176,6 @@ export function sanitizeReadiness(msg) {
   }
 }
 
-/** Whitelist the page's voice report: no transcript text crosses this line. */
-export function sanitizeVoiceReport(msg) {
-  const num = (v) => (Number.isFinite(v) && v >= 0 ? Math.floor(v) : 0)
-  return {
-    engine: msg?.engine === 'elevenlabs' ? 'elevenlabs' : 'browser',
-    voiceState: VOICE_STATES.has(msg?.voiceState) ? msg.voiceState : 'OFF',
-    wakeListening: msg?.wakeListening === true,
-    commandRecognitionActive: msg?.commandRecognitionActive === true,
-    ttsActive: msg?.ttsActive === true,
-    recognitionGeneration: num(msg?.recognitionGeneration),
-    wakes: num(msg?.wakes),
-    accepted: num(msg?.accepted),
-    lastFinalTranscriptChars: num(msg?.lastFinalTranscriptChars),
-    lastUtteranceSentAt: num(msg?.lastUtteranceSentAt),
-    lastWakeAt: num(msg?.lastWakeAt),
-    reportedAt: Date.now(),
-  }
-}
 
 
 /**
@@ -548,10 +529,10 @@ const handleRequest = async (req, res) => {
             ownsRunFile,
           },
           brain: {
-            mode: 'local',
+            mode: BRAIN.provider === 'hermes' ? 'agent' : 'local',
             provider: b.provider,
             endpoint: b.endpoint,
-            keepAlive: brain.primary.keepAlive,
+            keepAlive: brain.primary.keepAlive ?? null,
             primary: { model: brain.primary.model, ...health.primary },
             fallback: brain.fallback ? { model: brain.fallback.model, ...health.fallback } : null,
             lastModel: b.last?.model ?? null,
@@ -565,8 +546,16 @@ const handleRequest = async (req, res) => {
             cancelledTurns: metrics.cancelledTurns,
             lastSource: metrics.lastSource,
             lastTurnAt: metrics.lastTurnAt,
-            cloudRequired: false,
+            cloudRequired: b.cloudRequired,
             claudeRuntime: 'none',
+            // Hermes' own state: what it reports running, the live tool
+            // inventory, the current session and its priming. Never the key.
+            hermes:
+              brain.primary.id === 'hermes'
+                ? (({ reported, enabledTools, webEnabled, session, priming, toolPolicy }) => ({
+                    reported, enabledTools, webEnabled, session, priming, toolPolicy,
+                  }))(brain.primary.diagnostics())
+                : null,
           },
           tools: {
             mode: tools.mode,
@@ -623,7 +612,7 @@ const handleRequest = async (req, res) => {
           isolation: {
             globalClaudeConfigRead: false,
             mcpServers: [],
-            cloudRequired: false,
+            cloudRequired: brain.diagnostics().cloudRequired,
           },
           env: {
             // Key NAMES that came from the project env files. Never values.
@@ -1122,7 +1111,11 @@ const tools = createTools({
     const h = await checkBrain()
     return {
       brainOnline: Boolean(h.primary?.ok || h.fallback?.ok),
-      model: h.primary?.ok ? brain.primary.model : brain.fallback?.model,
+      model: !h.primary?.ok
+        ? brain.fallback?.model
+        : BRAIN.provider === 'hermes'
+          ? `Hermes Agent${BRAIN.hermesBackendModel ? ` running ${BRAIN.hermesBackendModel}` : ''}`
+          : brain.primary.model,
     }
   },
 })
@@ -1138,9 +1131,13 @@ server.listen(PORT, '127.0.0.1', () => {
   }
   console.log(`[jarvis] ${describeElevenSource()}`)
   console.log(
-    `[jarvis] brain: local Ollama at ${BRAIN.ollamaUrl} · primary ${BRAIN.model}` +
-      (brain.fallback ? ` · fallback ${brain.fallback.model}` : '') +
-      ` · keep_alive ${BRAIN.keepAlive} · no cloud, no Claude`,
+    BRAIN.provider === 'hermes'
+      ? `[jarvis] brain: Hermes at ${BRAIN.hermesUrl} · profile ${BRAIN.hermesModel}` +
+          (BRAIN.hermesBackendModel ? ` · model ${BRAIN.hermesBackendModel}` : '') +
+          ` · fallback ${BRAIN.hermesFallback === 'none' ? 'none' : `Ollama ${BRAIN.model}`} · no Claude`
+      : `[jarvis] brain: local Ollama at ${BRAIN.ollamaUrl} · primary ${BRAIN.model}` +
+          (brain.fallback ? ` · fallback ${brain.fallback.model}` : '') +
+          ` · keep_alive ${BRAIN.keepAlive} · no cloud, no Claude`,
   )
   console.log(
     `[jarvis] mode ${ALLOW_WRITES ? 'WRITES' : 'safe (read-only)'}` +
@@ -1170,10 +1167,32 @@ server.listen(PORT, '127.0.0.1', () => {
     const describe = (name, x) =>
       x ? `${name} ${x.ok ? (x.loaded ? 'ready (loaded)' : 'ready') : `UNAVAILABLE - ${x.error}`}` : ''
     console.log(
-      `[jarvis] ${[describe(BRAIN.model, h.primary), describe(brain.fallback?.model, h.fallback)].filter(Boolean).join(' · ')}`,
+      `[jarvis] ${[describe(brain.primary.model, h.primary), describe(brain.fallback?.model, h.fallback)].filter(Boolean).join(' · ')}`,
     )
-    if (h.primary?.ok && !h.primary.loaded && process.env.JARVIS_WARM_MODEL !== '0') void brain.warm()
+    // Hermes reports "loaded" for its gateway, not for the model behind it, so
+    // its warm-up (loading Hermes' Ollama model) runs whenever it is healthy.
+    const needsWarm = h.primary?.ok && (BRAIN.provider === 'hermes' || !h.primary.loaded)
+    if (needsWarm && process.env.JARVIS_WARM_MODEL !== '0') {
+      const t0 = Date.now()
+      void brain
+        .warm()
+        .then((ok) => {
+          if (ok && BRAIN.provider === 'hermes') console.log(`[jarvis] Hermes model ${BRAIN.hermesBackendModel} warmed in ${Date.now() - t0} ms`)
+          return BRAIN.provider === 'hermes' ? brain.prepare() : false
+        })
+        .then((primed) => {
+          if (primed) console.log(`[jarvis] Hermes session primed in ${Date.now() - t0} ms total`)
+        })
+    }
   })
+  // Keep Hermes' model resident while a JARVIS window is open. A load-only
+  // request: it renews keep_alive without evaluating anything, so the prompt
+  // cache the next question resumes from is left intact.
+  if (BRAIN.provider === 'hermes' && BRAIN.hermesBackendModel && BRAIN.hermesKeepWarmMs > 0 && process.env.JARVIS_WARM_MODEL !== '0') {
+    setInterval(() => {
+      if (stats.clients > 0) void brain.warm()
+    }, BRAIN.hermesKeepWarmMs).unref()
+  }
 })
 
 /**
@@ -1294,7 +1313,7 @@ wss.on('connection', (socket) => {
   }
 
   // Labels for the HUD's systems rail.
-  send({ type: 'ready', servers: [`local · ${BRAIN.model}`, 'apps'] })
+  send({ type: 'ready', servers: [BRAIN.provider === 'hermes' ? `Hermes · ${BRAIN.hermesModel}` : `local · ${BRAIN.model}`, 'apps'] })
 
   const conversation = createConversation({ brain, tools, systemPrompt: SYSTEM_PROMPT, send, metrics })
 
@@ -1319,7 +1338,12 @@ wss.on('connection', (socket) => {
     } else if (msg?.type === 'interrupt') {
       conversation.interrupt()
     } else if (msg?.type === 'voice') {
+      const lastWakeBefore = stats.voice?.lastWakeAt ?? 0
       stats.voice = sanitizeVoiceReport(msg)
+      // The wake word: a question is a few seconds away. If the Hermes session
+      // went stale, open and prime a new one while the user is still speaking.
+      // (lastWakeAt, unlike the wake counter, survives a page reload.)
+      if (stats.voice.lastWakeAt > lastWakeBefore) void brain.prepare()
     }
   })
 

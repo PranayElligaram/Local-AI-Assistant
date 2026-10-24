@@ -105,6 +105,37 @@ log-on task.
    malformed reply), JARVIS says *"My local AI brain is unavailable right now."*
    and keeps running; time, date and applications still work.
 
+### Hermes Agent brain (optional)
+
+With `JARVIS_BRAIN_PROVIDER=hermes`, step 2 goes to a loopback
+[Hermes Agent](https://hermes-agent.nousresearch.com) gateway instead
+(`bridge/brain/hermes.mjs`); steps 1, 3 and 4 are unchanged, and the Ollama pair
+answers if Hermes cannot (`JARVIS_HERMES_FALLBACK=none` to report it instead).
+
+- **Model.** Hermes needs a real 64K context. On this machine that is
+  `qwen3.5-4b-64k`: `qwen3.5:4b` plus `PARAMETER num_ctx 65536` in a Modelfile,
+  on the Arc iGPU (`OLLAMA_IGPU_ENABLE=1`). Ollama's `/v1` API ignores a
+  per-request `num_ctx`, so the Modelfile is what makes the context real;
+  `npm run diagnostics` checks it matches Hermes' `context_length`.
+- **Tools.** Hermes runs its own tools. Before every turn JARVIS reads the live
+  `GET /v1/toolsets` and refuses the turn if anything beyond `web_search` /
+  `web_extract` is enabled for the API server. Hermes cannot operate the PC.
+- **Conversation.** One JARVIS conversation = one Hermes session
+  (`X-Hermes-Session-Id`, kept in `.jarvis\hermes-session.json`); Hermes keeps
+  the history, JARVIS sends only the new question. A session ends after 30 idle
+  minutes or 24 turns, and each new one is opened with a short background
+  exchange so its first real question is fast.
+- **Barge-in** closes the stream, which interrupts the Hermes run.
+
+```powershell
+hermes gateway restart          # start/restart the gateway (a log-on task runs it normally)
+npm run diagnostics             # Hermes auth, tools, model, context, fallback
+npm run e2e:hermes              # real end-to-end checks against the gateway
+```
+
+Rollback: set `JARVIS_BRAIN_PROVIDER=ollama` in `.env.local` and restart JARVIS.
+See `HERMES_MIGRATION_REPORT.md` for setup, measurements and limitations.
+
 ### Opening applications
 
 "Jarvis, open *anything*" works for any application Windows lists as installed.
@@ -223,7 +254,10 @@ environment variable wins over the file.
 
 | Variable | Default | Effect |
 |---|---|---|
-| `JARVIS_BRAIN_PROVIDER` | `ollama` | The brain provider |
+| `JARVIS_BRAIN_PROVIDER` | `ollama` | `ollama`, or `hermes` (see above) |
+| `JARVIS_HERMES_KEY` | - | Hermes gateway API key (`.env.local` only) |
+| `JARVIS_HERMES_BACKEND_MODEL` | - | Hermes' Ollama model, preloaded at start |
+| `JARVIS_HERMES_FALLBACK` | `ollama` | `none`: report a Hermes failure instead |
 | `JARVIS_OLLAMA_URL` | `http://127.0.0.1:11434` | Ollama endpoint |
 | `JARVIS_LOCAL_MODEL` | `granite4:3b` | Primary model |
 | `JARVIS_LOCAL_FALLBACK_MODEL` | `qwen3.5:4b` | Fallback model |
@@ -252,6 +286,7 @@ npm run typecheck
 npm run lint
 npm run build
 npm run e2e:offline    # deterministic + offline end-to-end (no Ollama needed)
+npm run e2e:hermes     # real Hermes gateway end-to-end (skipped if not configured)
 npm run e2e            # + real granite answer, tool call, qwen fallback (needs Ollama)
 ```
 
@@ -273,6 +308,14 @@ running JARVIS or open anything on screen. A provider error, quota message or
   file from a crashed launcher is detected and replaced automatically.
 - **An app won't open:** `npm run app -- resolve "<name>"`, then
   `npm run app -- refresh`, or register it with `npm run app -- add`.
+
+---
+
+## Roadmap
+
+- **Native Windows floating-notch app** (planned, not started): a small
+  always-on-top notch that hosts JARVIS outside the browser tab, reusing the
+  existing bridge and voice runtime.
 
 ---
 

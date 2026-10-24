@@ -9,11 +9,13 @@
  * question, and a line is either a fact or plainly marked as unknown.
  *
  * It changes nothing, installs nothing, reads nothing outside this repository
- * (plus localhost: the bridge port and Ollama), and never prints a secret.
- * Claude is not checked because JARVIS does not use it.
+ * (plus localhost: the bridge port, Ollama and the Hermes gateway; and, in
+ * Hermes mode, the non-secret `model:` keys of Hermes' config.yaml - never its
+ * .env), and never prints a secret. Claude is not checked because JARVIS does
+ * not use it.
  */
 
-import { existsSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
@@ -57,18 +59,78 @@ if (existsSync(join(ROOT, 'node_modules'))) ok('dependencies installed')
 else fail('node_modules is missing - run `npm ci`')
 
 // --- the local brain -------------------------------------------------------
+
+/** Non-secret keys of the top-level `model:` block of Hermes' config.yaml. */
+function hermesModelConfig() {
+  const home = process.env.HERMES_HOME || join(process.env.LOCALAPPDATA ?? '', 'hermes')
+  let text
+  try {
+    text = readFileSync(join(home, 'config.yaml'), 'utf8')
+  } catch {
+    return null
+  }
+  // The block runs to the next top-level key; blank lines and comments (even at
+  // column 0, as in Hermes' template) inside it are fine.
+  const block = /^model:[ \t]*\r?\n((?:(?:[ \t]+.*|[ \t]*|#.*)(?:\r?\n|$))*)/m.exec(text)?.[1] ?? ''
+  // (Hermes writes LF lines into a CRLF template, so allow a stray \r.)
+  const key = (k) => new RegExp(`^[ \\t]+${k}:[ \\t]*"?([^"\\r\\n#]+?)"?[ \\t]*(?:#.*)?\\r?$`, 'm').exec(block)?.[1]?.trim() ?? null
+  return { default: key('default'), provider: key('provider'), baseUrl: key('base_url'), contextLength: Number(key('context_length')) || null, ollamaNumCtx: Number(key('ollama_num_ctx')) || null }
+}
+
+/** Is Hermes' model local, and does the server really allocate the context Hermes is told? */
+async function checkHermesModel(model) {
+  const cfg = hermesModelConfig()
+  if (!cfg) return note('Hermes config.yaml not found - cannot check where Hermes runs its model')
+  let local = false
+  try {
+    local = ['127.0.0.1', 'localhost', '[::1]'].includes(new URL(cfg.baseUrl).hostname)
+  } catch {
+    /* no or bad base_url */
+  }
+  if (local) ok(`Hermes inference is local: provider ${cfg.provider} at ${cfg.baseUrl}`)
+  else note(`Hermes model provider "${cfg.provider}" at ${cfg.baseUrl ?? '(provider default)'} is not loopback - answers may leave this machine`)
+  const declared = cfg.ollamaNumCtx ?? cfg.contextLength
+  if (!local || !model) return
+  const ollama = new URL(cfg.baseUrl).origin
+  try {
+    const show = await (await fetch(`${ollama}/api/show`, { method: 'POST', body: JSON.stringify({ model }), signal: AbortSignal.timeout(5000) })).json()
+    const numCtx = Number(/num_ctx\s+(\d+)/.exec(show.parameters ?? '')?.[1]) || null
+    if (numCtx && numCtx >= 64000 && numCtx === declared) ok(`${model}: Modelfile num_ctx ${numCtx} matches Hermes context ${declared}`)
+    else fail(`${model}: Modelfile num_ctx ${numCtx ?? 'unset'} vs Hermes context ${declared} - Ollama's /v1 ignores per-request num_ctx, so these must match and be >= 64000`)
+    const ps = await (await fetch(`${ollama}/api/ps`, { signal: AbortSignal.timeout(5000) })).json()
+    const live = ps.models?.find((m) => m.name === model || m.name === `${model}:latest` || m.model === model)
+    if (live) info(`${model} loaded: context ${live.context_length}, ${(live.size / 1e9).toFixed(1)} GB, ${live.size_vram ? `${Math.round((live.size_vram / live.size) * 100)}% GPU` : 'CPU'}`)
+    else info(`${model} not loaded right now (first question will load it)`)
+  } catch (err) {
+    note(`could not query Ollama at ${ollama} (${err.message})`)
+  }
+}
+
 const brain = createBrain(BRAIN)
 const health = await brain.health()
-const describe = (label, model, h) => {
-  if (!h) return
-  if (h.ok) ok(`${label} ${model} installed${h.loaded ? ' and loaded' : ''}`)
-  else if (!h.reachable) fail(`Ollama is not reachable at ${BRAIN.ollamaUrl} - start Ollama (https://ollama.com)`)
-  else fail(`${label} ${model} is not installed - run: ollama pull ${model}`)
+if (BRAIN.provider === 'hermes') {
+  const hermes = brain.primary
+  if (health.primary.ok) {
+    ok(`Hermes authenticated at ${BRAIN.hermesUrl}; tool policy verified (enabled: ${health.primary.tools.join(', ') || 'none'})`)
+  } else fail(`Hermes unavailable: ${health.primary.error} - start it with: hermes gateway restart`)
+  const reported = hermes.diagnostics().reported
+  if (reported) info(`Hermes reports provider "${reported.provider}", model ${reported.model}`)
+  await checkHermesModel(reported?.model ?? BRAIN.hermesBackendModel)
+  if (BRAIN.hermesFallback === 'none') info('fallback disabled (JARVIS_HERMES_FALLBACK=none): a Hermes failure is reported, not papered over')
+  else if (health.fallback?.reachable) ok(`Ollama fallback ${brain.fallback.model} reachable`)
+  else note('Ollama fallback not reachable (deterministic commands continue working)')
+} else {
+  const describe = (label, model, h) => {
+    if (!h) return
+    if (h.ok) ok(`${label} ${model} installed${h.loaded ? ' and loaded' : ''}`)
+    else if (!h.reachable) fail(`Ollama is not reachable at ${BRAIN.ollamaUrl} - start Ollama (https://ollama.com)`)
+    else fail(`${label} ${model} is not installed - run: ollama pull ${model}`)
+  }
+  if (health.primary.reachable) ok(`Ollama reachable at ${BRAIN.ollamaUrl}`)
+  describe('primary model', BRAIN.model, health.primary)
+  if (health.primary.reachable) describe('fallback model', brain.fallback?.model, health.fallback)
+  info(`keep_alive ${BRAIN.keepAlive} · max ${BRAIN.maxTokens} tokens per answer · cloud required: no · Claude runtime: none`)
 }
-if (health.primary.reachable) ok(`Ollama reachable at ${BRAIN.ollamaUrl}`)
-describe('primary model', BRAIN.model, health.primary)
-if (health.primary.reachable) describe('fallback model', brain.fallback?.model, health.fallback)
-info(`keep_alive ${BRAIN.keepAlive} · max ${BRAIN.maxTokens} tokens per answer · cloud required: no · Claude runtime: none`)
 info(`mode ${ALLOW_WRITES ? 'WRITES enabled' : 'safe (read-only)'}`)
 
 // --- speech ---------------------------------------------------------------

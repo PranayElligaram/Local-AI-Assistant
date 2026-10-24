@@ -259,7 +259,7 @@ export function createTools(deps) {
       run: async () => {
         const s = await systemStatus()
         const mem = Math.round((1 - os.freemem() / os.totalmem()) * 100)
-        const brain = s.brainOnline ? `The local brain is online with ${s.model}.` : 'The local brain is offline.'
+        const brain = s.brainOnline ? `The AI brain is online with ${s.model}.` : 'The AI brain is offline.'
         return { ok: true, say: `${brain} Memory use is ${mem} percent.`, data: { ...s, memoryPercent: mem } }
       },
     },

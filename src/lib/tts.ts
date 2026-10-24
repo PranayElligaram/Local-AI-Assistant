@@ -86,6 +86,8 @@ export const diag = {
   rescued: 0,
   voice: '',
   lastText: '',
+  /** Lines played from the preloaded phrase cache (no network round trip). */
+  cachedPhrases: 0,
 }
 
 if (typeof window !== 'undefined') {
@@ -129,6 +131,12 @@ function setSpeaking(text: string) {
     speakingEnded = Date.now()
   }
   speaking = ''
+}
+
+/** The sentence that most recently finished playing. The voice loop re-arms
+ *  sooner after a short one (the wake greeting) than after a long answer. */
+export function lastSpoken(): string {
+  return recent
 }
 
 /**
@@ -392,6 +400,11 @@ export function createSpeaker(): Speaker {
       // ElevenLabs, which makes the one field naming the engine useless
       // exactly when you are trying to work out which engine is at fault.
       diag.engine = 'elevenlabs'
+      const held = phraseCache.get(text)
+      if (held) {
+        diag.cachedPhrases++
+        return Promise.resolve(URL.createObjectURL(held))
+      }
       return fetchCloudAudio(text).catch(() => null)
     }
     if (TTS_ENGINE === 'kokoro' && !kokoro.isUnavailable()) {
@@ -743,9 +756,40 @@ export function createSpeaker(): Speaker {
   }
 }
 
+/**
+ * Cloud audio for fixed lines, generated once ahead of time.
+ *
+ * The wake greeting is said while the microphone is shut (half-duplex), so
+ * every millisecond before it starts is a millisecond before JARVIS can hear
+ * the question. Fetching it per wake cost 0.13 s on a warm connection and
+ * ~0.8 s on the first request after idling (measured 2026-10-16) - and a wake
+ * almost always follows idling. A handful of short lines is a few kilobytes.
+ */
+const phraseCache = new Map<string, Blob>()
+
+export async function preloadPhrases(lines: string[]): Promise<number> {
+  if (!(USE_ELEVENLABS || caps().tts)) return 0
+  let loaded = 0
+  for (const line of lines) {
+    const text = shape(line)
+    if (!text || phraseCache.has(text)) continue
+    const blob = await fetchCloudBlob(text)
+    if (blob) {
+      phraseCache.set(text, blob)
+      loaded++
+    }
+  }
+  return loaded
+}
+
 /** Only used when USE_ELEVENLABS is on. Bridge proxy first (it already holds
  *  the key), then a direct key, then null to fall back to the native voice. */
 async function fetchCloudAudio(text: string): Promise<string | null> {
+  const blob = await fetchCloudBlob(text)
+  return blob ? URL.createObjectURL(blob) : null
+}
+
+async function fetchCloudBlob(text: string): Promise<Blob | null> {
   try {
     const res = await fetch(`${BRIDGE_HTTP_URL}/tts`, {
       method: 'POST',
@@ -753,7 +797,7 @@ async function fetchCloudAudio(text: string): Promise<string | null> {
       body: JSON.stringify({ text }),
       signal: AbortSignal.timeout(15000),
     })
-    if (res.ok) return URL.createObjectURL(await res.blob())
+    if (res.ok) return await res.blob()
   } catch {
     /* fall through */
   }
@@ -780,7 +824,7 @@ async function fetchCloudAudio(text: string): Promise<string | null> {
           }),
         },
       )
-      if (res.ok) return URL.createObjectURL(await res.blob())
+      if (res.ok) return await res.blob()
     } catch {
       /* fall through */
     }

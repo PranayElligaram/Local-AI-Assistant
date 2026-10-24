@@ -35,6 +35,7 @@ async function setup(t, { premium = true, mode: initial = 'guard' } = {}) {
       'export const speakingNow = () => globalThis.__hdTest.speaking',
       'export const speakingSince = () => globalThis.__hdTest.since',
       'export const speakingEndedAt = () => globalThis.__hdTest.ended',
+      "export const lastSpoken = () => globalThis.__hdTest.last ?? ''",
     ].join('\n'),
     './capabilities': `export const caps = () => ({ stt: ${premium} })`,
     './vad': 'export async function startVad(h) { globalThis.__hdTest.capture = h; return { stop() {}, live: () => true, meter: () => ({ speaking: false }), setGuard() {} } }',
@@ -170,4 +171,51 @@ test('a wake heard only as a partial waits for the whole phrase instead of sendi
   assert.deepEqual(events, [])
   instances[0].result('hey Jarvis what time is it', true)
   assert.deepEqual(events, [['wake', 'what time is it']])
+})
+
+test('after a short line (the wake greeting) the microphone re-arms in 250 ms; after an answer, 500 ms', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: 1_000_000 })
+  const { module, events, instances, setMode, speak } = await setup(t, { premium: false, mode: 'wake' })
+  assert.equal(module.rearmFor('Yes, sir?'), module.SHORT_REARM_MS)
+  assert.equal(module.rearmFor('The sky is blue because of Rayleigh scattering.'), module.REARM_MS)
+  assert.equal(module.rearmFor(''), module.REARM_MS)
+  const tts = globalThis.__hdTest
+  const finish = (line) => { tts.speaking = ''; tts.since = 0; tts.ended = Date.now(); tts.last = line }
+
+  // "Hey Jarvis" alone: he answers to his name, then listens for the question.
+  instances[0].result('Hey Jarvis')
+  assert.deepEqual(events, [['wake', '']])
+  setMode('command')
+  speak('Yes, sir?')
+  t.mock.timers.tick(150)
+  assert.equal(instances.length, 1, 'no recogniser while the greeting plays')
+  t.mock.timers.tick(450) // the greeting lasts 0.6 s
+  finish('Yes, sir?')
+  t.mock.timers.tick(150)
+  assert.equal(instances.length, 1, 'still shut inside the short re-arm')
+  t.mock.timers.tick(150)
+  assert.equal(instances.length, 2, 'listening again 250-300 ms after the greeting')
+  assert.equal(module.diag.voiceState, 'COMMAND_LISTENING')
+  assert.ok(module.diag.wakeToListenMs >= 850 && module.diag.wakeToListenMs <= 950, `wake -> listening ${module.diag.wakeToListenMs} ms`)
+  assert.equal(module.diag.wakeToMicMs, module.diag.wakeToListenMs, 'the stub recogniser starts at once')
+
+  // A full answer keeps the longer guard.
+  setMode('guard')
+  speak('The sky is blue because of Rayleigh scattering.')
+  t.mock.timers.tick(300)
+  finish('The sky is blue because of Rayleigh scattering.')
+  setMode('wake')
+  t.mock.timers.tick(300)
+  assert.equal(instances.length, 2, 'still shut 300 ms after a long answer')
+  t.mock.timers.tick(300)
+  assert.equal(instances.length, 3)
+})
+
+test('a wake with the command in the same breath records no listening delay', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: 1_000_000 })
+  const { module, events, instances } = await setup(t, { premium: false, mode: 'wake' })
+  instances[0].result('Hey Jarvis what time is it')
+  assert.deepEqual(events, [['wake', 'what time is it']])
+  t.mock.timers.tick(2000)
+  assert.equal(module.diag.wakeToListenMs, 0)
 })

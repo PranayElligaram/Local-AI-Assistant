@@ -149,6 +149,65 @@ test('an action the model claims but did not call is done for real, or not claim
   assert.deepEqual(launched, ['Visual Studio Code'])
 })
 
+test('a brain without JARVIS tools (Hermes) may request an installed app, never a web address', async () => {
+  const hermesTurn = (text) => [{ type: 'model', provider: 'hermes', model: 'hermes-agent', fallbackUsed: false, supportsTools: false }, { type: 'text', delta: text }]
+  const brain = fakeBrain()
+  const scripts = [
+    hermesTurn('Opening Calculator.'),
+    hermesTurn('Opening example.com.'),
+    hermesTurn("I've opened https://evil.example for you."),
+    hermesTurn('Opening Flux Capacitor.'),
+    hermesTurn('Starting points vary by region.'),
+  ]
+  // This brain announces itself, so replace the scripted brain's own model event.
+  brain.stream = async function* (req) {
+    brain.calls++
+    brain.requests.push(req)
+    yield* scripts.shift()
+  }
+  const { convo, done, launched, opened } = setup(brain)
+  await convo.ask('could you get the calculator going', 'h1')
+  assert.deepEqual(launched, ['Calculator'])
+  assert.equal(done()[0].text, 'Opening Calculator.')
+  await convo.ask('take me to that site', 'h2')
+  await convo.ask('show me the page', 'h3')
+  assert.deepEqual(opened, [], 'no web address named by Hermes is opened')
+  assert.equal(done()[1].text, "I couldn't carry that out.")
+  assert.equal(done()[2].text, "I couldn't carry that out.")
+  await convo.ask('I fancy the flux gadget', 'h4')
+  assert.equal(done()[3].text, "I couldn't find an application called Flux Capacitor.", 'an app that is not installed is not claimed')
+  await convo.ask('where do hikes start', 'h5')
+  assert.equal(done()[4].text, 'Starting points vary by region.')
+  assert.deepEqual(launched, ['Calculator'])
+})
+
+test('Hermes mode: looser app requests open an INSTALLED app directly; anything else reaches the brain', async () => {
+  const brain = fakeBrain([{ type: 'text', delta: 'Answer one.' }], [{ type: 'text', delta: 'Answer two.' }])
+  brain.primary = { supportsTools: false }
+  const { convo, done, launched } = setup(brain)
+  await convo.ask("I'd like to do some sums, could you get the calculator going?", 's1')
+  assert.deepEqual(launched, ['Calculator'])
+  assert.equal(done()[0].source, 'router')
+  assert.equal(brain.calls, 0)
+  await convo.ask('could you get the barbecue going', 's2') // not an installed app
+  assert.equal(done()[1].text, 'Answer one.')
+  assert.equal(brain.calls, 1)
+  // A brain that CAN call JARVIS tools keeps choosing for itself.
+  const ollama = fakeBrain([{ type: 'text', delta: 'Answer two.' }])
+  const other = setup(ollama)
+  await other.convo.ask('get the calculator going', 's3')
+  assert.equal(ollama.calls, 1)
+  assert.deepEqual(other.launched, [])
+})
+
+test('a false "I\'ve got it ready" claim is never spoken', async () => {
+  const brain = fakeBrain([{ type: 'text', delta: '"Alright! I\'ve got the calculator ready for you."' }])
+  const { convo, done, launched } = setup(brain)
+  await convo.ask('sums please', 'q1')
+  assert.equal(done()[0].text, "I couldn't carry that out.")
+  assert.deepEqual(launched, [])
+})
+
 test('barge-in cancels the model turn and nothing more is spoken for it', async () => {
   const brain = fakeBrain([{ type: 'text', delta: 'This is a long answer. ' }, 'wait', { type: 'text', delta: 'NEVER' }], [{ type: 'text', delta: 'New answer.' }])
   const { convo, frames, done } = setup(brain)
@@ -199,4 +258,19 @@ test('turn counters: a deterministic command counts as a router turn, a question
   assert.equal(done[1].model, 'granite4:3b')
   assert.match(done[1].text, /scatter/)
   assert.doesNotMatch(done[1].text, /didn't understand|unknown command/i)
+})
+
+test("a brain's own tool starting reaches the interface before the answer, once nothing has been said yet", async () => {
+  const brain = fakeBrain(
+    [{ type: 'tool', name: 'web_search' }, { type: 'text', delta: 'Node 24 is current.' }],
+    [{ type: 'text', delta: 'Checking. ' }, { type: 'tool', name: 'web_search' }, { type: 'text', delta: 'Done.' }],
+  )
+  const { convo, frames } = setup(brain)
+  await convo.ask('explain the event loop', 'r1')
+  const kinds = frames.filter((f) => f.ask === 'r1').map((f) => f.type)
+  assert.deepEqual(kinds.slice(0, 2), ['tool', 'text'])
+  assert.deepEqual(frames.find((f) => f.type === 'tool'), { type: 'tool', name: 'web_search', ask: 'r1' })
+  // Already talking: no filler on top of the answer.
+  await convo.ask('explain it again', 'r2')
+  assert.equal(frames.filter((f) => f.ask === 'r2' && f.type === 'tool').length, 0)
 })

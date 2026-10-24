@@ -44,7 +44,25 @@ type VoiceDiag = {
   recognitionGeneration: number
   lastWakeAt: number
   lastUtteranceSentAt: number
+  wakeToListenMs: number
+  wakeToMicMs: number
   engine: string
+  voiceMode: string
+  lastWakePhrase: string
+  lastWakeRejection: string
+  lastWakeRejectionAt: number
+  lastTransition: string
+  lastTransitionAt: number
+  commandSince: number
+}
+
+type ConversationDiag = {
+  lastTransition: string
+  lastTransitionAt: number
+  listeningSince: number
+  deadlineAt: number
+  timeouts: number
+  standDowns: number
 }
 
 type MicDiag = {
@@ -86,8 +104,16 @@ type BridgeDiag = {
     lastFirstTokenMs: number | null
     lastError: string
     lastSource: string
-    cloudRequired: boolean
+    cloudRequired: boolean | null
     claudeRuntime: string
+    hermes?: {
+      reported: { provider: string; model: string } | null
+      enabledTools: string[]
+      webEnabled: boolean
+      session: { id: string; turns: number; lastUsedAt: number } | null
+      priming: { enabled: boolean; inFlight: boolean; last: { ok: boolean; ms: number; at: number; error?: string } | null }
+      toolPolicy: string
+    } | null
   }
   tools?: { mode: string; last: string; lastResult: string; executed: number; rejected: number }
   apps?: {
@@ -103,7 +129,7 @@ type BridgeDiag = {
 }
 
 const health = (m?: { model: string; ok: boolean; reachable: boolean; loaded: boolean; error: string } | null) =>
-  !m ? '—' : m.ok ? `${m.model} · ${m.loaded ? 'loaded' : 'ready'}` : `${m.model} · ${m.reachable ? m.error || 'not ready' : 'Ollama unreachable'}`
+  !m ? '—' : m.ok ? `${m.model} · ${m.loaded ? 'loaded' : 'ready'}` : `${m.model} · ${m.error || 'unreachable'}`
 
 const ago = (t: number) => (t ? `${((Date.now() - t) / 1000).toFixed(1)}s ago` : '—')
 
@@ -209,6 +235,11 @@ export function Diagnostics() {
   const v = (w.__voice ?? {}) as Partial<VoiceDiag>
   const t = (w.__tts ?? {}) as Partial<TtsDiag>
   const m = (w.__mic ?? {}) as Partial<MicDiag>
+  const c = (w.__conversation ?? {}) as Partial<ConversationDiag>
+  const secs = (t: number) => `${((Date.now() - t) / 1000).toFixed(1)}s`
+  // Listening with no deadline is the stuck state this panel exists to catch.
+  const listening = phase === 'listening' || phase === 'waking'
+  const deadlineLeft = c.deadlineAt ? Math.max(0, c.deadlineAt - Date.now()) : 0
 
   // The three verdicts worth stating outright, rather than making you infer
   // them from the numbers underneath.
@@ -260,7 +291,7 @@ export function Diagnostics() {
         <Row k="error" v={m.lastError || '—'} bad={Boolean(m.lastError)} />
       </Section>
 
-      <Section title="Local AI">
+      <Section title="AI Brain">
         {bridgeErr ? <Row k="bridge" v={`unreachable · ${bridgeErr}`} bad /> : null}
         <Row k="mode" v={b ? `${b.mode === 'local' ? 'Local' : b.mode} · ${b.provider}` : '—'} />
         <Row k="primary" v={health(b?.primary)} bad={Boolean(b) && !b?.primary?.ok} />
@@ -273,7 +304,27 @@ export function Diagnostics() {
         <Row k="last source" v={b?.lastSource || '—'} />
         <Row k="brain error" v={b?.lastError || '—'} bad={Boolean(b?.lastError)} />
         <Row k="endpoint" v={b?.endpoint ?? '—'} />
-        <Row k="cloud required" v={b ? (b.cloudRequired ? 'YES' : 'No') : '—'} bad={Boolean(b?.cloudRequired)} />
+        {b?.hermes ? (
+          <>
+            <Row k="Hermes model" v={b.hermes.reported ? `${b.hermes.reported.model} · ${b.hermes.reported.provider}` : '—'} />
+            <Row k="Hermes tools" v={b.hermes.enabledTools.length ? b.hermes.enabledTools.join(', ') : 'none'} />
+            <Row k="Hermes session" v={b.hermes.session ? `${b.hermes.session.turns} turns · ${ago(b.hermes.session.lastUsedAt)}` : '—'} />
+            <Row
+              k="session priming"
+              v={
+                !b.hermes.priming.enabled
+                  ? 'off'
+                  : b.hermes.priming.inFlight
+                    ? 'priming…'
+                    : b.hermes.priming.last
+                      ? `${b.hermes.priming.last.ok ? 'ok' : b.hermes.priming.last.error} · ${(b.hermes.priming.last.ms / 1000).toFixed(1)}s`
+                      : 'not yet'
+              }
+              bad={b.hermes.priming.last?.ok === false}
+            />
+          </>
+        ) : null}
+        <Row k="cloud required" v={b ? (b.cloudRequired === null ? 'Unknown' : b.cloudRequired ? 'YES' : 'No') : '—'} bad={Boolean(b?.cloudRequired)} />
         <Row k="Claude runtime" v={b ? (b.claudeRuntime === 'none' ? 'None' : b.claudeRuntime) : '—'} />
       </Section>
 
@@ -317,6 +368,44 @@ export function Diagnostics() {
         <Row k="guard" v={v.mode === 'guard' ? 'active — mic paused while JARVIS has the floor' : 'idle'} />
       </Section>
 
+      <Section title="Wake & command">
+        <Row k="voice mode" v={v.voiceMode ?? '—'} />
+        <Row
+          k="wake detector"
+          v={v.voiceMode === 'STANDBY' ? (v.running ? 'active' : 'armed, recogniser STOPPED') : 'inactive'}
+          bad={v.voiceMode === 'STANDBY' && !v.running}
+        />
+        <Row k="mic capturing" v={v.running ? 'yes' : 'no'} />
+        <Row k="engine" v={`${v.engine ?? '—'}${v.lastError ? ` · ${v.lastError}` : ''}`} bad={Boolean(v.lastError)} />
+        <Row k="last wake phrase" v={v.lastWakePhrase ? `"${v.lastWakePhrase}"` : '—'} />
+        <Row k="last wake" v={v.lastWakeAt ? `${new Date(v.lastWakeAt).toLocaleTimeString()} · ${ago(v.lastWakeAt)}` : '—'} />
+        <Row
+          k="last wake rejection"
+          v={v.lastWakeRejection ? `${v.lastWakeRejection} · ${ago(v.lastWakeRejectionAt ?? 0)}` : '—'}
+        />
+        <Row
+          k="voice transition"
+          v={v.lastTransition ? `${v.lastTransition} · ${ago(v.lastTransitionAt ?? 0)}` : '—'}
+        />
+        <Row
+          k="phase transition"
+          v={c.lastTransition ? `${c.lastTransition} · ${ago(c.lastTransitionAt ?? 0)}` : '—'}
+        />
+        <Row k="command mic open for" v={v.commandSince ? secs(v.commandSince) : '—'} />
+        <Row
+          k="listening window"
+          v={
+            listening
+              ? c.deadlineAt
+                ? `${secs(c.listeningSince ?? Date.now())} open · closes in ${(deadlineLeft / 1000).toFixed(1)}s`
+                : 'NO DEADLINE — would never return to standby'
+              : '—'
+          }
+          bad={listening && !c.deadlineAt}
+        />
+        <Row k="listen timeouts" v={String(c.timeouts ?? 0)} />
+      </Section>
+
       <Section title="Voice lifecycle">
         <Row k="state" v={v.voiceState ?? '—'} />
         <Row k="input engine" v={v.engine ?? '—'} />
@@ -325,6 +414,10 @@ export function Diagnostics() {
         <Row k="TTS active" v={v.ttsActive ? 'yes (mic paused)' : 'no'} />
         <Row k="generation" v={String(v.recognitionGeneration ?? 0)} />
         <Row k="last wake" v={ago(v.lastWakeAt ?? 0)} />
+        <Row
+          k="wake → listening"
+          v={v.wakeToListenMs ? `${v.wakeToListenMs} ms${v.wakeToMicMs ? ` (mic live ${v.wakeToMicMs} ms)` : ''}` : '—'}
+        />
         <Row k="last command sent" v={ago(v.lastUtteranceSentAt ?? 0)} />
       </Section>
 

@@ -63,6 +63,9 @@ function makePicker(pool: string[]) {
   }
 }
 
+/** Every wake greeting, so their audio can be generated before the first wake. */
+export const ATTENTION_LINES: readonly string[] = ATTENTION
+
 export const working = makePicker(WORKING)
 export const acknowledge = makePicker(ACKNOWLEDGE)
 export const attention = makePicker(ATTENTION)
